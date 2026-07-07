@@ -1,0 +1,35 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "after": {
+      "description": "Lines AFTER each match; defaults to 2.",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "before": {
+      "description": "Lines BEFORE each match; defaults to 2.",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "key": {
+      "description": "Context key; defaults to 'latest' (the agent's most recent value) when omitted or empty.",
+      "type": "string"
+    },
+    "max_matches": {
+      "description": "Cap on match count; defaults to 20.",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "pattern": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "agent",
+    "pattern"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,10 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "filter": {
+      "description": "empty \u21d2 all agents; a substring narrows.",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

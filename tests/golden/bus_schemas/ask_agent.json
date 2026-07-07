@@ -1,0 +1,25 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "deliverable": {
+      "type": "string"
+    },
+    "max_turns": {
+      "type": "integer"
+    },
+    "name": {
+      "type": "string"
+    },
+    "prefer_primary": {
+      "type": "boolean"
+    },
+    "prompt": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "prompt"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,22 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "depth": {
+      "description": "hops out from the entity; defaults to 1.",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "entity": {
+      "type": "string"
+    },
+    "limit": {
+      "description": "max neighbors to return; defaults to 50.",
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "entity"
+  ],
+  "type": "object"
+}

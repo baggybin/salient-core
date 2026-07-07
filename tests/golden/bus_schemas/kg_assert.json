@@ -1,0 +1,43 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "confidence": {
+      "description": "0..1 confidence in the fact; defaults to 1.0.",
+      "maximum": 1,
+      "minimum": 0,
+      "type": "number"
+    },
+    "contradicts": {
+      "type": "string"
+    },
+    "object": {
+      "type": "string"
+    },
+    "permanent": {
+      "type": "boolean"
+    },
+    "predicate": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    },
+    "ttl_days": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "days until the fact expires; 0/negative = never; omit for the engagement default (~30 days)."
+    }
+  },
+  "required": [
+    "subject",
+    "predicate",
+    "object"
+  ],
+  "type": "object"
+}

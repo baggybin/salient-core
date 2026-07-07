@@ -1,0 +1,10 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "filter": {
+      "description": "empty / '*' \u21d2 all keys; an agent name narrows.",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

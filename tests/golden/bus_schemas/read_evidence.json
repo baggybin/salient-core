@@ -1,0 +1,22 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "length": {
+      "description": "bytes to read; defaults to 8192, max 32768 per call.",
+      "maximum": 32768,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "offset": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "sha": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "sha"
+  ],
+  "type": "object"
+}

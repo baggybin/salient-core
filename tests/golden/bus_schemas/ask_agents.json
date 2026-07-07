@@ -1,0 +1,63 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "aggregate": {
+      "description": "'all' gather every child; 'any' return on first success; 'race' return the first to finish. Defaults to 'all'.",
+      "enum": [
+        "all",
+        "any",
+        "race"
+      ],
+      "type": "string"
+    },
+    "children": {
+      "items": {
+        "properties": {
+          "deliverable": {
+            "type": "string"
+          },
+          "max_turns": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefer_primary": {
+            "type": "boolean"
+          },
+          "prompt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "type": "array"
+    },
+    "concurrency": {
+      "anyOf": [
+        {
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "max children in flight; defaults to auto = min(children, 10)."
+    },
+    "deliverable": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "children"
+  ],
+  "type": "object"
+}

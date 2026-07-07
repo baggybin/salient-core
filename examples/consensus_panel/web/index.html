@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>salient-core · consensus panel</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span> salient-core
+        <span class="sub">consensus panel</span>
+      </div>
+      <label class="mode">
+        <input type="checkbox" id="mode" checked />
+        <span>Consensus mode</span>
+      </label>
+    </header>
+
+    <section class="composer" id="composer">
+      <textarea
+        id="question"
+        rows="2"
+        placeholder="Ask one question. It goes to every model in the panel, verbatim."
+      >How do I speed up a function that's called repeatedly with the same arguments?</textarea>
+
+      <div class="panel-config">
+        <div class="legs" id="legs"></div>
+        <button class="ghost" id="add-leg" type="button">+ add model</button>
+        <div class="judge">
+          <label>Judge</label>
+          <select id="judge-model"></select>
+        </div>
+        <button class="primary" id="run" type="button">Run consensus</button>
+      </div>
+    </section>
+
+    <main class="panes" id="panes"></main>
+
+    <section class="convergence hidden" id="convergence">
+      <div class="meter-wrap">
+        <div class="meter-label">
+          Semantic convergence
+          <span class="score" id="score">—</span>
+        </div>
+        <div class="meter"><div class="meter-fill" id="meter-fill"></div></div>
+      </div>
+      <div class="verdict">
+        <div class="verdict-head">Judge verdict <span id="judge-tag" class="tag"></span></div>
+        <div class="verdict-body" id="verdict">Run a panel to see the reconciliation.</div>
+      </div>
+    </section>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

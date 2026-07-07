@@ -1,0 +1,33 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "agent": {
+      "type": "string"
+    },
+    "end": {
+      "anyOf": [
+        {
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Last line, inclusive; defaults to start."
+    },
+    "key": {
+      "description": "Context key; defaults to 'latest' (the agent's most recent value) when omitted or empty.",
+      "type": "string"
+    },
+    "start": {
+      "description": "First line, 1-indexed; defaults to 1.",
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "agent"
+  ],
+  "type": "object"
+}

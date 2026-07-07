@@ -1,0 +1,21 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "agent": {
+      "type": "string"
+    },
+    "key": {
+      "description": "Context key; defaults to 'latest' (the agent's most recent value) when omitted or empty.",
+      "type": "string"
+    },
+    "n": {
+      "description": "Line count; defaults to 20.",
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "agent"
+  ],
+  "type": "object"
+}

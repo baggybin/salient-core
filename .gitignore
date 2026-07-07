@@ -1,0 +1,54 @@
+# Secrets / env
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+# …but memory/credentials.py is the credential-VOCABULARY seam — a source module
+# with no secrets in it. The patterns above are for secret files; keep it tracked.
+!src/salient_core/memory/credentials.py
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Build / runtime
+__pycache__/
+*.pyc
+node_modules/
+dist/
+build/
+.venv/
+venv/
+*.egg-info/
+
+# Library repo — consumers resolve their own deps; don't pin a lockfile
+uv.lock
+
+# Logs
+*.log
+
+# Local SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Coverage
+.coverage
+htmlcov/
+
+# Work root (runtime data — lessons, study uploads, etc.)
+work/
+
+# graphify knowledge graph (machine-local)
+graphify-out/
+
+# Claude Code local settings
+.claude/
+
+# Internal roadmap — not for the public repo
+PLAN.md

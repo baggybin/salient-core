@@ -1,0 +1,41 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "agents": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "deliverable": {
+      "type": "string"
+    },
+    "judge": {
+      "description": "'on'=always reconcile; 'auto'=only when agreement is low; 'off'=never. Defaults to 'auto'.",
+      "enum": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "type": "string"
+    },
+    "judge_agent": {
+      "description": "Which running agent reconciles the panel; defaults to 'counsel'.",
+      "type": "string"
+    },
+    "max_turns": {
+      "type": "integer"
+    },
+    "name": {
+      "type": "string"
+    },
+    "prompt": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "prompt"
+  ],
+  "type": "object"
+}

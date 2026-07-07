@@ -1,0 +1,16 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "rule_kind": {
+      "type": "string"
+    },
+    "rule_text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "rule_kind",
+    "rule_text"
+  ],
+  "type": "object"
+}

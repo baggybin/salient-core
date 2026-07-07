@@ -1,0 +1,9 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "reason": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

@@ -1,0 +1,16 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "agent": {
+      "type": "string"
+    },
+    "key": {
+      "description": "Context key to read; defaults to 'latest' (the agent's most recent reply) when omitted or empty.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "agent"
+  ],
+  "type": "object"
+}

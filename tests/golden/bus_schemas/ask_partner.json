@@ -1,0 +1,18 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "deliverable": {
+      "type": "string"
+    },
+    "max_turns": {
+      "type": "integer"
+    },
+    "prompt": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "prompt"
+  ],
+  "type": "object"
+}

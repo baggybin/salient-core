@@ -1,0 +1,20 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "limit": {
+      "description": "max rows to return; defaults to 20.",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "object": {
+      "type": "string"
+    },
+    "predicate": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

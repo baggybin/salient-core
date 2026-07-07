@@ -1,0 +1,22 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "grade": {
+      "enum": [
+        "again",
+        "hard",
+        "good",
+        "easy"
+      ],
+      "type": "string"
+    },
+    "topic": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "topic",
+    "grade"
+  ],
+  "type": "object"
+}

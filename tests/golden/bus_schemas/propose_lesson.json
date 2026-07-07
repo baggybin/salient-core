@@ -1,0 +1,16 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "description": "tactic | gotcha | workaround; defaults to 'tactic'.",
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "text"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,32 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "include_args": {
+      "type": "boolean"
+    },
+    "limit": {
+      "description": "max rows to return; defaults to 20.",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "since_minutes": {
+      "anyOf": [
+        {
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "only actions newer than N minutes; unbounded when omitted."
+    },
+    "target": {
+      "type": "string"
+    },
+    "tool": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
