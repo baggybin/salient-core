@@ -3,9 +3,9 @@
 > A multi-agent coordination kernel with policy gates, knowledge graph,
 > and operator-mediated delegation.
 
-![salient-core: a single inter-agent bus at the hub, with agents fanned out on its spokes over a knowledge graph](imgs/hero-bus.jpg)
+![salient-core — a multi-agent coordination kernel](imgs/social-preview.jpg)
 
-[![CI](https://github.com/baggybin/salient-core/actions/workflows/ci.yml/badge.svg)](https://github.com/baggybin/salient-core/actions/workflows/ci.yml)
+[![CI](https://github.com/baggybin/salient-core-public/actions/workflows/ci.yml/badge.svg)](https://github.com/baggybin/salient-core-public/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 `salient-core` is a generic agent-coordination kernel — the infrastructure
