@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-07-06
+## [0.4.0] - 2026-07-07
+
+First public snapshot. Consolidates the pre-public `0.3.x`–`0.4.0` kernel work
+and prepares the repository for open-source release.
+
+### Added
+- Runnable in-repo showcase: `examples/consensus_panel/` — an offline bus demo
+  of the `ask_consensus` fan-out with semantic-convergence scoring.
+
+### Changed
+- README rebuilt as an adopter on-ramp: "Why / when-not-to-use" motivation,
+  a "How it works" flow diagram, a positioning table vs. LangGraph/CrewAI/
+  AutoGen, a Requirements section, a default-deny callout, and the `ask_fable`
+  sidecar surfaced in the feature table.
+- Package metadata and in-repo links point at the public repository
+  (`baggybin/salient-core-public`); `__version__` synced to the packaged
+  version (`0.4.0`).
 
 ### Added
 - **Per-agent privilege separation seam**: the daemon injects an agent's
