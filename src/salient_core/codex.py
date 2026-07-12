@@ -322,9 +322,7 @@ class CodexBackend:
             )
         return approval_response(request, resolution)
 
-    def _resolve_mcp_elicitation(
-        self, params: Mapping[str, JsonValue]
-    ) -> dict[str, JsonValue]:
+    def _resolve_mcp_elicitation(self, params: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
         # MCP elicitation response shape (ElicitResult): accept | decline | cancel,
         # with `content` matching the requested (here empty) schema. Auto-accept the
         # per-tool-call approval elicitation for OUR gateway; fail closed on any
@@ -367,7 +365,9 @@ class CodexBackend:
         # Merge the reasoning-effort override into the codex config object (the
         # same JsonObject that carries mcp_servers). `model_reasoning_effort`
         # takes none|minimal|low|medium|high|xhigh; unset → the model default.
-        config_obj: dict[str, Any] = dict(self._config.mcp_config) if self._config.mcp_config else {}
+        config_obj: dict[str, Any] = (
+            dict(self._config.mcp_config) if self._config.mcp_config else {}
+        )
         if self._config.effort:
             config_obj["model_reasoning_effort"] = self._config.effort
         if config_obj:
@@ -461,8 +461,8 @@ class CodexBackend:
                         final_text = item.get("text")
                         if isinstance(final_text, str) and final_text:
                             text_parts[:] = [final_text]
-                        if (event := _drain()) is not None:
-                            yield event
+                        if (flushed := _drain()) is not None:
+                            yield flushed
                     else:
                         event = _native_event(data, completed=True)
                         if event is not None and event.id not in self._completed_actions:
@@ -471,8 +471,8 @@ class CodexBackend:
                 elif method == "error":
                     # Flush any text streamed before the error so a turn that
                     # fails mid-message still surfaces what arrived.
-                    if (event := _drain()) is not None:
-                        yield event
+                    if (flushed := _drain()) is not None:
+                        yield flushed
                     # The error shape varies (top-level message, nested error
                     # object, bare code); surface whatever detail is present —
                     # and the raw body as a last resort — rather than a bare
@@ -495,8 +495,8 @@ class CodexBackend:
                     # Safety flush: a normal turn already drained at
                     # `item/completed`, but a turn that completes without one
                     # still surfaces its buffered text.
-                    if (event := _drain()) is not None:
-                        yield event
+                    if (flushed := _drain()) is not None:
+                        yield flushed
                     turn = data.get("turn", {})
                     turn_data = turn if isinstance(turn, Mapping) else {}
                     status = str(turn_data.get("status", "completed"))
@@ -514,8 +514,8 @@ class CodexBackend:
                     break
         except (EOFError, OSError, RuntimeError) as error:
             # Surface any text buffered before the transport dropped.
-            if (event := _drain()) is not None:
-                yield event
+            if (flushed := _drain()) is not None:
+                yield flushed
             yield ProviderErrorEvent(code="transport_closed", message=str(error), retryable=True)
         finally:
             await self._run(self._client.unregister_turn_notifications, turn_id)

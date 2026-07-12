@@ -880,12 +880,16 @@ def test_codex_two_agent_messages_per_turn_do_not_contaminate() -> None:
                     _Notification("item/agentMessage/delta", _Payload(delta="first message")),
                     _Notification(
                         "item/completed",
-                        _Payload(item={"id": "m1", "type": "agentMessage", "text": "first message"}),
+                        _Payload(
+                            item={"id": "m1", "type": "agentMessage", "text": "first message"}
+                        ),
                     ),
                     _Notification("item/agentMessage/delta", _Payload(delta="second")),
                     _Notification(
                         "item/completed",
-                        _Payload(item={"id": "m2", "type": "agentMessage", "text": "second message"}),
+                        _Payload(
+                            item={"id": "m2", "type": "agentMessage", "text": "second message"}
+                        ),
                     ),
                     _Notification(
                         "turn/completed",
