@@ -11,20 +11,22 @@ import asyncio
 import hashlib
 import logging
 import os
+import shlex
+from functools import partial
 
 log = logging.getLogger(__name__)
 
 # Warn-once set for the loop-detection question-filing path.
 _LOOP_WARNED: set[str] = set()
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, assert_never, cast
 from urllib.parse import urlparse
 
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
-from ..bus import get_bus_builder, make_bus_tools
+from ..bus import get_bus_builder, make_bus_tool_bundle, make_bus_tools
 
 
 # Engagement profile resolution is downstream SKIN (registered via
@@ -49,6 +51,10 @@ def render_profile_block(*args: Any, **kwargs: Any) -> str:
     return eng.render_profile_block(*args, **kwargs) if eng is not None else ""
 
 
+from ..protocols import ToolBuildContext
+from ..providers import ProviderName, get_provider_registry
+from ..runtime import AgentBackend, ToolBundle
+from ._backend import LocalClaudeBackend, _json_value
 from ._helpers import (
     Job,
     _extract_marker_questions,
@@ -65,7 +71,12 @@ from ._prompts import (
     resolve_endpoint_thinking,
 )
 from ._tasks import spawn_background
-from ._tool_registry import get_daemon_skin_module, get_subagent_builder, get_tool_builder
+from ._tool_registry import (
+    get_daemon_skin_module,
+    get_subagent_builder,
+    get_tool_builder,
+    get_tool_bundle_builder,
+)
 from .runner import AgentRunner
 
 if TYPE_CHECKING:
@@ -113,6 +124,144 @@ def set_spawn_observer(observer: Any) -> None:
     Either method may be omitted. Default: no observer."""
     global _spawn_observer
     _spawn_observer = observer
+
+
+# ── Codex read-only command classifier: safe-flag allowlist ──────────
+# Default-deny per-binary flag tables. A Codex-proposed command auto-approves
+# (skips the operator gate) only when its binary is known read-only AND every
+# flag token is on that binary's safe list. Unknown flags fall through to
+# operator approval (classifier returns False) — the safe direction, since a
+# false deny only costs a prompt while a false accept auto-executes. Denylists
+# rot open as tools grow new flags (rg --pre, git --output/--ext-diff, tail -f
+# all slipped a bare-binary allowlist); this allowlist rots closed. Value True =
+# the flag consumes the next argv token as a data-only value; False = valueless.
+_CODEX_SAFE_FLAGS: dict[str | tuple[str, str], dict[str, bool]] = {
+    "ls": {
+        "-l": False,
+        "-a": False,
+        "-h": False,
+        "-A": False,
+        "-R": False,
+        "-t": False,
+        "-r": False,
+        "-S": False,
+        "-1": False,
+        "-d": False,
+    },
+    "grep": {
+        "-r": False,
+        "-n": False,
+        "-i": False,
+        "-l": False,
+        "-c": False,
+        "-v": False,
+        "-w": False,
+        "-x": False,
+        "-F": False,
+        "-E": False,
+        "-o": False,
+        "-H": False,
+        "-e": True,
+        "-A": True,
+        "-B": True,
+        "-C": True,
+        "--include": True,
+        "--exclude": True,
+    },
+    "rg": {
+        "-i": False,
+        "-n": False,
+        "-l": False,
+        "-c": False,
+        "-v": False,
+        "-w": False,
+        "-x": False,
+        "-F": False,
+        "-S": False,
+        "-s": False,
+        "-o": False,
+        "-e": True,
+        "-g": True,
+        "-t": True,
+        "-A": True,
+        "-B": True,
+        "-C": True,
+        "-m": True,
+        "--json": False,
+        "--no-heading": False,
+        "--hidden": False,
+        "--max-columns": True,
+    },
+    "head": {"-n": True, "-c": True},
+    "tail": {"-n": True, "-c": True},
+    "cat": {"-n": False, "-A": False, "-b": False},
+    "wc": {"-l": False, "-c": False, "-w": False, "-m": False},
+    "stat": {"-c": True, "--format": True},
+    "pwd": {},
+    ("git", "diff"): {
+        "--stat": False,
+        "--name-only": False,
+        "--name-status": False,
+        "--cached": False,
+        "--staged": False,
+        "-U": True,
+        "--no-color": False,
+    },
+    ("git", "log"): {
+        "--oneline": False,
+        "--stat": False,
+        "-n": True,
+        "--graph": False,
+        "--follow": False,
+        "--no-color": False,
+        "--format": True,
+        "--pretty": True,
+        "--since": True,
+        "--until": True,
+        "--author": True,
+        "--grep": True,
+    },
+    ("git", "show"): {
+        "--stat": False,
+        "--name-only": False,
+        "--no-color": False,
+        "--format": True,
+        "--pretty": True,
+    },
+    ("git", "status"): {"-s": False, "--short": False, "--porcelain": False, "-b": False},
+}
+
+
+def _codex_flags_all_safe(table: dict[str, bool], argv: list[str]) -> bool:
+    """True when every flag token in argv is on ``table`` (valueless or
+    data-valued); positional args (paths/patterns) pass. An unrecognized flag
+    returns False (→ operator approval). Bundled shorts (``-lah``) pass only
+    when each constituent is a valueless safe flag, so ``tail -fn5`` / ``rg
+    -zi`` still deny. A trailing value-taking flag with no value → False."""
+    i = 0
+    expect_value = False
+    while i < len(argv):
+        tok = argv[i]
+        i += 1
+        if expect_value:
+            expect_value = False
+            continue
+        if tok == "--":
+            return True  # end of options — the rest are paths/patterns
+        if not tok.startswith("-") or tok == "-":
+            continue  # positional (path / pattern / stdin)
+        flag, _, inline_val = tok.partition("=")
+        if flag in table:  # exact long/short flag, optional --flag=value
+            expect_value = table[flag] and not inline_val
+            continue
+        if not flag.startswith("--") and len(flag) > 2:
+            head = flag[:2]  # e.g. "-A" of "-A3"
+            if head in table and table[head]:
+                continue  # value-taking short with glued value, e.g. -A3 / -n50
+            if all(f"-{ch}" in table and not table[f"-{ch}"] for ch in flag[1:]):
+                continue  # bundle of valueless shorts, e.g. -lah / -rn
+        return False
+    return not expect_value
 
 
 class _RunnerFactoryMixin:
@@ -325,193 +474,144 @@ class _RunnerFactoryMixin:
         return hook
 
     def _make_safeguard_hook(self, agent_name: str):
-        """PreToolUse hook that applies prohibited-use safeguards
-        (salient.safeguards) to EVERY mcp__ tool call — internal factory
-        tools, external MCP servers, and the agent's own bus tools.
-        Runs alongside the external-scope hook; either may deny.
+        """Apply universal safeguards and SDK-native authorization once."""
 
-        Wire-name parse:
-          mcp__<server>__<bare>  →  qualified="<server>.<bare>" for the
-                                    PROHIBITED_PATTERNS lookup.
-        For per-agent bus servers (`bus__<owner>__<tool>`), we also try
-        the bare tool name as a fallback — bus tools (ask_agent, etc.)
-        aren't typical safeguard targets but we don't want a NameError
-        to break the dispatch.
+        from ..policy.registry import get_active
+        from ..policy.safeguard_evaluation import (
+            SafeguardEvaluationRequest,
+            evaluate_safeguards,
+        )
+        from ..policy.safeguards import resolve_config
+        from ..policy.scope_evaluation import ScopeEvaluationKind, evaluate_scope
+        from ._policy_hook_adapter import (
+            HookReplayCache,
+            ReplayOutcome,
+            ReplayOwner,
+            ReplayRejected,
+            deny,
+            normalize_mcp,
+            normalize_sdk,
+            safeguard_payload,
+            thaw_input,
+        )
 
-        On match:
-          - increment runner.total_safeguard_blocks
-          - emit a structured `safeguard_block` JSONL event with the
-            full context (agent, qualified, input, matched label, count)
-          - if count >= halt_threshold, return a halt-style deny
-          - else return a refuse-with-counter deny
-
-        The deny `permissionDecisionReason` is what the model sees as
-        the tool_result — it explains the strike count so the model can
-        choose a different approach instead of immediately retrying.
-        """
-        from ..policy.safeguards import check_intent, check_posture, resolve_config
+        replay_cache = HookReplayCache()
 
         async def hook(input_data, tool_use_id, context):  # noqa: ARG001
-            tool_name = (input_data or {}).get("tool_name") or ""
-            if not tool_name.startswith("mcp__"):
+            if not isinstance(input_data, dict):
                 return {}
-            rest = tool_name[len("mcp__") :]
-            if "__" not in rest:
+            tool_name = input_data.get("tool_name") or ""
+            raw_tool_input = input_data.get("tool_input")
+            tool_input = {} if raw_tool_input is None else raw_tool_input
+            if not isinstance(tool_name, str) or not tool_name or not isinstance(tool_input, dict):
                 return {}
-            server_name, bare_tool = rest.split("__", 1)
-            tool_input = (input_data or {}).get("tool_input") or {}
-
-            # Qualified lookup key matches scope.TOOL_TARGETS convention.
-            # Per-agent bus servers are named `bus__<owner>` — normalize
-            # to just "bus.<tool>" so prohibited patterns on bus tools
-            # (e.g. "bus.ask_agent" — natural-language intent in the
-            # `prompt` field) hit regardless of owner. External servers
-            # and factory servers keep their literal server_name, but
-            # reverse-aliased so PROHIBITED_PATTERNS keys stay on real
-            # names (the SDK may hand us a `mcp__<alias>__*` form when
-            # the agent's name is in the alias map).
-            from ..alias import to_real as _alias_to_real
-
-            if server_name.startswith("bus__"):
-                qualified = f"bus.{bare_tool}"
-            else:
-                qualified = f"{_alias_to_real(server_name)}.{bare_tool}"
 
             runner = self.runners.get(agent_name)
             agent_cfg = (runner.cfg if runner else None) or {}
-            cfg = resolve_config(agent_cfg, self.profile)
-
-            # Sticky halt gate: once the counter is at or over threshold,
-            # refuse EVERY subsequent tool call (including clean ones)
-            # until the operator resets the agent. Without this gate,
-            # the halt is only enforced when the next call ALSO matches
-            # a prohibited pattern — a halted agent could escape by
-            # switching to ask_agent / context_read / any benign tool.
-            if runner is not None and runner.total_safeguard_blocks >= cfg.halt_threshold:
-                halt_count = runner.total_safeguard_blocks
-                halt_at = cfg.halt_threshold
-                await runner._record_jsonl(
-                    "safeguard_halt_blocked",
-                    {
-                        "agent": agent_name,
-                        "tool": tool_name,
-                        "qualified": qualified,
-                        "count": halt_count,
-                        "halt_at": halt_at,
-                    },
-                )
-                deny_reason = (
-                    f"ENGAGEMENT HALT for {agent_name!r}: "
-                    f"{halt_count}/{halt_at} safeguard blocks. "
-                    f"Operator must `reset {agent_name}` (or adjust "
-                    f"the engagement profile's safeguards section) to "
-                    f"clear. Operator-side details are logged."
-                )
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": deny_reason,
-                    }
-                }
-
-            allowed, reason = check_intent(qualified, tool_input, config=cfg)
-            if allowed:
-                # Posture gate: a disciplined operator holds back high-
-                # noise techniques until the operator authorizes a louder
-                # posture. Separate from the prohibited-use counter below
-                # — a gated loud action is NOT a strike toward engagement
-                # halt, it's just not allowed at this posture. Only fires
-                # when the engagement posture is "stealth".
-                pallowed, preason = check_posture(
-                    qualified,
-                    tool_input,
-                    posture=cfg.posture,
-                )
-                if pallowed:
+            dataset = (
+                runner._policy_dataset
+                if runner is not None and runner._policy_dataset is not None
+                else get_active()
+            )
+            cfg = (
+                runner._safeguard_config
+                if runner is not None
+                else resolve_config(agent_cfg, self.profile)
+            )
+            if tool_name.startswith("mcp__"):
+                rest = tool_name.removeprefix("mcp__")
+                if "__" not in rest:
                     return {}
+                server_name, bare_tool = rest.split("__", 1)
+                if not server_name or not bare_tool:
+                    return {}
+                invocation = normalize_mcp(tool_name, tool_input, agent_name)
+            else:
+                invocation = normalize_sdk(tool_name, tool_input, agent_name)
+            reservation = await replay_cache.reserve(tool_use_id, invocation)
+            match reservation:
+                case ReplayOutcome(outcome=outcome):
+                    return outcome
+                case ReplayRejected(reason=reason):
+                    return deny(reason)
+                case ReplayOwner() as owner:
+                    pass
+                case unreachable:
+                    assert_never(unreachable)
+            try:
+                safeguards = evaluate_safeguards(
+                    SafeguardEvaluationRequest(
+                        invocation=invocation,
+                        config=cfg,
+                        current_strike_count=(runner.total_safeguard_blocks if runner else 0),
+                        halt_threshold=cfg.halt_threshold,
+                        dataset=dataset,
+                    )
+                )
+                if runner is not None:
+                    runner.total_safeguard_blocks += safeguards.counter_delta
+                    if safeguards.audit is not None:
+                        await runner._record_jsonl(
+                            safeguards.audit.event.value,
+                            safeguard_payload(safeguards.audit),
+                        )
+                if not safeguards.allowed:
+                    return replay_cache.complete(
+                        owner,
+                        deny(safeguards.model_reason),
+                    )
+                if tool_name.startswith("mcp__"):
+                    return replay_cache.complete(owner, {})
+
+                evaluation = await evaluate_scope(invocation, self.scope, dataset)
+                if evaluation.allowed:
+                    return replay_cache.complete(owner, {})
+                enforce = runner._enforce_builtin_policy if runner is not None else False
+                if (
+                    runner is not None
+                    and not enforce
+                    and evaluation.kind is ScopeEvaluationKind.UNCLASSIFIED
+                    and tool_name in dataset.trusted_builtins
+                    and runner.options.tools is not None
+                    and tool_name in runner.options.tools
+                    and tool_name not in runner._legacy_trusted_builtin_warned
+                ):
+                    async with runner._legacy_trusted_builtin_warning_lock:
+                        if tool_name not in runner._legacy_trusted_builtin_warned:
+                            await runner._record_jsonl(
+                                "legacy_trusted_builtin",
+                                {
+                                    "agent": agent_name,
+                                    "tool": tool_name,
+                                    "qualified": invocation.qualified_name,
+                                    "input": thaw_input(invocation.audit_input),
+                                    "mode": "shadow",
+                                    "deprecated": True,
+                                    "migration": (
+                                        "add an explicit qualified "
+                                        "PolicyDataset.tool_targets classification "
+                                        "before enabling enforce mode"
+                                    ),
+                                },
+                            )
+                            runner._legacy_trusted_builtin_warned.add(tool_name)
                 if runner is not None:
                     await runner._record_jsonl(
-                        "safeguard_posture_gate",
+                        "builtin_policy_deny" if enforce else "builtin_policy_shadow",
                         {
                             "agent": agent_name,
                             "tool": tool_name,
-                            "qualified": qualified,
-                            "input": tool_input,
-                            "reason": preason,
-                            "posture": cfg.posture,
+                            "qualified": invocation.qualified_name,
+                            "policy_class": evaluation.kind.value,
+                            "enforce": enforce,
+                            "input": thaw_input(invocation.audit_input),
+                            "reason": evaluation.reason,
                         },
                     )
-                # Terse deny text: name the posture, not the specific
-                # technique. The matched loud-technique label lives in the
-                # structured `safeguard_posture_gate` event for the operator.
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": (
-                            f"posture gate: this engagement runs at the "
-                            f"{cfg.posture!r} posture, which holds back "
-                            f"higher-impact options on this tool. Use the "
-                            f"lighter-touch approach for now, or ask the "
-                            f"operator to authorize this step (or raise the "
-                            f"engagement posture) and retry. Operator-side "
-                            f"details are logged."
-                        ),
-                    }
-                }
-
-            if runner is not None:
-                runner.total_safeguard_blocks += 1
-            count = runner.total_safeguard_blocks if runner else 0
-            halt_at = cfg.halt_threshold
-
-            if runner is not None:
-                await runner._record_jsonl(
-                    "safeguard_block",
-                    {
-                        "agent": agent_name,
-                        "tool": tool_name,
-                        "qualified": qualified,
-                        "input": tool_input,
-                        "reason": reason,
-                        "count": count,
-                        "halt_at": halt_at,
-                    },
-                )
-
-            # Sanitized model-facing text. The pattern name and the
-            # restricted-category vocabulary (destructive or high-impact
-            # operations, etc.) are intentionally NOT included here — the
-            # model just needs to know the call was refused and to try
-            # something else, not the exact matched pattern. Full reason +
-            # matched pattern are in the structured `safeguard_block` JSONL
-            # event for the operator (and counted on
-            # runner.total_safeguard_blocks).
-            if count >= halt_at:
-                deny_reason = (
-                    f"ENGAGEMENT HALT for {agent_name!r}: {count}/{halt_at} "
-                    f"safeguard blocks on {qualified!r}. Operator must "
-                    f"`reset {agent_name}` (or adjust the engagement "
-                    f"profile's safeguards section) to clear. "
-                    f"Operator-side details are logged."
-                )
-            else:
-                deny_reason = (
-                    f"safeguard refused: tool call on {qualified!r} matched "
-                    f"a policy pattern the engagement profile blocks. Strike "
-                    f"{count}/{halt_at} — agent halts at limit. Try a "
-                    f"different approach that stays inside the engagement's "
-                    f"authorized scope. Operator-side details are logged."
-                )
-
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": deny_reason,
-                }
-            }
+                outcome = deny(evaluation.reason) if enforce else {}
+                return replay_cache.complete(owner, outcome)
+            finally:
+                replay_cache.fail(owner)
 
         return hook
 
@@ -608,115 +708,68 @@ class _RunnerFactoryMixin:
              reason; on allow, return allow (so the SDK proceeds).
         """
         from ..policy.registry import get_active
-        from ..policy.scope import CheckResult, ExtractorError, extract_targets
+        from ..policy.scope_evaluation import (
+            ScopeEvaluationRequest,
+            evaluate_scope,
+        )
+        from ._policy_hook_adapter import (
+            HookReplayCache,
+            ReplayOutcome,
+            ReplayOwner,
+            ReplayRejected,
+            allow,
+            deny,
+            normalize_mcp,
+        )
+
+        replay_cache = HookReplayCache()
 
         async def hook(input_data, tool_use_id, context):  # noqa: ARG001
-            tool_name = (input_data or {}).get("tool_name") or ""
+            if not isinstance(input_data, dict):
+                return {}
+            tool_name = input_data.get("tool_name") or ""
+            if not isinstance(tool_name, str):
+                return {}
             if not tool_name.startswith("mcp__"):
                 return {}
             rest = tool_name[len("mcp__") :]
             if "__" not in rest:
                 return {}
             server_name, bare_tool = rest.split("__", 1)
-            if server_name not in external_servers:
+            if not bare_tool or server_name not in external_servers:
                 return {}
-            tool_input = (input_data or {}).get("tool_input") or {}
-
-            spec = get_active().tool_targets.get(bare_tool)
-            if spec is None:
-                # Fail-closed: tool we don't recognize from an external
-                # MCP server. Operator must explicitly classify it.
-                reason = (
-                    f"tool {bare_tool!r} (from external MCP server "
-                    f"{server_name!r}) has no scope classification — "
-                    f"refusing fail-closed. Add an entry to the active "
-                    f"PolicyDataset.tool_targets (policy.registry.set_active)."
-                )
-                self.scope.log_decision(
-                    agent=agent_name,
-                    tool=bare_tool,
-                    args=tool_input,
-                    targets=[],
-                    result=CheckResult(allowed=False, decisions=[], summary=reason),
-                )
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": reason,
-                    }
-                }
-            if spec.none:
+            raw_tool_input = input_data.get("tool_input")
+            tool_input = {} if raw_tool_input is None else raw_tool_input
+            if not isinstance(tool_input, dict):
                 return {}
-            if spec.local_only:
-                self.scope.log_decision(
-                    agent=agent_name,
-                    tool=bare_tool,
-                    args=tool_input,
-                    targets=[],
-                    result=CheckResult(
-                        allowed=True,
-                        decisions=[],
-                        summary="local-only tool — scope check skipped",
-                    ),
-                )
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                    }
-                }
-            try:
-                targets = extract_targets(spec, tool_input)
-            except ExtractorError as e:
-                reason = f"extractor refused: {e}"
-                self.scope.log_decision(
-                    agent=agent_name,
-                    tool=bare_tool,
-                    args=tool_input,
-                    targets=[],
-                    result=CheckResult(allowed=False, decisions=[], summary=reason),
-                )
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": reason,
-                    }
-                }
-            if not targets:
-                # No targets extracted with no error = nothing to check.
-                # Mirrors scope.gate behavior for that edge case.
-                return {}
-            # NOTE: this external-MCP path intentionally always applies STRICT
-            # scope and does NOT honor spec.research (the research lane lives
-            # only in scope.gate, the SDK-tool path). This is fail-safe — it
-            # over-refuses (a research tool here would need a scope add), never
-            # over-grants. No external MCP server currently exposes a
-            # research=True tool (only the Burp `proxy`); wire research routing
-            # here too if that changes.
-            result = self.scope.check(targets)
-            self.scope.log_decision(
-                agent=agent_name,
-                tool=bare_tool,
-                args=tool_input,
-                targets=targets,
-                result=result,
+            runner = self.runners.get(agent_name)
+            dataset = (
+                runner._policy_dataset
+                if runner is not None and runner._policy_dataset is not None
+                else get_active()
             )
-            if not result.allowed:
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": result.summary,
-                    }
-                }
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                }
-            }
+            invocation = normalize_mcp(tool_name, tool_input, agent_name)
+            reservation = await replay_cache.reserve(tool_use_id, invocation)
+            match reservation:
+                case ReplayOutcome(outcome=outcome):
+                    return outcome
+                case ReplayRejected(reason=reason):
+                    return deny(reason)
+                case ReplayOwner() as owner:
+                    pass
+                case unreachable:
+                    assert_never(unreachable)
+            try:
+                evaluation = await evaluate_scope(
+                    invocation,
+                    self.scope,
+                    ScopeEvaluationRequest(dataset=dataset, allow_research=False),
+                )
+                if not evaluation.allowed:
+                    return replay_cache.complete(owner, deny(evaluation.reason))
+                return replay_cache.complete(owner, allow())
+            finally:
+                replay_cache.fail(owner)
 
         return hook
 
@@ -1677,10 +1730,71 @@ class _RunnerFactoryMixin:
             # store the bare line with trailing newline stripped.
             stderr_buffer.append(line.rstrip("\r\n"))
 
+        backend_factory: Callable[[], AgentBackend]
+        runtime = cfg.get("runtime")
+        tool_bundle = ToolBundle()
+        if runtime is None:
+            options = self._build_options(cfg, stderr_callback=_stderr_sink)
+            backend_factory = partial(LocalClaudeBackend, options)
+        elif isinstance(runtime, dict):
+            provider_name = ProviderName(runtime.get("provider", ""))
+            config = _json_value(runtime.get("config", {}))
+            if not isinstance(config, dict):
+                raise TypeError("runtime.config must be a mapping")
+            if cfg.get("model") is not None and "model" not in config:
+                config["model"] = _json_value(cfg["model"])
+            provider = get_provider_registry().get(provider_name)
+            tool_bundle = self._build_provider_tool_bundle(cfg)
+            if provider_name == ProviderName("codex"):
+                from ..codex import CodexProvider
+
+                if not isinstance(provider, CodexProvider):
+                    raise TypeError("registered codex provider has an incompatible implementation")
+                config["agent_name"] = cfg["name"]
+                config["cwd"] = str(self.engagement_path or Path.cwd())
+                config["instructions"] = self._augment_system_prompt(cfg)
+                if cfg.get("mcp_servers"):
+                    config["mcp_servers"] = _json_value(cfg["mcp_servers"])
+
+                def _make_codex_backend() -> AgentBackend:
+                    loop = asyncio.get_running_loop()
+
+                    def enqueue_followup(text: str) -> None:
+                        future = asyncio.run_coroutine_threadsafe(
+                            self.runners[cfg["name"]].steer(text), loop
+                        )
+
+                        def report_failure(completed: Any) -> None:
+                            try:
+                                completed.result()
+                            except Exception:  # noqa: BLE001
+                                log.exception(
+                                    "Codex approval edit enqueue failed for %s", cfg["name"]
+                                )
+
+                        future.add_done_callback(report_failure)
+
+                    return provider.create_backend(
+                        config,
+                        tool_bundle=tool_bundle,
+                        approval_handler=self._make_codex_approval_handler(cfg["name"], loop),
+                        followup_handler=enqueue_followup,
+                    )
+
+                backend_factory = _make_codex_backend
+            else:
+                backend_factory = partial(
+                    provider.create_backend,
+                    config,
+                    tool_bundle=tool_bundle,
+                )
+        else:
+            raise TypeError("runtime must be a mapping")
         r = AgentRunner(
             name=cfg["name"],
             cfg=cfg,
-            options=self._build_options(cfg, stderr_callback=_stderr_sink),
+            backend_factory=backend_factory,
+            tool_bundle=tool_bundle,
             prompt_timeout=float(cfg.get("prompt_timeout", self.prompt_timeout)),  # type: ignore[arg-type]
             idle_timeout=float(cfg.get("idle_timeout", self.idle_timeout)),  # type: ignore[arg-type]
             context=self.context,
@@ -1708,6 +1822,12 @@ class _RunnerFactoryMixin:
         # calls (ask_operator today) to their real handlers via
         # `daemon.add_question(...)`.
         r._daemon = cast("DaemonServices", self)
+        from ..policy.registry import get_active
+        from ..policy.safeguards import resolve_config
+
+        r._policy_dataset = get_active()
+        r._safeguard_config = resolve_config(cfg, self.profile)
+        r._enforce_builtin_policy = bool(cfg.get("enforce_builtin_policy"))
         # Inject the daemon-wide event hub so _publish mirrors every event to
         # the global /ws/events/all stream (not just the per-agent tail).
         r._event_hub = self.event_hub
@@ -1766,6 +1886,191 @@ class _RunnerFactoryMixin:
             r.jobs_recorded = len(r.history)
             r._next_job_id = max(r._next_job_id, highest + 1)
         return r
+
+    def _make_codex_approval_handler(
+        self,
+        agent_name: str,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Callable[[Any], Any]:
+        from ..codex import ApprovalDecision
+
+        def handle(request: Any) -> Any:
+            future = asyncio.run_coroutine_threadsafe(
+                self._resolve_codex_approval(agent_name, request), loop
+            )
+            while not request.cancelled.wait(0.1):
+                try:
+                    return future.result(timeout=0)
+                except TimeoutError:
+                    continue
+            future.cancel()
+            return ApprovalDecision.CANCEL
+
+        return handle
+
+    async def _resolve_codex_approval(self, agent_name: str, request: Any) -> Any:
+        from ..bus import _parse_delegation_answer
+        from ..codex import ApprovalDecision, ApprovalResolution
+
+        if request.kind.value == "command":
+            command = request.params.get("command")
+            raw_input = {"command": command}
+            from ..policy.decision import InvocationIdentity, InvocationTransport, ToolInvocation
+            from ..policy.safeguards import check_intent, resolve_config
+            from ..policy.scope_evaluation import evaluate_scope
+
+            runner = self.runners.get(agent_name)
+            agent_cfg = (runner.cfg if runner else None) or {}
+            allowed, _reason = check_intent(
+                "bash.run",
+                raw_input,
+                config=resolve_config(agent_cfg, self.profile),
+            )
+            if not allowed:
+                return ApprovalDecision.DECLINE
+            if self.scope is not None:
+                invocation = ToolInvocation.normalize(
+                    InvocationIdentity(
+                        InvocationTransport.SDK,
+                        "CodexCommand",
+                        "bash.run",
+                        agent_name,
+                    ),
+                    raw_input,
+                )
+                scope_result = await evaluate_scope(invocation, self.scope)
+                if not scope_result.allowed:
+                    return ApprovalDecision.DECLINE
+            if self._codex_command_is_read_only(request.params):
+                return ApprovalDecision.ACCEPT
+        elif request.kind.value == "file_change":
+            root = Path(self.engagement_path or Path.cwd()).resolve()
+            changes = request.params.get("changes")
+            paths: list[str] = []
+            if isinstance(changes, list):
+                for item in changes:
+                    if isinstance(item, dict):
+                        changed_path = item.get("path")
+                        if isinstance(changed_path, str):
+                            paths.append(changed_path)
+            grant_root = request.params.get("grantRoot")
+            if isinstance(grant_root, str):
+                paths.append(grant_root)
+            for raw_path in paths:
+                path = Path(raw_path)
+                resolved = (root / path).resolve() if not path.is_absolute() else path.resolve()
+                if not resolved.is_relative_to(root):
+                    return ApprovalDecision.DECLINE
+        elif request.kind.value == "permission":
+            permissions = request.params.get("permissions")
+            values = permissions if isinstance(permissions, list) else [permissions]
+            denied = {"danger-full-access", "full_access", "root", "sudo", "all"}
+            if any(str(value).lower() in denied for value in values):
+                return ApprovalDecision.DECLINE
+
+        summary_values = [
+            str(request.params.get(key))
+            for key in ("command", "cwd", "reason", "permissions")
+            if request.params.get(key)
+        ]
+        summary = " | ".join(summary_values)[:300] or request.method
+        qid, answer_future = self.add_tool_approval_question(
+            agent_name,
+            request.kind.value,
+            summary,
+            [request.kind.value],
+        )
+        try:
+            answer = await asyncio.wait_for(answer_future, timeout=600)
+        except TimeoutError:
+            self.inbox.expire(qid, "[timed out]")
+            return ApprovalDecision.DECLINE
+        verdict, payload = _parse_delegation_answer(answer)
+        if verdict == "approve":
+            return ApprovalDecision.ACCEPT
+        if verdict == "edit" and payload:
+            return ApprovalResolution(ApprovalDecision.EDIT, payload)
+        return ApprovalDecision.DECLINE
+
+    @staticmethod
+    def _codex_command_is_read_only(params: Mapping[str, Any]) -> bool:
+        if params.get("networkApprovalContext"):
+            return False
+        command = params.get("command")
+        if isinstance(command, list):
+            if not command or not all(isinstance(part, str) and part for part in command):
+                return False
+            parts = list(command)
+            command_text = " ".join(parts)
+        elif isinstance(command, str):
+            command_text = command
+            try:
+                parts = shlex.split(command)
+            except ValueError:
+                return False
+        else:
+            return False
+        if any(
+            marker in command_text for marker in ("\r", "\n", "&", "|", ";", "<", ">", "$", "`")
+        ):
+            return False
+        if not parts:
+            return False
+        # Per-binary safe-flag allowlist (default-deny). The `git` global-option
+        # slot (parts[1]) must be a read-only subcommand, which already rejects
+        # `git -c …` / `git --exec-path …`; the subcommand's own flags are then
+        # allowlisted so `git log --output=…` / `git diff --ext-diff` deny.
+        if parts[0] == "git":
+            if len(parts) < 2 or parts[1] not in {"diff", "log", "show", "status"}:
+                return False
+            table = _CODEX_SAFE_FLAGS.get(("git", parts[1]))
+            return table is not None and _codex_flags_all_safe(table, parts[2:])
+        table = _CODEX_SAFE_FLAGS.get(parts[0])
+        return table is not None and _codex_flags_all_safe(table, parts[1:])
+
+    def _build_provider_tool_bundle(self, cfg: dict[str, Any]) -> ToolBundle:
+        bus_bundle, bus_wires = make_bus_tool_bundle(cast("DaemonServices", self), cfg["name"])
+        tool_cfg = cfg.get("tool")
+        if not isinstance(tool_cfg, dict):
+            return bus_bundle
+        factory_config = dict(tool_cfg.get("config") or {})
+        if self.engagement_path is not None:
+            factory_config.setdefault("_engagement_path", str(self.engagement_path))
+        factory_config.setdefault("_listener_registry", getattr(self, "listeners", None))
+        from ..policy.safeguards import posture_from_profile
+
+        factory_config.setdefault("_posture", posture_from_profile(self.profile))
+        launch = cfg.get("launch")
+        if launch:
+            factory_config.setdefault("_launch_profile", launch)
+        browser_cfg = (self.profile or {}).get("browser") or {}
+        factory_config.setdefault(
+            "_authed_sessions",
+            bool(browser_cfg.get("authed_sessions")),
+        )
+        if self.scope is not None:
+            factory_config.setdefault(
+                "_scope_networks",
+                [
+                    rule.pattern
+                    for rule in self.scope.rules()
+                    if rule.direction == "in" and rule.kind == "network"
+                ],
+            )
+        from ..alias import to_wire
+
+        context = ToolBuildContext(
+            server_name=to_wire(cfg["name"]),
+            scope_store=self.scope,
+            agent_name=cfg["name"],
+            extra_tools=bus_bundle.tools,
+            extra_bare_wires=bus_wires,
+        )
+        return get_tool_bundle_builder()(
+            tool_cfg["type"],
+            factory_config,
+            context=context,
+        )
 
     def _on_loop_detected(
         self, runner: AgentRunner, tool_name: str, repeats: int, arg_hash: str

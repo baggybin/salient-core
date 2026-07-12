@@ -1,8 +1,8 @@
 """Per-agent runner — owns one AgentBackend task and its job queue.
 
 `AgentRunner` is the self-contained execution unit: it drives an
-`AgentBackend` (default `LocalClaudeBackend`, a passthrough over a
-`ClaudeSDKClient` subprocess), consumes a prompt queue, streams response
+`AgentBackend` supplied by the daemon's provider factory, consumes a prompt
+queue, streams normalized response
 blocks (text / thinking / tool-use / tool-result), emits structured
 events to subscribers + JSONL, tracks token + cost + refusal counters,
 and enforces the per-agent loop-detection + safeguard halt gates.
@@ -20,6 +20,7 @@ one-way: daemon → runner.
 
 import asyncio
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -29,7 +30,9 @@ from collections import Counter, deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, assert_never
+
+import anyio
 
 _log = logging.getLogger("salient.daemon.runner")
 
@@ -72,30 +75,36 @@ below also each both
 """.split()
 )
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
-
 from ..bus import ContextStore, _redact_secret_fields
 from ..display import (
     _emit,
     _format_tool_args,
     _format_tool_result,
     _prettify_tool_name,
-    _stringify_tool_result,
     _truncate,
 )
 from ..memory.actions import extract_target_keys_from_text, target_key_for_call
 from ..memory.credentials import cred_kinds, predicate_for_kind
+from ..policy.decision import ToolInvocation, text_identity
+from ..policy.registry import PolicyDataset, get_active
+from ..policy.safeguards import SafeguardConfig
+from ..policy.scope import ScopeStore
 from ..protocols import AgentBackend, DaemonServices
-from ._backend import LocalClaudeBackend
+from ..runtime import (
+    AssistantEvent,
+    ContextCompactedEvent,
+    MissingBackendError,
+    NativeActionCompletedEvent,
+    NativeActionStartedEvent,
+    ProviderErrorEvent,
+    TextContent,
+    ThinkingContent,
+    ToolBundle,
+    ToolCallContent,
+    ToolResultEvent,
+    TurnCompletedEvent,
+)
+from ._event_hub import fork_event
 from ._helpers import (
     _TEXT_FULL_INLINE_CAP,
     DEFAULT_HISTORY_MAX,
@@ -109,13 +118,26 @@ from ._prompts import (
     _extract_function_calls_from_text,
     _strip_llama_output_noise,
 )
+from ._text_policy import authorize_text
+
+
+async def _offload_blocking_io(
+    func: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if kwargs:
+        return await anyio.to_thread.run_sync(functools.partial(func, **kwargs), *args)
+    return await anyio.to_thread.run_sync(func, *args)
 
 
 @dataclass
 class AgentRunner:
     name: str
     cfg: dict[str, Any]
-    options: ClaudeAgentOptions
+    backend_factory: Callable[[], AgentBackend] | None = None
+    tool_bundle: ToolBundle = field(default_factory=ToolBundle)
     prompt_timeout: float = DEFAULT_PROMPT_TIMEOUT
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT
     context: ContextStore | None = None
@@ -135,11 +157,9 @@ class AgentRunner:
     last_active: float = field(default_factory=time.time)
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     recent_events: deque = field(default_factory=deque)
-    # The agent SDK backend the runner drives. Default is a 1:1 passthrough over
-    # a local ClaudeSDKClient (LocalClaudeBackend); a test or a future remote
-    # transport injects a different `backend_factory`. See daemon/_backend.py.
+    # The agent SDK backend the runner drives, constructed by the selected
+    # provider factory.
     _backend: AgentBackend | None = None
-    backend_factory: Callable[[ClaudeAgentOptions], AgentBackend] = LocalClaudeBackend
     _task: asyncio.Task | None = None
     _stop_requested: bool = False
     _next_job_id: int = 1
@@ -213,6 +233,11 @@ class AgentRunner:
     # is wanted, thread the profile dict into runner construction and
     # add an explicit fallback in __post_init__ + _check_loop.
     _recent_tool_calls: deque = field(default_factory=deque)
+    # (tool_name, arg_hash) keys we've already filed a loop question for. The
+    # detector clears `_recent_tool_calls` when it fires, so a genuinely stuck
+    # call would otherwise re-hit the threshold and re-file every few repeats —
+    # spamming the operator. Report each (tool, args) loop ONCE per agent.
+    _loop_reported: set = field(default_factory=set)
     # Cumulative per-tool-name call count. Surfaced via `info <agent>`
     # so the operator can see what the agent is actually using (tells
     # you whether the agent is leaning on its specialty tools or
@@ -231,8 +256,17 @@ class AgentRunner:
     _log_warned: set[str] = field(default_factory=set)
     # Scope store reference — used to render the live "Active scope" block
     # into every task message body, so the agent sees the authoritative
-    # rule set on each turn rather than having to ask the operator.
-    _scope_store: Any = None
+    # rule set on each turn rather than having to ask the operator. Stored
+    # behind a validating property (below) so a wrong-typed store fails loudly
+    # at assignment instead of silently degrading to "scope unconfigured".
+    _scope_store_ref: "ScopeStore | None" = field(default=None, repr=False, compare=False)
+    _policy_dataset: PolicyDataset | None = field(default=None, repr=False, compare=False)
+    _safeguard_config: SafeguardConfig = field(
+        default_factory=SafeguardConfig,
+        repr=False,
+        compare=False,
+    )
+    _enforce_builtin_policy: bool = field(default=False, repr=False, compare=False)
     # Action ledger reference — every ToolUseBlock records a row, every
     # ToolResultBlock fills in the outcome. Lets the daemon inject a
     # "Prior actions" block on each new task and gives the bus a
@@ -247,6 +281,22 @@ class AgentRunner:
     # because `_daemon` points back at the Daemon that owns this runner — a
     # recursive structure the dataclass repr/eq must not walk.
     _daemon: "DaemonServices | None" = field(default=None, repr=False, compare=False)
+    _legacy_trusted_builtin_warned: set[str] = field(
+        default_factory=set,
+        repr=False,
+        compare=False,
+    )
+    _legacy_trusted_builtin_warning_lock: anyio.Lock = field(
+        default_factory=anyio.Lock,
+        repr=False,
+        compare=False,
+    )
+    # Idempotency guard for cancel_job: the id of the in-flight job we've already
+    # fired an interrupt into, so two independent reap owners (an operator `bus
+    # cancel` and the ask_agent timeout reaper targeting the same child) can't
+    # double-interrupt one turn. Resets naturally when a new job becomes
+    # `current` (a different id).
+    _interrupted_job_id: int | None = field(default=None, repr=False, compare=False)
     # Daemon-wide event hub — _publish mirrors every event to the global
     # /ws/events/all stream (not just the per-agent tail).
     _event_hub: Any = field(default=None, repr=False, compare=False)  # EventHub
@@ -328,6 +378,29 @@ class AgentRunner:
         # queue at the next turn boundary (see steer() + _run).
         self._steer_lane: deque = deque()
 
+    def _create_backend(self) -> AgentBackend:
+        if self.backend_factory is not None:
+            return self.backend_factory()
+        raise MissingBackendError(self.name)
+
+    @property
+    def _scope_store(self) -> "ScopeStore | None":
+        return self._scope_store_ref
+
+    @_scope_store.setter
+    def _scope_store(self, store: "ScopeStore | None") -> None:
+        # Validate at the injection boundary: a non-None value that is not a
+        # ScopeStore (stale import, a mock leaking into prod, a refactored class)
+        # must NOT be silently coerced to None downstream — that would turn a
+        # config bug into a policy bypass. Fail loudly here instead.
+        if store is not None and not isinstance(store, ScopeStore):
+            raise TypeError(
+                f"{self.name!r} runner scope store must be a ScopeStore or None, "
+                f"got {type(store).__name__}; refusing to silently treat a "
+                "misconfigured scope store as unconfigured"
+            )
+        self._scope_store_ref = store
+
     def subscribe(self) -> tuple[asyncio.Queue, list[dict[str, Any]]]:
         """Subscribe to live events and get a snapshot of recent ones.
 
@@ -337,7 +410,10 @@ class AgentRunner:
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self.subscribers.append(q)
-        snapshot = list(self.recent_events)
+        # Fork each frame: the ring keeps the canonical event; this subscriber
+        # gets deeply-isolated copies it can annotate without corrupting the
+        # ring, another subscriber, or a later replay.
+        snapshot = [fork_event(evt) for evt in self.recent_events]
         return q, snapshot
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
@@ -414,7 +490,10 @@ class AgentRunner:
         self.recent_events.append(evt)
         for q in list(self.subscribers):
             try:
-                q.put_nowait(evt)
+                # Fork per subscriber: the ring keeps the canonical birth event;
+                # each consumer gets a deeply-isolated copy so annotating one
+                # subscriber's frame can't corrupt another's or a later replay.
+                q.put_nowait(fork_event(evt))
             except asyncio.QueueFull:
                 # Drop on backpressure — slow tailer shouldn't block the agent.
                 pass
@@ -558,9 +637,14 @@ class AgentRunner:
         operator question, etc.). Retry-after-gate-clears is correct
         agent behavior; the detector shouldn't fire on that pattern.
         See `_pop_loop_entry_on_gate_refusal` for the pop side."""
-        # Pattern-based exemption: read-only / polling tool names.
+        # Pattern-based exemption: read-only / polling tool names. `_read` covers
+        # `context_read`, which swarm workers legitimately poll while waiting for
+        # peers to write shared findings — hammering a side-effect-free read is a
+        # normal wait pattern, not a stuck loop, and the per-turn cap already bounds
+        # runaway polling. (A mutating tool named `*_read` would be a naming bug;
+        # tighten via the per-agent `loop_detection_ignore_patterns` override.)
         cfg = self.cfg or {}
-        default_patterns = ("_list", "_tasks", "_info", "_status", "_get")
+        default_patterns = ("_list", "_tasks", "_info", "_status", "_get", "_read")
         patterns = tuple(cfg.get("loop_detection_ignore_patterns") or default_patterns)
         ignore_tools = set(cfg.get("loop_detection_ignore_tools") or ())
         # Strip the MCP wrapper prefix for matching: mcp__server__tool → tool
@@ -595,6 +679,8 @@ class AgentRunner:
             self._recent_tool_calls.clear()
             if on_loop is None:
                 return
+            if not self._mark_loop_reported(key):
+                return  # already surfaced this (tool, args) loop once — don't spam
             try:
                 await _emit(
                     self.name,
@@ -633,6 +719,8 @@ class AgentRunner:
             return
         if on_loop is None:
             return
+        if not self._mark_loop_reported(key):
+            return  # already surfaced this (tool, args) loop once — don't spam
         try:
             await _emit(
                 self.name,
@@ -645,6 +733,18 @@ class AgentRunner:
             on_loop(self, tool_name, prior + 1, arg_hash)
         except Exception:
             pass
+
+    def _mark_loop_reported(self, key: tuple[str, str]) -> bool:
+        """Return True the FIRST time a (tool, arg_hash) loop is reported for this
+        agent, False thereafter — so the operator hears about a given stuck call
+        once, not on every threshold-th repeat. Bounded so a pathological agent
+        can't grow the set without limit."""
+        if key in self._loop_reported:
+            return False
+        self._loop_reported.add(key)
+        if len(self._loop_reported) > 512:
+            self._loop_reported.pop()
+        return True
 
     # Substrings in a tool-result that mark a deterministic, non-loop
     # refusal: the bus / scope / safeguard layer pre-empted the call,
@@ -725,7 +825,7 @@ class AgentRunner:
     async def _action_ledger_start(
         self,
         job: "Job",
-        block: ToolUseBlock,
+        block: ToolCallContent,
         pretty: str,
     ) -> None:
         """Record a started tool call. tool_use_id → row-id is stashed
@@ -740,13 +840,13 @@ class AgentRunner:
         if ledger is None:
             return
         try:
-            tk = target_key_for_call(pretty, block.input)
-            action_id = await asyncio.to_thread(
+            tk = target_key_for_call(pretty, block.arguments)
+            action_id = await _offload_blocking_io(
                 ledger.record_start,
                 agent=self.name,
                 job_id=job.id,
                 tool=pretty,
-                args=block.input,
+                args=block.arguments,
                 target_key=tk,
             )
             self._inflight_actions[block.id] = action_id
@@ -1021,7 +1121,7 @@ class AgentRunner:
     async def _maybe_log_refusal(
         self,
         job: "Job",
-        msg: AssistantMessage,
+        msg: AssistantEvent,
     ) -> None:
         """Detect Anthropic-side refusals AND SDK/transport errors on
         an assistant message and emit a structured `refusal` event
@@ -1057,12 +1157,12 @@ class AgentRunner:
         if msg is None:
             return
 
-        err = getattr(msg, "error", None)
-        stop = getattr(msg, "stop_reason", None)
+        err = msg.error_code
+        stop = msg.stop_reason
 
         text_content_parts: list[str] = []
         for block in msg.content or []:
-            if isinstance(block, TextBlock):
+            if isinstance(block, TextContent):
                 text_content_parts.append(block.text)
         text_content = "\n".join(text_content_parts).strip()
 
@@ -1154,7 +1254,7 @@ class AgentRunner:
 
     async def _action_ledger_finish(
         self,
-        block: ToolResultBlock,
+        block: ToolResultEvent,
         text: str,
         *,
         is_error: bool,
@@ -1165,7 +1265,7 @@ class AgentRunner:
         ledger = getattr(self, "_action_ledger", None)
         if ledger is None:
             return
-        action_id = self._inflight_actions.pop(block.tool_use_id, None)
+        action_id = self._inflight_actions.pop(block.tool_call_id, None)
         if action_id is None:
             return
         try:
@@ -1176,7 +1276,7 @@ class AgentRunner:
                 if stripped:
                     first_line = stripped
                     break
-            await asyncio.to_thread(
+            await _offload_blocking_io(
                 ledger.record_finish,
                 action_id,
                 outcome=outcome,
@@ -1286,7 +1386,7 @@ class AgentRunner:
         source: str | None = None,
         recipient: str | None = None,
     ) -> None:
-        await asyncio.to_thread(
+        await _offload_blocking_io(
             self._log_jsonl,
             kind,
             content,
@@ -1295,7 +1395,7 @@ class AgentRunner:
         )
 
     async def _record_evidence(self, job: "Job", kind: str, text: str) -> None:
-        await asyncio.to_thread(self._save_evidence, job, kind, text)
+        await _offload_blocking_io(self._save_evidence, job, kind, text)
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"agent:{self.name}")
@@ -1410,7 +1510,7 @@ class AgentRunner:
         with suppress(Exception):
             if self._backend is not None:
                 await self._backend.disconnect()
-        self._backend = self.backend_factory(self.options)
+        self._backend = self._create_backend()
         await self._backend.connect()
 
     async def _run_job(self, job: "Job") -> None:
@@ -1431,7 +1531,6 @@ class AgentRunner:
         # making progress through a series of long jobs.
         self._last_activity_ts = time.time()
         watchdog: asyncio.Task | None = None
-        idle_timeout_hit: float | None = None
         self._turn_active = True  # a turn is now streaming
         proc_task = asyncio.create_task(
             self._process(job),
@@ -1450,14 +1549,40 @@ class AgentRunner:
         try:
             await proc_task
         except asyncio.CancelledError:
-            # Watchdog cancelled us — fetch its return value
-            # (the actual idle seconds) for the attribution.
-            if watchdog is not None:
-                try:
-                    idle_timeout_hit = await watchdog
-                except Exception:
-                    idle_timeout_hit = self.prompt_timeout
-            idle_secs = idle_timeout_hit or self.prompt_timeout
+            # Attribute the cancellation to its INITIATOR before reclassifying.
+            # The idle watchdog cancels `proc_task`, so the CancelledError
+            # arrives THROUGH `await proc_task` while our own task's
+            # `cancelling()` stays 0. An external stop cancels the runner's
+            # OWNING task (`cancelling() > 0`) or trips `_stop_requested`.
+            # Blindly attributing every CancelledError to the watchdog turned an
+            # external stop into a false "idle timeout" and left the runner
+            # alive; only a genuine watchdog cancel may be reclassified as an
+            # idle timeout — anything else must re-raise so the cancellation
+            # actually unwinds the runner.
+            current = asyncio.current_task()
+            externally_cancelled = self._stop_requested or (
+                current is not None and current.cancelling() > 0
+            )
+            # Non-awaiting check: the watchdog's `return idle` completes its task
+            # in the same loop step as `proc_task.cancel()`, strictly before we
+            # resume here — so `.result()` is available without an `await` that
+            # would itself re-raise under external cancellation.
+            watchdog_fired = (
+                watchdog is not None
+                and watchdog.done()
+                and not watchdog.cancelled()
+                and watchdog.exception() is None
+                and watchdog.result() is not None
+            )
+            if externally_cancelled or not watchdog_fired:
+                # External stop wins over idle attribution (a hung stop is worse
+                # than a mislabeled job error); an unattributed cancel we refuse
+                # to guess about is likewise treated as external. Record a
+                # terminal reason and re-raise so the runner's task unwinds
+                # instead of returning to idle.
+                job.error = "runner stopping"
+                raise
+            idle_secs = watchdog.result() or self.prompt_timeout  # type: ignore[union-attr]
             job.error = f"idle timeout after {idle_secs:.0f}s of inactivity"
             self._last_interrupt_reason = (
                 f"RUNNER IDLE TIMEOUT after {idle_secs:.0f}s "
@@ -1477,11 +1602,15 @@ class AgentRunner:
             # SDK internal error. See classify_run_loop_error
             # for the full layering — extracted so the logic
             # is unit-testable without standing up the SDK.
-            job.error = classify_run_loop_error(
-                self.name,
-                e,
-                self._backend.raw if self._backend else None,
-                stderr_tail=self.stderr_buffer,
+            job.error = (
+                self._backend.diagnose_failure(self.name, e, tuple(self.stderr_buffer))
+                if self._backend is not None
+                else classify_run_loop_error(
+                    self.name,
+                    e,
+                    None,
+                    stderr_tail=self.stderr_buffer,
+                )
             )
             await self._log("tool-error", job.error)
         finally:
@@ -1531,7 +1660,7 @@ class AgentRunner:
 
     async def _run(self) -> None:
         try:
-            self._backend = self.backend_factory(self.options)
+            self._backend = self._create_backend()
             await self._backend.connect()
             self.status = "idle"
             await self._log("start", "ready")
@@ -1568,9 +1697,16 @@ class AgentRunner:
                 if self._backend is not None:
                     try:
                         usage = await self._backend.get_context_usage()
-                        # ContextUsageResponse is a TypedDict; we want the
-                        # plain dict for JSON serialization downstream.
-                        self.last_context_usage = dict(usage) if usage is not None else None
+                        self.last_context_usage = (
+                            {
+                                "totalTokens": usage.used_tokens,
+                                "maxTokens": usage.max_tokens,
+                                "percentage": usage.percentage,
+                                "model": usage.model,
+                            }
+                            if usage is not None
+                            else None
+                        )
                     except Exception:
                         pass
                 # Run completion hook BEFORE the context-bus write so it can
@@ -1585,7 +1721,7 @@ class AgentRunner:
                     # to <agent>/job_<id> but nothing ever read those keys
                     # (no context_read consumer references them) — the
                     # extra UPSERT was pure SQLite waste.
-                    await asyncio.to_thread(
+                    await _offload_blocking_io(
                         self.context.write,
                         self.name,
                         "latest",
@@ -1595,7 +1731,7 @@ class AgentRunner:
                 # operator's `info <agent>` view (and any future audit)
                 # survives a daemon restart.
                 if self.context is not None:
-                    await asyncio.to_thread(
+                    await _offload_blocking_io(
                         self.context.record_job,
                         agent=self.name,
                         job_id=job.id,
@@ -1727,17 +1863,17 @@ class AgentRunner:
             chunks_before = len(chunks)
             tools_before = tool_uses_in_job
             async for msg in self._backend.receive_response():
-                if isinstance(msg, AssistantMessage):
+                if isinstance(msg, AssistantEvent):
                     turn_count += 1
                     self.current_turn_count = turn_count
                     for block in msg.content:
-                        if isinstance(block, TextBlock):
+                        if isinstance(block, TextContent):
                             chunks.append(block.text)
                             await self._log("text", block.text)
-                        elif isinstance(block, ThinkingBlock):
-                            if block.thinking.strip():
-                                await self._log_truncated("thinking", block.thinking, 800)
-                        elif isinstance(block, ToolUseBlock):
+                        elif isinstance(block, ThinkingContent):
+                            if block.text.strip():
+                                await self._log_truncated("thinking", block.text, 800)
+                        elif isinstance(block, ToolCallContent):
                             tool_uses_in_job += 1
                             # Redact secret arg VALUES (password / api_token / …)
                             # up front so neither the live operator feed, the
@@ -1747,7 +1883,7 @@ class AgentRunner:
                             # which need the real args (loop dedup +
                             # prior_actions retry).
                             safe_input = _redact_secret_fields(
-                                block.input,
+                                block.arguments,
                                 tool=block.name,
                             )
                             args = _format_tool_args(safe_input)
@@ -1799,10 +1935,12 @@ class AgentRunner:
                             self.tool_call_counts[pretty] += 1
                             await self._check_loop(
                                 block.name,
-                                block.input,
+                                block.arguments,
                                 tool_use_id=block.id,
                             )
                             await self._action_ledger_start(job, block, pretty)
+                        else:
+                            assert_never(block)
                     # After all blocks are processed, check whether THIS
                     # assistant message is a Usage-Policy / API-error refusal
                     # and emit a structured `refusal` event if so.
@@ -1839,97 +1977,120 @@ class AgentRunner:
                             if self._backend is not None:
                                 await self._backend.interrupt()
                         break
-                elif isinstance(msg, UserMessage):
-                    if isinstance(msg.content, list):
-                        for block in msg.content:
-                            if isinstance(block, ToolResultBlock):
-                                text = _format_tool_result(_stringify_tool_result(block.content))
-                                # Runner-initiated cancellations come
-                                # back from the SDK as the stock string
-                                # "The user doesn't want to proceed with
-                                # this tool use..." Rewrite the displayed
-                                # text to make the actual cause visible
-                                # so the operator transcript doesn't
-                                # falsely implicate them. _last_interrupt
-                                # _reason is set by the timeout / hard-
-                                # cap / stop(kill) paths and consumed on
-                                # the first matching ToolResultBlock.
-                                if (
-                                    block.is_error
-                                    and self._last_interrupt_reason is not None
-                                    and "doesn't want to proceed" in text
-                                ):
-                                    text = (
-                                        f"[{self._last_interrupt_reason}]"
-                                        f"\n\n--- SDK message follows ---\n\n{text}"
-                                    )
-                                    self._last_interrupt_reason = None
-                                kind = "tool-error" if block.is_error else "tool-result"
-                                await self._record_evidence(job, kind, text)
-                                # Carry the originating tool_use_id so stream
-                                # consumers (TUI REPL) can pair this result
-                                # with its tool-call block.
-                                await self._log_truncated(
-                                    kind,
-                                    text,
-                                    600,
-                                    meta={
-                                        "tool_result": {
-                                            "tool_use_id": block.tool_use_id,
-                                            "is_error": block.is_error,
-                                        }
-                                    },
-                                )
-                                # Untruncated text in the JSONL so `logs grep`
-                                # finds usage dumps / Errors past the 600-char
-                                # display cap.
-                                await self._record_jsonl(
-                                    kind,
-                                    {
-                                        "text": text,
-                                        "job_id": job.id,
-                                    },
-                                )
-                                await self._action_ledger_finish(
-                                    block, text, is_error=bool(block.is_error)
-                                )
-                                # If this was a deterministic gate refusal
-                                # (e.g. "pending operator question"), pop
-                                # the matching loop-ring entry so the
-                                # agent's retry after the gate clears
-                                # doesn't look like a stuck thought-loop.
-                                if block.is_error:
-                                    self._pop_loop_entry_on_gate_refusal(
-                                        block.tool_use_id,
-                                        text,
-                                    )
-                elif isinstance(msg, ResultMessage):
-                    cost = msg.total_cost_usd or 0.0
-                    # Pull token usage defensively — SDK structure may evolve.
-                    # Anthropic API usage fields: input_tokens, output_tokens,
-                    # cache_creation_input_tokens, cache_read_input_tokens.
-                    usage = getattr(msg, "usage", None) or {}
-                    if hasattr(usage, "__dict__"):
-                        usage = usage.__dict__
-                    in_t = int(usage.get("input_tokens", 0) or 0) if isinstance(usage, dict) else 0
-                    out_t = (
-                        int(usage.get("output_tokens", 0) or 0) if isinstance(usage, dict) else 0
+                elif isinstance(msg, ToolResultEvent):
+                    text = _format_tool_result(msg.content)
+                    if (
+                        msg.is_error
+                        and self._last_interrupt_reason is not None
+                        and "doesn't want to proceed" in text
+                    ):
+                        text = (
+                            f"[{self._last_interrupt_reason}]"
+                            f"\n\n--- SDK message follows ---\n\n{text}"
+                        )
+                        self._last_interrupt_reason = None
+                    kind = "tool-error" if msg.is_error else "tool-result"
+                    await self._record_evidence(job, kind, text)
+                    await self._log_truncated(
+                        kind,
+                        text,
+                        600,
+                        meta={
+                            "tool_result": {
+                                "tool_use_id": msg.tool_call_id,
+                                "is_error": msg.is_error,
+                            }
+                        },
                     )
-                    cache_r = (
-                        int(usage.get("cache_read_input_tokens", 0) or 0)
-                        if isinstance(usage, dict)
-                        else 0
+                    await self._record_jsonl(
+                        kind,
+                        {
+                            "text": text,
+                            "job_id": job.id,
+                        },
                     )
-                    cache_c = (
-                        int(usage.get("cache_creation_input_tokens", 0) or 0)
-                        if isinstance(usage, dict)
-                        else 0
+                    await self._action_ledger_finish(msg, text, is_error=msg.is_error)
+                    if msg.is_error:
+                        self._pop_loop_entry_on_gate_refusal(msg.tool_call_id, text)
+                elif isinstance(msg, NativeActionStartedEvent):
+                    block = ToolCallContent(msg.id, msg.name, msg.arguments)
+                    pretty = _prettify_tool_name(msg.name)
+                    safe_input = _redact_secret_fields(msg.arguments, tool=msg.name)
+                    label = f"{pretty}  {_format_tool_args(safe_input)}"
+                    await self._log_truncated(
+                        "tool-call",
+                        label,
+                        400,
+                        meta={
+                            "native_action": {
+                                "id": msg.id,
+                                "kind": msg.kind.value,
+                                "name": pretty,
+                                "input": safe_input,
+                            },
+                            # Also emit the provider-neutral tool_call identity the
+                            # Claude path ships so stream consumers (TUI REPL pairing,
+                            # web card) render native/MCP tool calls the same way.
+                            "tool_call": {
+                                "id": msg.id,
+                                "name": pretty,
+                                "input": safe_input,
+                            },
+                        },
                     )
+                    # Persist to JSONL + the events DB table so `logs grep` and the
+                    # `events` query surface native / MCP tool calls too — _log skips
+                    # this for tool-* kinds, so (unlike Claude's ToolCallContent path)
+                    # native actions were invisible to those views.
+                    await self._record_jsonl(
+                        "tool-call",
+                        {
+                            "tool": msg.name,
+                            "tool_pretty": pretty,
+                            "input": safe_input,
+                            "label": label,
+                            "job_id": job.id,
+                        },
+                    )
+                    tool_uses_in_job += 1
+                    self.tool_call_counts[pretty] += 1
+                    await self._check_loop(msg.name, msg.arguments, tool_use_id=msg.id)
+                    await self._action_ledger_start(job, block, pretty)
+                elif isinstance(msg, NativeActionCompletedEvent):
+                    result = ToolResultEvent(msg.id, msg.content, msg.is_error)
+                    kind = "tool-error" if msg.is_error else "tool-result"
+                    text = _format_tool_result(msg.content)
+                    await self._record_evidence(job, kind, text)
+                    await self._log_truncated(
+                        kind,
+                        text,
+                        600,
+                        meta={
+                            "native_action_result": {
+                                "id": msg.id,
+                                "kind": msg.kind.value,
+                                "is_error": msg.is_error,
+                            },
+                            "tool_result": {
+                                "tool_use_id": msg.id,
+                                "is_error": msg.is_error,
+                            },
+                        },
+                    )
+                    await self._record_jsonl(kind, {"text": text, "job_id": job.id})
+                    await self._action_ledger_finish(result, text, is_error=msg.is_error)
+                elif isinstance(msg, TurnCompletedEvent):
+                    cost = msg.usage.cost_usd
+                    in_t = msg.usage.input_tokens
+                    out_t = msg.usage.output_tokens
+                    cache_r = msg.usage.cache_read_tokens
+                    cache_c = msg.usage.cache_create_tokens
                     self.total_input_tokens += in_t
                     self.total_output_tokens += out_t
                     self.total_cache_read_tokens += cache_r
                     self.total_cache_create_tokens += cache_c
-                    self.total_cost_usd += cost
+                    if cost is not None:
+                        self.total_cost_usd += cost
                     self.total_jobs_completed += 1
                     self.last_input_tokens = in_t
                     self.last_output_tokens = out_t
@@ -1939,9 +2100,10 @@ class AgentRunner:
                     # we don't need to know about it here.
                     self._tokens_since_checkpoint += in_t + cache_r + cache_c
                     tok_summary = f" tokens={in_t}/{out_t} (in/out)" if (in_t or out_t) else ""
+                    cost_summary = f"${cost:.4f}" if cost is not None else "n/a"
                     await self._log(
                         "done",
-                        f"turns={msg.num_turns} cost=${cost:.4f} "
+                        f"turns={msg.turns} cost={cost_summary} "
                         f"duration={msg.duration_ms}ms{tok_summary}",
                         # Structured per-turn usage for stream consumers (the
                         # TUI REPL StatusBar). The numbers were previously only
@@ -1956,22 +2118,39 @@ class AgentRunner:
                             }
                         },
                     )
+                elif isinstance(msg, ProviderErrorEvent):
+                    job.error = f"{msg.code}: {msg.message}"
+                    await self._log("tool-error", job.error)
+                elif isinstance(msg, ContextCompactedEvent):
+                    await self._log("system", msg.summary)
+                else:
+                    assert_never(msg)
             # Inner receive_response loop has ended (ResultMessage hit or
             # hard-cap break). Decide whether this phase was a "silent
             # completion" — no tool calls AND no <ask_operator> tag AND a
             # caller is awaiting our reply — and if so, re-prompt ONCE.
+            if job.error is not None:
+                break
             tools_this_phase = tool_uses_in_job - tools_before
             phase_text = "".join(chunks[chunks_before:])
             # An operator steer that interrupted this turn ends it early by
             # design — don't treat that as a silent completion to re-prompt.
             steer_truncated = self._steer_interrupt_pending
             self._steer_interrupt_pending = False
+            # A text reply IS the deliverable — `job.result` (the accumulated
+            # chunks) is returned to the awaiting caller, so an agent that answered
+            # in prose never stranded anyone. Only nudge when the phase produced
+            # NOTHING: no text, no tool call, no `<ask_operator>`. Without the
+            # empty-text guard a delegated agent that simply answers (common on
+            # codex, which reaches for tools/ask_operator less readily) gets
+            # re-prompted and its reply is duplicated.
             silent = (
                 not nudge_fired
                 and not cap_fired
                 and not steer_truncated
                 and job.future is not None
                 and tools_this_phase == 0
+                and not phase_text.strip()
                 and "<ask_operator>" not in phase_text
             )
             if not silent:
@@ -2124,7 +2303,15 @@ class AgentRunner:
                 "'doesn't want to proceed' echo below is the wire-level "
                 "cancellation, not a tool-use rejection."
             )
-            if self._turn_active and self._backend is not None:
+            if (
+                self._turn_active
+                and self._backend is not None
+                and self._interrupted_job_id != job_id
+            ):
+                # Record BEFORE the await so a re-entrant cancel_job for the same
+                # job (concurrent reap owners) sees the guard and skips a second
+                # interrupt.
+                self._interrupted_job_id = job_id
                 with suppress(Exception):
                     await self._backend.interrupt()
             return True
@@ -2255,7 +2442,7 @@ class AgentRunner:
             predicate = predicate_for_kind(kind)
             obj = f"secret:{kind}:{value}"
             try:
-                fact = daemon.kg.assert_fact(
+                daemon.kg.assert_fact(
                     subject,
                     predicate,
                     obj,
@@ -2280,7 +2467,7 @@ class AgentRunner:
                 )
             return (
                 True,
-                f"recorded: {fact}",
+                f"recorded credential for {user!r} ({kind})",
                 f"user={user!r} kind={kind!r}" + (f" host={host!r}" if host else ""),
             )
         return None, "", ""
@@ -2335,8 +2522,7 @@ class AgentRunner:
             # Names may arrive bare ("ask_operator") or MCP-qualified
             # ("mcp__bus__<agent>__ask_operator"). Normalize to bare.
             bare = raw_name.rsplit("__", 1)[-1] if "__" in raw_name else raw_name
-            ok, result_text, args_for_log = self._synthetic_dispatch(daemon, bare, args)
-            if ok is None:
+            if bare not in {"ask_operator", "context_write", "kg_assert", "cred_record"}:
                 # Tool isn't in the side-effect-only allowlist — surface
                 # so the operator can see WHY their agent is producing
                 # JSON gibberish, but don't try to fake the result back
@@ -2348,6 +2534,31 @@ class AgentRunner:
                     "ends its turn — its next call would consume nothing)",
                 )
                 continue
+            invocation = ToolInvocation.normalize(text_identity(raw_name, self.name), args)
+            authorization = await authorize_text(
+                invocation,
+                dataset=self._policy_dataset or get_active(),
+                safeguards=self._safeguard_config,
+                safeguard_count=self.total_safeguard_blocks,
+                scope_store=self._scope_store,
+                enforce=self._enforce_builtin_policy,
+            )
+            self.total_safeguard_blocks += authorization.counter_delta
+            await self._record_jsonl(authorization.event, authorization.payload)
+            if not authorization.dispatch_allowed:
+                result_text = f"policy error: {authorization.reason}"
+                await self._log("tool-error", _truncate(result_text, 200))
+                await self._record_jsonl(
+                    "tool-error",
+                    {
+                        "text": result_text,
+                        "job_id": job.id,
+                        "synthetic": True,
+                    },
+                )
+                continue
+            ok, result_text, args_for_log = self._synthetic_dispatch(daemon, bare, args)
+            assert ok is not None
             label = (
                 f"bus.{self.name}.{bare}(synthetic, from JSON-as-text)  "
                 f"{_truncate(args_for_log, 200)}"

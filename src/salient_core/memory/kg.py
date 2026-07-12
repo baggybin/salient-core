@@ -32,7 +32,8 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,39 @@ _ACTIVE_CLAUSE = "(expires_at IS NULL OR expires_at > ?)"
 # stay reachable ONLY when a caller passes the matching `subject_prefix`
 # explicitly (the tutor does: kg_semantic_query(subject_prefix="pedagogy:")).
 _META_PREFIXES: tuple[str, ...] = ("pedagogy:",)
+
+
+# ── source-provenance resolver seam ──────────────────────────────────────
+# A Fact's `source_ref` is an opaque, scheme-tagged pointer ("archive:...",
+# "tool:...") back to the raw evidence a fact was distilled from. The kernel
+# STORES and surfaces it but NEVER dereferences it — a downstream skin registers
+# per-scheme resolvers that load and REDACT the raw evidence (so no unredacted
+# tool output can leak through the security-neutral core). Same injection idiom
+# as the credential-vocab / kg_assert_hook seams: an un-skinned core has no
+# resolvers, so resolution is a no-op and provenance stays display-only.
+_SOURCE_RESOLVERS: dict[str, Callable[[str], Any]] = {}
+
+
+def register_source_resolver(scheme: str, fn: Callable[[str], Any]) -> None:
+    """Register a resolver for `source_ref`s of the form ``<scheme>:...`` (e.g.
+    ``archive`` or ``tool``). Called once at startup by a downstream skin. The
+    resolver receives the FULL source_ref string and returns whatever (already
+    redacted) evidence it chooses; the kernel does not interpret the result."""
+    _SOURCE_RESOLVERS[scheme.strip().lower()] = fn
+
+
+def resolve_source_ref(source_ref: str | None) -> Any:
+    """Dereference a Fact's `source_ref` via the resolver registered for its
+    scheme. Returns None when there's no ref, no scheme, or no matching resolver
+    — the kernel never loads raw evidence itself, so an un-skinned core always
+    returns None (provenance is display-only until a skin wires a resolver)."""
+    if not source_ref:
+        return None
+    scheme, sep, _rest = source_ref.partition(":")
+    if not sep:
+        return None
+    fn = _SOURCE_RESOLVERS.get(scheme.strip().lower())
+    return fn(source_ref) if fn is not None else None
 
 
 def _like_prefix(prefix: str) -> str:
@@ -151,13 +185,26 @@ def _load_corroborators(
 
 
 def _fact_with_corroboration(row: tuple) -> Fact:
-    """Build a Fact from an 11-column row — the 9 base columns followed by
-    `corroborators` (JSON) and `contradiction`. Decodes the map (with the
-    legacy single-agent fallback) and attaches both. Used by the read paths
-    so agent-facing output can show the corroboration / contradiction flags."""
+    """Build a Fact from a 12-column row — the 9 base columns followed by
+    `corroborators` (JSON), `contradiction`, and `source_ref`. Decodes the map
+    (with the legacy single-agent fallback) and attaches all three. Used by the
+    read paths so agent-facing output can show the corroboration / contradiction
+    flags and the provenance pointer."""
     f = Fact(*row[:9])
     f.corroborators = _load_corroborators(row[9], f.agent, f.confidence)
     f.contradiction = row[10]
+    f.source_ref = row[11]
+    return f
+
+
+def _fact_with_source(row: tuple) -> Fact:
+    """Build a Fact from a 10-column row — the 9 base columns followed by
+    `source_ref`. Used by the archive/export paths, which carry provenance (so a
+    restored fact keeps its evidence pointer) but not the corroboration map.
+    `source_ref` is attached explicitly, never positionally, so it can't land in
+    the trailing `corroborators`/`contradiction` slots of `Fact(*row[:9])`."""
+    f = Fact(*row[:9])
+    f.source_ref = row[9]
     return f
 
 
@@ -182,6 +229,12 @@ class Fact:
     corroborators: dict[str, float] | None = None
     # Free-text note an agent attached flagging a conflict; None = none.
     contradiction: str | None = None
+    # Opaque, scheme-tagged pointer back to the raw evidence this fact was
+    # distilled from (e.g. "archive:sha256:<hash>#<span>", "tool:nmap#L47").
+    # None = no recorded provenance (all legacy facts, and any asserted without
+    # one). Trailing + defaulted so `Fact(*row[:9])` positional unpacking stays
+    # valid; attached explicitly by the read paths, like corroborators above.
+    source_ref: str | None = None
 
     @property
     def corroboration_count(self) -> int:
@@ -212,19 +265,24 @@ class Fact:
             "corroboration_count": self.corroboration_count,
             "corroborated": self.corroborated,
             "contradiction": self.contradiction,
+            "source_ref": self.source_ref,
         }
 
     def __str__(self) -> str:
         prov = f" [{self.agent}/{self.engagement_id or '?'}]" if self.agent else ""
         corr = f" [corroborated ×{self.corroboration_count}]" if self.corroborated else ""
         flag = " [CONTRADICTION FLAGGED]" if self.contradiction else ""
-        return f"({self.subject}) -[{self.predicate}]-> ({self.object}){prov}{corr}{flag}"
+        src = " [src]" if self.source_ref else ""
+        return f"({self.subject}) -[{self.predicate}]-> ({self.object}){prov}{corr}{flag}{src}"
 
 
 class KnowledgeGraph:
-    """SQLite-backed triple store. Thread-safe via a single lock around the
-    in-process connection (we only have one daemon writer; concurrent reads
-    serialize but that's fine at this scale)."""
+    """SQLite-backed triple store. One writer, snapshot-isolated readers:
+    mutating methods serialize on a single locked write connection and run
+    inside a real transaction (commit on success, ROLLBACK on exception);
+    read methods use per-thread READ-ONLY connections with no lock — WAL
+    gives each a consistent snapshot concurrent with writes, so a slow
+    reader never blocks the writer or other readers."""
 
     def __init__(self, db_path: Path) -> None:
         self._lock = threading.RLock()
@@ -234,12 +292,21 @@ class KnowledgeGraph:
             str(db_path), check_same_thread=False
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Wait out a concurrent writer instead of failing fast; NORMAL is
+        # durable enough under WAL (a power cut loses at most the last
+        # transaction, never corrupts) and avoids FULL's fsync-per-commit.
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._migrate()
         # Safe now: _SCHEMA created the column on a fresh DB and _migrate
         # ALTERed it onto an old one, so expires_at is guaranteed present.
         self._conn.execute(_EXPIRES_INDEX)
         self._conn.commit()
+        # Reader-side state: one READ-ONLY connection per thread, created
+        # lazily by _read_conn and tracked so close() can close them all.
+        self._local = threading.local()
+        self._read_conns: list[sqlite3.Connection] = []
 
     def _migrate(self) -> None:
         """Additive, idempotent schema migrations for DBs created before a
@@ -282,10 +349,61 @@ class KnowledgeGraph:
         # non-learner fact leaves it NULL and is wholly unaffected.
         if "review_due" not in cols:
             self._conn.execute("ALTER TABLE kg_facts ADD COLUMN review_due REAL")
+        # Provenance pointer (added 2026-07). `source_ref` is one OPAQUE,
+        # scheme-tagged string linking a fact back to the raw evidence it was
+        # distilled from — e.g. "archive:sha256:<hash>#<span>" or "tool:nmap#L47".
+        # The kernel only STORES and surfaces it; a downstream skin registers
+        # resolvers (register_source_resolver) that dereference + redact it.
+        # Nullable; a legacy row leaves it NULL and behaves exactly as before.
+        # Set only by trusted internal callers (the demotion distiller, the
+        # curator) — NOT the agent-facing kg_assert — so provenance can't be
+        # forged. _migrate-only (like embedding/review_due), runs on every open.
+        if "source_ref" not in cols:
+            self._conn.execute("ALTER TABLE kg_facts ADD COLUMN source_ref TEXT")
 
     @property
     def db_path(self) -> Path:
         return self._db_path
+
+    # ── connection discipline ───────────────────────────────────────────
+    # One writer, snapshot-isolated readers. Writers serialize on the lock
+    # and run inside a real transaction; readers take NO lock — each thread
+    # gets its own read-only connection and WAL snapshot isolation, so a
+    # slow read (semantic_query's fetchall over embedding blobs) blocks
+    # neither the writer nor other readers.
+
+    @contextmanager
+    def _write_txn(self) -> Iterator[sqlite3.Connection]:
+        """Serialize writers and make each write transactional: the
+        connection context manager commits on success and ROLLS BACK on
+        exception, so a failed write can never leak an open transaction
+        (and half a write) to the next lock-holder."""
+        with self._lock:
+            assert self._conn is not None
+            with self._conn:
+                yield self._conn
+
+    def _read_conn(self) -> sqlite3.Connection | None:
+        """This thread's READ-ONLY connection, or None once the store is
+        closed. mode=ro means a coding mistake in a read path can never
+        write; the 5s timeout waits out WAL checkpoint edges."""
+        if self._conn is None:
+            return None
+        conn = getattr(self._local, "read_conn", None)
+        if conn is None:
+            conn = sqlite3.connect(
+                f"file:{self._db_path}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+            with self._lock:
+                if self._conn is None:  # closed while we were connecting
+                    conn.close()
+                    return None
+                self._read_conns.append(conn)
+            self._local.read_conn = conn
+        return conn
 
     # ── writes ──────────────────────────────────────────────────────────
 
@@ -300,6 +418,7 @@ class KnowledgeGraph:
         engagement_id: str | None = None,
         expires_at: float | None = None,
         contradicts: str | None = None,
+        source_ref: str | None = None,
         dedupe: bool = True,
     ) -> Fact:
         """Record (subject, predicate, object). When `dedupe` is True (default)
@@ -317,6 +436,13 @@ class KnowledgeGraph:
         Stored on the row and returned on the Fact so the bus wrapper can flag
         the operator. A new value overrides; absence preserves any prior flag.
 
+        `source_ref` (optional): an opaque, scheme-tagged pointer back to the raw
+        evidence this fact was distilled from (e.g. "archive:sha256:<hash>#<span>").
+        Stored verbatim; the kernel never dereferences it (a skin resolver does).
+        Same merge semantics as `contradicts` — a new stamp overrides; absence
+        preserves the earliest evidence anchor on a re-asserted triple. Set only
+        by trusted internal callers, never the agent-facing kg_assert.
+
         `expires_at` is an absolute epoch after which the fact stops showing
         up in reads (None = permanent). The dedup lookup is intentionally
         NOT filtered by expiry: re-asserting an expired-but-unpurged triple
@@ -327,18 +453,19 @@ class KnowledgeGraph:
             raise ValueError("subject, predicate, object all required")
         ts = time.time()
         contradiction = (contradicts or "").strip() or None
-        with self._lock:
-            assert self._conn is not None
+        src_ref = (source_ref or "").strip() or None
+        with self._write_txn() as conn:
             if dedupe:
-                row = self._conn.execute(
-                    "SELECT id, confidence, corroborators, contradiction, agent "
+                row = conn.execute(
+                    "SELECT id, confidence, corroborators, contradiction, agent, "
+                    "source_ref "
                     "FROM kg_facts "
                     "WHERE subject=? AND predicate=? AND object=? "
                     "LIMIT 1",
                     (s, p, o),
                 ).fetchone()
                 if row is not None:
-                    fid, old_conf, raw_map, old_contra, old_agent = row
+                    fid, old_conf, raw_map, old_contra, old_agent, old_ref = row
                     # Seed the map from the EXISTING row's agent on a legacy
                     # NULL map — not the new asserter — so the prior agent's
                     # confidence isn't misattributed.
@@ -352,10 +479,13 @@ class KnowledgeGraph:
                     )
                     # New flag overrides; absence keeps any prior contradiction.
                     new_contra = contradiction or old_contra
-                    self._conn.execute(
+                    # Same for provenance: a new stamp overrides, absence
+                    # preserves the earliest evidence anchor.
+                    new_ref = src_ref or old_ref
+                    conn.execute(
                         "UPDATE kg_facts SET ts=?, confidence=?, agent=?, "
                         "engagement_id=?, expires_at=?, corroborators=?, "
-                        "contradiction=? WHERE id=?",
+                        "contradiction=?, source_ref=? WHERE id=?",
                         (
                             ts,
                             new_conf,
@@ -364,21 +494,22 @@ class KnowledgeGraph:
                             expires_at,
                             json.dumps(cmap) if cmap else None,
                             new_contra,
+                            new_ref,
                             fid,
                         ),
                     )
-                    self._conn.commit()
                     f = Fact(fid, s, p, o, new_conf, agent, engagement_id, ts, expires_at)
                     f.corroborators = cmap or None
                     f.contradiction = new_contra
+                    f.source_ref = new_ref
                     return f
             cmap = {agent: float(confidence)} if agent else {}
             stored_conf = _combined_confidence(cmap) if cmap else float(confidence)
-            cur = self._conn.execute(
+            cur = conn.execute(
                 "INSERT INTO kg_facts (subject, predicate, object, "
                 "confidence, agent, engagement_id, ts, expires_at, "
-                "corroborators, contradiction) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "corroborators, contradiction, source_ref) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     s,
                     p,
@@ -390,13 +521,14 @@ class KnowledgeGraph:
                     expires_at,
                     json.dumps(cmap) if cmap else None,
                     contradiction,
+                    src_ref,
                 ),
             )
-            self._conn.commit()
             fid = cur.lastrowid or 0
             f = Fact(fid, s, p, o, stored_conf, agent, engagement_id, ts, expires_at)
             f.corroborators = cmap or None
             f.contradiction = contradiction
+            f.source_ref = src_ref
             return f
 
     # ── tutor learner-model scheduling ───────────────────────────────────
@@ -431,14 +563,14 @@ class KnowledgeGraph:
         interval just completed (review_due - ts), or None for a first review."""
         s, o = subject.strip(), object_.strip()
         ph = ",".join("?" for _ in self._STRONG_WEAK)
-        with self._lock:
-            assert self._conn is not None
-            row = self._conn.execute(
-                f"SELECT predicate, confidence, ts, review_due FROM kg_facts "
-                f"WHERE subject=? AND object=? AND predicate IN ({ph}) "
-                f"ORDER BY ts DESC LIMIT 1",
-                (s, o, *self._STRONG_WEAK),
-            ).fetchone()
+        conn = self._read_conn()
+        assert conn is not None
+        row = conn.execute(
+            f"SELECT predicate, confidence, ts, review_due FROM kg_facts "
+            f"WHERE subject=? AND object=? AND predicate IN ({ph}) "
+            f"ORDER BY ts DESC LIMIT 1",
+            (s, o, *self._STRONG_WEAK),
+        ).fetchone()
         if row is None:
             return None
         predicate, conf, ts_, review_due = row
@@ -472,22 +604,21 @@ class KnowledgeGraph:
             raise ValueError("subject, object, predicate all required")
         ts = now if now is not None else time.time()
         cmap = {agent: float(mastery)} if agent else {}
-        with self._lock:
-            assert self._conn is not None
+        with self._write_txn() as conn:
             others = [p for p in self._STRONG_WEAK if p != predicate]
             if others:
                 ph = ",".join("?" for _ in others)
-                self._conn.execute(
+                conn.execute(
                     f"DELETE FROM kg_facts WHERE subject=? AND object=? AND predicate IN ({ph})",
                     (s, o, *others),
                 )
-            existing = self._conn.execute(
+            existing = conn.execute(
                 "SELECT id FROM kg_facts WHERE subject=? AND predicate=? AND object=? LIMIT 1",
                 (s, predicate, o),
             ).fetchone()
             if existing is not None:
                 fid = existing[0]
-                self._conn.execute(
+                conn.execute(
                     "UPDATE kg_facts SET confidence=?, agent=?, ts=?, "
                     "expires_at=NULL, review_due=?, corroborators=? WHERE id=?",
                     (
@@ -500,7 +631,7 @@ class KnowledgeGraph:
                     ),
                 )
             else:
-                cur = self._conn.execute(
+                cur = conn.execute(
                     "INSERT INTO kg_facts (subject, predicate, object, "
                     "confidence, agent, engagement_id, ts, expires_at, "
                     "review_due, corroborators) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -518,7 +649,6 @@ class KnowledgeGraph:
                     ),
                 )
                 fid = cur.lastrowid or 0
-            self._conn.commit()
         f = Fact(fid, s, predicate, o, float(mastery), agent, None, ts, None)
         f.corroborators = cmap or None
         return f
@@ -538,15 +668,15 @@ class KnowledgeGraph:
         so always present; misconception/profile facts surface while
         unexpired."""
         now = now if now is not None else time.time()
-        with self._lock:
-            assert self._conn is not None
-            rows = self._conn.execute(
-                "SELECT id, subject, predicate, object, confidence, agent, "
-                f"engagement_id, ts, expires_at, review_due FROM kg_facts "
-                f"WHERE subject=? AND {_ACTIVE_CLAUSE} "
-                "ORDER BY ts DESC LIMIT ?",
-                (subject.strip(), now, int(limit)),
-            ).fetchall()
+        conn = self._read_conn()
+        assert conn is not None
+        rows = conn.execute(
+            "SELECT id, subject, predicate, object, confidence, agent, "
+            f"engagement_id, ts, expires_at, review_due FROM kg_facts "
+            f"WHERE subject=? AND {_ACTIVE_CLAUSE} "
+            "ORDER BY ts DESC LIMIT ?",
+            (subject.strip(), now, int(limit)),
+        ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             review_due = r[9]
@@ -582,15 +712,15 @@ class KnowledgeGraph:
         a different model). Returns [(id, "subject predicate object")] for the
         caller to embed in a batch."""
         now = now if now is not None else time.time()
-        with self._lock:
-            assert self._conn is not None
-            rows = self._conn.execute(
-                "SELECT id, subject, predicate, object FROM kg_facts "
-                f"WHERE {_ACTIVE_CLAUSE} "
-                "AND (embedding IS NULL OR embed_model IS NOT ?) "
-                "ORDER BY ts DESC LIMIT ?",
-                (now, model, int(limit)),
-            ).fetchall()
+        conn = self._read_conn()
+        assert conn is not None
+        rows = conn.execute(
+            "SELECT id, subject, predicate, object FROM kg_facts "
+            f"WHERE {_ACTIVE_CLAUSE} "
+            "AND (embedding IS NULL OR embed_model IS NOT ?) "
+            "ORDER BY ts DESC LIMIT ?",
+            (now, model, int(limit)),
+        ).fetchall()
         return [(r[0], f"{r[1]} {r[2]} {r[3]}") for r in rows]
 
     def store_embeddings(
@@ -601,13 +731,11 @@ class KnowledgeGraph:
         """Batch-store [(fact_id, blob)] under `model`. Returns count."""
         if not items:
             return 0
-        with self._lock:
-            assert self._conn is not None
-            self._conn.executemany(
+        with self._write_txn() as conn:
+            conn.executemany(
                 "UPDATE kg_facts SET embedding=?, embed_model=? WHERE id=?",
                 [(blob, model, int(fid)) for fid, blob in items],
             )
-            self._conn.commit()
         return len(items)
 
     def embedding_counts(
@@ -615,24 +743,34 @@ class KnowledgeGraph:
         model: str,
         *,
         now: float | None = None,
+        subject_prefix: str | None = None,
     ) -> tuple[int, int, int]:
-        """`(total, embedded, pending)` over ACTIVE facts for `model`, so the
+        """``(total, embedded, pending)`` over ACTIVE facts for ``model``, so the
         operator can see how much of the KG is actually searchable by meaning.
-        `pending` mirrors :meth:`facts_needing_embedding`'s predicate verbatim
-        (NULL embedding, or embedded under a different model); `embedded` is the
-        complement, so `embedded + pending == total`."""
+        ``pending`` mirrors :meth:`facts_needing_embedding`'s predicate verbatim
+        (NULL embedding, or embedded under a different model); ``embedded`` is the
+        complement, so ``embedded + pending == total``.
+
+        ``subject_prefix`` (optional) scopes all three counts to ACTIVE facts
+        whose subject starts with it (LIKE, escaped) — the namespaced twin of the
+        read methods' prefix filter, so a fenced caller's stats can show the
+        embedding coverage of ONLY its own namespace. Empty/None = the whole
+        graph."""
         now = now if now is not None else time.time()
-        with self._lock:
-            assert self._conn is not None
-            total = self._conn.execute(
-                f"SELECT COUNT(*) FROM kg_facts WHERE {_ACTIVE_CLAUSE}",
-                (now,),
-            ).fetchone()[0]
-            pending = self._conn.execute(
-                f"SELECT COUNT(*) FROM kg_facts WHERE {_ACTIVE_CLAUSE} "
-                "AND (embedding IS NULL OR embed_model IS NOT ?)",
-                (now, model),
-            ).fetchone()[0]
+        prefix_clause = " AND subject LIKE ? ESCAPE '\\'" if subject_prefix else ""
+        prefix_params: list[Any] = [_like_prefix(subject_prefix)] if subject_prefix else []
+        conn = self._read_conn()
+        assert conn is not None
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM kg_facts WHERE {_ACTIVE_CLAUSE}{prefix_clause}",
+            (now, *prefix_params),
+        ).fetchone()[0]
+        pending = conn.execute(
+            f"SELECT COUNT(*) FROM kg_facts WHERE {_ACTIVE_CLAUSE} "
+            "AND (embedding IS NULL OR embed_model IS NOT ?)"
+            f"{prefix_clause}",
+            (now, model, *prefix_params),
+        ).fetchone()[0]
         return (int(total), int(total) - int(pending), int(pending))
 
     def semantic_query(
@@ -664,7 +802,7 @@ class KnowledgeGraph:
         sql = (
             "SELECT id, subject, predicate, object, confidence, agent, "
             "engagement_id, ts, expires_at, embedding, corroborators, "
-            f"contradiction FROM kg_facts "
+            f"contradiction, source_ref FROM kg_facts "
             f"WHERE embed_model=? AND embedding IS NOT NULL AND {_ACTIVE_CLAUSE}"
         )
         params: list[Any] = [model, now]
@@ -677,9 +815,9 @@ class KnowledgeGraph:
             for mp in _META_PREFIXES:
                 sql += " AND subject NOT LIKE ? ESCAPE '\\'"
                 params.append(_like_prefix(mp))
-        with self._lock:
-            assert self._conn is not None
-            rows = self._conn.execute(sql, params).fetchall()
+        conn = self._read_conn()
+        assert conn is not None
+        rows = conn.execute(sql, params).fetchall()
         scored: list[tuple[Fact, float]] = []
         for row in rows:
             vec = unpack_vector(row[9])
@@ -690,6 +828,7 @@ class KnowledgeGraph:
                 f = Fact(*row[:9])
                 f.corroborators = _load_corroborators(row[10], f.agent, f.confidence)
                 f.contradiction = row[11]
+                f.source_ref = row[12]
                 scored.append((f, s))
         scored.sort(key=lambda t: t[1], reverse=True)
         return scored[: int(top_k)]
@@ -703,12 +842,21 @@ class KnowledgeGraph:
         object_: str | None = None,
         *,
         limit: int = 20,
+        subject_prefix: str | None = None,
     ) -> list[Fact]:
         """Pattern-match query. Any of (s, p, o) may be None to wildcard.
         Substring matches (case-insensitive) — use exact strings for exact
-        matches when you have them. Ordered by recency."""
+        matches when you have them. Ordered by recency.
+
+        ``subject_prefix`` (optional) restricts the result to facts whose
+        subject starts with it — matched in SQL (LIKE, escaped) via the
+        ``kg_subject`` index so a namespaced caller can scope a read without
+        over-fetching. Empty/None = no prefix restriction (the default)."""
         clauses: list[str] = []
         params: list[Any] = []
+        if subject_prefix:
+            clauses.append("subject LIKE ? ESCAPE '\\'")
+            params.append(_like_prefix(subject_prefix))
         for col, val in (("subject", subject), ("predicate", predicate), ("object", object_)):
             if val is not None and str(val).strip():
                 clauses.append(f"{col} LIKE ?")
@@ -719,14 +867,15 @@ class KnowledgeGraph:
         where = " WHERE " + " AND ".join(clauses)
         sql = (
             f"SELECT id, subject, predicate, object, confidence, agent, "
-            f"engagement_id, ts, expires_at, corroborators, contradiction "
+            f"engagement_id, ts, expires_at, corroborators, contradiction, "
+            f"source_ref "
             f"FROM kg_facts{where} "
             f"ORDER BY ts DESC LIMIT ?"
         )
         params.append(int(limit))
-        with self._lock:
-            assert self._conn is not None
-            rows = self._conn.execute(sql, params).fetchall()
+        conn = self._read_conn()
+        assert conn is not None
+        rows = conn.execute(sql, params).fetchall()
         return [_fact_with_corroboration(row) for row in rows]
 
     def get(self, fact_id: int) -> Fact | None:
@@ -735,13 +884,14 @@ class KnowledgeGraph:
         store is closed."""
         sql = (
             "SELECT id, subject, predicate, object, confidence, agent, "
-            "engagement_id, ts, expires_at, corroborators, contradiction "
+            "engagement_id, ts, expires_at, corroborators, contradiction, "
+            "source_ref "
             "FROM kg_facts WHERE id=?"
         )
-        with self._lock:
-            if self._conn is None:
-                return None
-            row = self._conn.execute(sql, (int(fact_id),)).fetchone()
+        conn = self._read_conn()
+        if conn is None:
+            return None
+        row = conn.execute(sql, (int(fact_id),)).fetchone()
         return _fact_with_corroboration(row) if row else None
 
     def neighbors(
@@ -750,13 +900,29 @@ class KnowledgeGraph:
         *,
         depth: int = 1,
         limit: int = 50,
+        subject_prefix: str | None = None,
     ) -> list[Fact]:
-        """Return facts where `entity` appears as either subject or object,
-        walking up to `depth` hops. Capped at `limit` total facts.
-        Useful for "tell me everything we know that touches host X.\""""
+        """Return facts where ``entity`` appears as either subject or object,
+        walking up to ``depth`` hops. Capped at ``limit`` total facts.
+        Useful for "tell me everything we know that touches host X."
+
+        ``subject_prefix`` (optional) scopes the walk to facts whose SUBJECT
+        starts with it — the namespace read-fence at the kernel tier. The BFS
+        only follows and returns in-prefix-subject edges: an out-of-prefix
+        entity reached as the OBJECT of an in-prefix fact (e.g.
+        ``study:X -concerns-> host:secret``) still seeds further hops, but a
+        foreign hub never explodes the frontier — its own facts have
+        out-of-prefix subjects and are filtered by the ``kg_subject`` index
+        scan, so the walk stays bounded by the namespace size, not the hub's
+        degree. Empty/None = walk the whole graph (the default)."""
         seen_facts: dict[int, Fact] = {}
         expanded: set[str] = set()  # entities we've already pulled neighbors for
         frontier: set[str] = {entity.strip()}
+        conn = self._read_conn()
+        assert conn is not None
+        prefix_clause = " AND subject LIKE ? ESCAPE '\\'" if subject_prefix else ""
+        prefix_params: tuple[Any, ...] = (_like_prefix(subject_prefix),) if subject_prefix else ()
+        now = time.time()
         for _ in range(max(1, depth)):
             if not frontier or len(seen_facts) >= limit:
                 break
@@ -765,16 +931,15 @@ class KnowledgeGraph:
                 if len(seen_facts) >= limit:
                     break
                 expanded.add(ent)
-                with self._lock:
-                    assert self._conn is not None
-                    rows = self._conn.execute(
-                        "SELECT id, subject, predicate, object, confidence, "
-                        "agent, engagement_id, ts, expires_at, corroborators, "
-                        f"contradiction FROM kg_facts "
-                        f"WHERE (subject=? OR object=?) AND {_ACTIVE_CLAUSE} "
-                        "ORDER BY ts DESC LIMIT ?",
-                        (ent, ent, time.time(), limit),
-                    ).fetchall()
+                rows = conn.execute(
+                    "SELECT id, subject, predicate, object, confidence, "
+                    "agent, engagement_id, ts, expires_at, corroborators, "
+                    f"contradiction, source_ref FROM kg_facts "
+                    f"WHERE (subject=? OR object=?) AND {_ACTIVE_CLAUSE}"
+                    f"{prefix_clause} "
+                    "ORDER BY ts DESC LIMIT ?",
+                    (ent, ent, now, *prefix_params, limit),
+                ).fetchall()
                 for row in rows:
                     f = _fact_with_corroboration(row)
                     if f.id in seen_facts:
@@ -800,33 +965,31 @@ class KnowledgeGraph:
         shutdown, so they only linger mid-run)."""
         now = now if now is not None else time.time()
         active = f"WHERE {_ACTIVE_CLAUSE}"
-        with self._lock:
-            assert self._conn is not None
-            total = self._conn.execute(
-                f"SELECT COUNT(*) FROM kg_facts {active}", (now,)
-            ).fetchone()[0]
-            entities = self._conn.execute(
-                "SELECT COUNT(DISTINCT s) FROM ("
-                f"SELECT subject AS s FROM kg_facts {active} UNION "
-                f"SELECT object  AS s FROM kg_facts {active})",
-                (now, now),
-            ).fetchone()[0]
-            preds = self._conn.execute(
-                f"SELECT predicate, COUNT(*) FROM kg_facts {active} "
-                "GROUP BY predicate ORDER BY 2 DESC LIMIT 10",
-                (now,),
-            ).fetchall()
-            engs = self._conn.execute(
-                f"SELECT COUNT(DISTINCT engagement_id) FROM kg_facts {active} "
-                "AND engagement_id IS NOT NULL",
-                (now,),
-            ).fetchone()[0]
-            expiring = self._conn.execute(
-                "SELECT COUNT(*) FROM kg_facts "
-                "WHERE expires_at IS NOT NULL AND expires_at > ? "
-                "AND expires_at <= ?",
-                (now, now + 7 * 86400),
-            ).fetchone()[0]
+        conn = self._read_conn()
+        assert conn is not None
+        total = conn.execute(f"SELECT COUNT(*) FROM kg_facts {active}", (now,)).fetchone()[0]
+        entities = conn.execute(
+            "SELECT COUNT(DISTINCT s) FROM ("
+            f"SELECT subject AS s FROM kg_facts {active} UNION "
+            f"SELECT object  AS s FROM kg_facts {active})",
+            (now, now),
+        ).fetchone()[0]
+        preds = conn.execute(
+            f"SELECT predicate, COUNT(*) FROM kg_facts {active} "
+            "GROUP BY predicate ORDER BY 2 DESC LIMIT 10",
+            (now,),
+        ).fetchall()
+        engs = conn.execute(
+            f"SELECT COUNT(DISTINCT engagement_id) FROM kg_facts {active} "
+            "AND engagement_id IS NOT NULL",
+            (now,),
+        ).fetchone()[0]
+        expiring = conn.execute(
+            "SELECT COUNT(*) FROM kg_facts "
+            "WHERE expires_at IS NOT NULL AND expires_at > ? "
+            "AND expires_at <= ?",
+            (now, now + 7 * 86400),
+        ).fetchone()[0]
         return {
             "total_facts": total,
             "distinct_entities": entities,
@@ -848,7 +1011,7 @@ class KnowledgeGraph:
         now = now if now is not None else time.time()
         sql = (
             "SELECT id, subject, predicate, object, confidence, agent, "
-            "engagement_id, ts, expires_at FROM kg_facts "
+            "engagement_id, ts, expires_at, source_ref FROM kg_facts "
             "WHERE expires_at IS NOT NULL AND expires_at <= ?"
         )
         params: list[Any] = [now]
@@ -856,10 +1019,10 @@ class KnowledgeGraph:
             ph = ",".join("?" for _ in exclude_predicates)
             sql += f" AND predicate NOT IN ({ph})"
             params.extend(exclude_predicates)
-        with self._lock:
-            assert self._conn is not None
-            rows = self._conn.execute(sql, params).fetchall()
-        return [Fact(*r).to_payload() for r in rows]
+        conn = self._read_conn()
+        assert conn is not None
+        rows = conn.execute(sql, params).fetchall()
+        return [_fact_with_source(r).to_payload() for r in rows]
 
     def purge_expired(
         self,
@@ -879,11 +1042,49 @@ class KnowledgeGraph:
             ph = ",".join("?" for _ in exclude_predicates)
             sql += f" AND predicate NOT IN ({ph})"
             params.extend(exclude_predicates)
-        with self._lock:
-            assert self._conn is not None
-            cur = self._conn.execute(sql, params)
-            self._conn.commit()
-            return cur.rowcount
+        with self._write_txn() as conn:
+            return conn.execute(sql, params).rowcount
+
+    def purge_expired_ids(
+        self,
+        fact_ids: Iterable[int],
+        now: float,
+        *,
+        exclude_predicates: tuple[str, ...] = (),
+    ) -> int:
+        """Delete facts BY ID, but only those STILL expired and non-excluded at
+        DELETE time. The compaction engine passes the exact id set it archived,
+        so archive and deletion cover the same rows — never a re-selection that
+        could delete an unarchived row. The per-row expiry/predicate re-check
+        preserves the concurrency guarantee: a fact revived (its ``expires_at``
+        pushed to the future) or reclassified to an excluded predicate between
+        the archive and this delete is left intact. Returns rows removed; one
+        transaction (all-or-nothing).
+
+        ``now`` is REQUIRED and must be the *export* timestamp (the same clock
+        used to select + archive the ids), not a fresh delete-time clock — the
+        re-check compares against it, so a stale clock could delete a row revived
+        to just past ``now``. Known limitation: the re-check covers expiry and
+        predicate, not the payload — a row whose content is updated while staying
+        expired is still deleted, and the archive then holds the pre-update copy
+        (acceptable: the row is expired junk either way, and concurrent updates
+        to already-expired rows are rare)."""
+        ids = [int(i) for i in fact_ids]
+        if not ids:
+            return 0
+        cond = "id=? AND expires_at IS NOT NULL AND expires_at <= ?"
+        tail: list[Any] = []
+        if exclude_predicates:
+            ph = ",".join("?" for _ in exclude_predicates)
+            cond += f" AND predicate NOT IN ({ph})"
+            tail = list(exclude_predicates)
+        with self._write_txn() as conn:
+            deleted = 0
+            for fid in ids:
+                deleted += conn.execute(
+                    f"DELETE FROM kg_facts WHERE {cond}", (fid, now, *tail)
+                ).rowcount
+            return deleted
 
     def export_by_subject_prefix(
         self,
@@ -900,15 +1101,15 @@ class KnowledgeGraph:
             return []
         now = now if now is not None else time.time()
         like = _like_prefix(prefix)
-        with self._lock:
-            assert self._conn is not None
-            rows = self._conn.execute(
-                "SELECT id, subject, predicate, object, confidence, agent, "
-                f"engagement_id, ts, expires_at FROM kg_facts "
-                f"WHERE subject LIKE ? ESCAPE '\\' AND {_ACTIVE_CLAUSE}",
-                (like, now),
-            ).fetchall()
-        return [Fact(*r).to_payload() for r in rows]
+        conn = self._read_conn()
+        assert conn is not None
+        rows = conn.execute(
+            "SELECT id, subject, predicate, object, confidence, agent, "
+            f"engagement_id, ts, expires_at, source_ref FROM kg_facts "
+            f"WHERE subject LIKE ? ESCAPE '\\' AND {_ACTIVE_CLAUSE}",
+            (like, now),
+        ).fetchall()
+        return [_fact_with_source(r).to_payload() for r in rows]
 
     def purge_by_subject_prefix(
         self,
@@ -925,21 +1126,31 @@ class KnowledgeGraph:
             return 0
         now = now if now is not None else time.time()
         like = _like_prefix(prefix)
-        with self._lock:
-            assert self._conn is not None
-            cur = self._conn.execute(
+        with self._write_txn() as conn:
+            return conn.execute(
                 f"DELETE FROM kg_facts WHERE subject LIKE ? ESCAPE '\\' AND {_ACTIVE_CLAUSE}",
                 (like, now),
-            )
-            self._conn.commit()
-            return cur.rowcount
+            ).rowcount
 
     def delete(self, fact_id: int) -> bool:
-        with self._lock:
-            assert self._conn is not None
-            cur = self._conn.execute("DELETE FROM kg_facts WHERE id=?", (fact_id,))
-            self._conn.commit()
-            return cur.rowcount > 0
+        with self._write_txn() as conn:
+            return conn.execute("DELETE FROM kg_facts WHERE id=?", (fact_id,)).rowcount > 0
+
+    def delete_many(self, fact_ids: Iterable[int]) -> int:
+        """Delete several facts in ONE transaction — all-or-nothing. Returns the
+        number of rows removed. Compaction uses this so a failure partway
+        through can't leave a curation plan half-applied (some facts deleted,
+        some kept) against an archive that claims all were selected: the single
+        ``_write_txn`` commits every delete together or rolls the whole set
+        back."""
+        ids = [int(i) for i in fact_ids]
+        if not ids:
+            return 0
+        with self._write_txn() as conn:
+            deleted = 0
+            for fid in ids:
+                deleted += conn.execute("DELETE FROM kg_facts WHERE id=?", (fid,)).rowcount
+            return deleted
 
     def get_exact(
         self,
@@ -952,15 +1163,16 @@ class KnowledgeGraph:
         (`kg_spo` index), so this resolves the canonical row the compaction
         curate engine targets. Exact match (not LIKE) — a mis-transcribed
         triple simply returns None, so curate can't delete the wrong fact."""
-        with self._lock:
-            assert self._conn is not None
-            row = self._conn.execute(
-                "SELECT id, subject, predicate, object, confidence, agent, "
-                "engagement_id, ts, expires_at, corroborators, contradiction "
-                "FROM kg_facts "
-                "WHERE subject=? AND predicate=? AND object=? LIMIT 1",
-                (subject, predicate, object_),
-            ).fetchone()
+        conn = self._read_conn()
+        assert conn is not None
+        row = conn.execute(
+            "SELECT id, subject, predicate, object, confidence, agent, "
+            "engagement_id, ts, expires_at, corroborators, contradiction, "
+            "source_ref "
+            "FROM kg_facts "
+            "WHERE subject=? AND predicate=? AND object=? LIMIT 1",
+            (subject, predicate, object_),
+        ).fetchone()
         return _fact_with_corroboration(row) if row is not None else None
 
     def close(self) -> None:
@@ -972,3 +1184,28 @@ class KnowledgeGraph:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+            # Per-thread read-only connections were opened with
+            # check_same_thread=False, so closing them from here is legal.
+            # Threads that race past the _read_conn closed-check keep a
+            # working (read-only) connection until process exit; harmless.
+            for rc in self._read_conns:
+                try:
+                    rc.close()
+                except sqlite3.Error:
+                    pass
+            self._read_conns.clear()
+
+    def __enter__(self) -> KnowledgeGraph:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Safety net against a leaked SQLite handle (ResourceWarning) when a
+        # caller/test drops the graph without close(). Idempotent + lock-guarded;
+        # __del__ must never raise during finalization, so suppress everything.
+        try:
+            self.close()
+        except Exception:
+            pass

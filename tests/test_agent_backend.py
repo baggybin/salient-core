@@ -15,13 +15,26 @@ from typing import Any
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
+    ResultMessage,
     TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
 
 from salient_core.daemon import AgentRunner, Job
 from salient_core.daemon._backend import LocalClaudeBackend
 from salient_core.protocols import AgentBackend
+from salient_core.runtime import (
+    AssistantEvent,
+    ContextUsage,
+    TextContent,
+    ThinkingContent,
+    ToolCallContent,
+    ToolResultEvent,
+    TurnCompletedEvent,
+)
 
 
 class _FakeBackend:
@@ -52,23 +65,27 @@ class _FakeBackend:
     async def interrupt(self) -> None:
         self.interrupt_called = True
 
-    async def get_context_usage(self) -> dict[str, Any] | None:
-        return {"percentage": 10}
+    async def get_context_usage(self) -> ContextUsage | None:
+        return ContextUsage(used_tokens=10, max_tokens=100, percentage=10.0)
 
-    @property
-    def raw(self) -> Any:
-        return self
+    def diagnose_failure(
+        self,
+        agent_name: str,
+        error: BaseException,
+        stderr_tail: tuple[str, ...],
+    ) -> str:
+        del stderr_tail
+        return f"{agent_name}: {type(error).__name__}: {error}"
 
 
-def _assistant(text: str) -> AssistantMessage:
-    return AssistantMessage(content=[TextBlock(text=text)], model="backend-test")
+def _assistant(text: str) -> AssistantEvent:
+    return AssistantEvent(content=(TextContent(text=text),), model="backend-test")
 
 
 def _runner(**kw: Any) -> AgentRunner:
     return AgentRunner(
         name="backend_test",
         cfg={},
-        options=ClaudeAgentOptions(),
         prompt_timeout=60.0,
         idle_timeout=0.0,
         **kw,
@@ -79,26 +96,78 @@ class AgentBackendProtocolTests(unittest.TestCase):
     def test_local_backend_satisfies_protocol(self):
         b = LocalClaudeBackend(ClaudeAgentOptions())
         self.assertIsInstance(b, AgentBackend)  # runtime_checkable
-        self.assertIsInstance(b.raw, ClaudeSDKClient)  # exposes the underlying client
 
     def test_fake_backend_satisfies_protocol(self):
         self.assertIsInstance(_FakeBackend(), AgentBackend)
 
-    def test_default_factory_is_local_claude_backend(self):
-        self.assertIs(
-            AgentRunner.__dataclass_fields__["backend_factory"].default,
-            LocalClaudeBackend,
-        )
+    def test_runner_requires_an_explicit_backend_factory(self):
+        with self.assertRaisesRegex(RuntimeError, "no agent backend configured"):
+            _runner()._create_backend()
 
 
 class AgentBackendSeamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_adapter_preserves_stream_content_and_usage(self):
+        messages = [
+            AssistantMessage(
+                content=[
+                    TextBlock(text="hello"),
+                    ThinkingBlock(thinking="reason", signature="sig"),
+                    ToolUseBlock(id="call-1", name="echo", input={"text": "hi"}),
+                ],
+                model="claude-test",
+            ),
+            UserMessage(content=[ToolResultBlock(tool_use_id="call-1", content="done")]),
+            ResultMessage(
+                subtype="success",
+                duration_ms=12,
+                duration_api_ms=10,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.25,
+                usage={"input_tokens": 3, "output_tokens": 4},
+            ),
+        ]
+
+        class ScriptedClient:
+            async def receive_response(self):
+                for message in messages:
+                    yield message
+
+        backend = LocalClaudeBackend(ClaudeAgentOptions())
+        backend._client = ScriptedClient()
+        events = [event async for event in backend.receive_response()]
+
+        assistant = events[0]
+        self.assertIsInstance(assistant, AssistantEvent)
+        assert isinstance(assistant, AssistantEvent)
+        self.assertEqual(assistant.content[0], TextContent("hello"))
+        self.assertEqual(assistant.content[1], ThinkingContent("reason"))
+        self.assertEqual(
+            assistant.content[2],
+            ToolCallContent("call-1", "echo", {"text": "hi"}),
+        )
+        self.assertEqual(events[1], ToolResultEvent("call-1", "done"))
+        self.assertEqual(
+            events[2],
+            TurnCompletedEvent(
+                turns=1,
+                duration_ms=12,
+                usage=events[2].usage,
+            ),
+        )
+        assert isinstance(events[2], TurnCompletedEvent)
+        self.assertEqual(events[2].usage.input_tokens, 3)
+        self.assertEqual(events[2].usage.output_tokens, 4)
+        self.assertEqual(events[2].usage.cost_usd, 0.25)
+
     async def test_factory_builds_and_connects_on_reconnect(self):
         # The runner builds its backend via backend_factory — inject a fake so
         # no ClaudeSDKClient subprocess is ever spawned.
         built: list[_FakeBackend] = []
 
-        def factory(options):
-            b = _FakeBackend(options)
+        def factory():
+            b = _FakeBackend()
             built.append(b)
             return b
 

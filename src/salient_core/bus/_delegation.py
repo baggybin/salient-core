@@ -148,16 +148,49 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger("salient.bus.delegation")
 
+# Bound on how long ask_agent waits, on an ordinary timeout/error exit, for the
+# child-stop (cancel_job = interrupt + optional queue drain) to complete before
+# it gives up and lets the daemon-teardown join finish it. Small: the stop is an
+# interrupt, not real work.
+_REAP_CHILD_TIMEOUT = 3.0
 
-def _pick_substitute(all_cfgs: dict[str, Any], runners: dict[str, Any], name: str) -> str | None:
-    """The lowest-named RUNNING substitute for ``name``, or None.
+
+def _spawn_child_stop(runner: Any, child_job_id: int, name: str) -> asyncio.Task:
+    """Create the child-stop task (``runner.cancel_job``) and register it for the
+    daemon-teardown join, WITHOUT awaiting it. Returns the task so the caller can
+    optionally ``await asyncio.wait_for(asyncio.shield(task), bound)`` when it is
+    safe to block (an ordinary timeout/error exit). Registering before any await
+    means every exit path — awaited, timed-out, or parent-cancelled mid-await —
+    leaves the stop either completed or joined at teardown, never dropped."""
+    from ..daemon._tasks import track_background  # lazy: avoid bus↔daemon cycle
+
+    cancel_task: asyncio.Task = asyncio.ensure_future(runner.cancel_job(child_job_id))
+    cancel_task.set_name(f"reap-child:{name}:{child_job_id}")
+    track_background(cancel_task)
+    return cancel_task
+
+
+def _pick_substitute(
+    all_cfgs: dict[str, Any],
+    runners: dict[str, Any],
+    name: str,
+    profile: Any = None,
+) -> str | None:
+    """The lowest-named RUNNING, non-disabled substitute for ``name``, or None.
 
     Name-stable so substitute routing doesn't depend on agents.yaml
     insertion order when more than one substitute for the same primary
     is up at once (rare, but the order-dependence was a real fragility).
+
+    A candidate the skin's agent-disabled checker rejects (operator-disabled,
+    or availability-toggled off in the provider selector) is SKIPPED here so
+    routing falls through to the primary — rather than picking it and having the
+    dispatch guard refuse the whole call.
     """
     for sub_name in sorted(all_cfgs or {}):
         if (all_cfgs.get(sub_name) or {}).get("substitute_for") != name:
+            continue
+        if _agent_disabled_checker is not None and _agent_disabled_checker(profile, sub_name):
             continue
         r = runners.get(sub_name)
         if r is not None and r.status != "stopped":
@@ -343,7 +376,7 @@ def make_delegation_tools(daemon: DaemonServices, owner: str) -> list:
         prefer_primary = bool(args.get("prefer_primary"))
         substituted_from: str | None = None
         if not prefer_primary and not flags.skip_substitute_routing:
-            _sub = _pick_substitute(daemon.all_cfgs, daemon.runners, name)
+            _sub = _pick_substitute(daemon.all_cfgs, daemon.runners, name, daemon.profile)
             if _sub is not None:
                 substituted_from = name
                 name = _sub
@@ -523,6 +556,16 @@ def make_delegation_tools(daemon: DaemonServices, owner: str) -> list:
             # an early return from Phase 0.5 / 1 / 2.
             child_q: asyncio.Queue | None = None
             echo_pump: asyncio.Task | None = None
+            # Child-lifetime ownership: capture the child Job id once it's
+            # submitted, and flip `child_completed` only when the child's reply
+            # actually lands. If we leave the try by ANY non-completion path
+            # (timeout, caller cancellation, an early error after submit), the
+            # finally stops the child runner so it isn't left burning tokens
+            # after its caller stopped waiting. `detach=True` opts out (explicit
+            # fire-and-forget); bounded child lifetime is the default.
+            child_job_id: int | None = None
+            child_completed = False
+            detach = bool(flags.detach)
             # ── Phase 0.5: redispatch governor (wire-level) ────────────────
             # Fires for ALL callers including bus_trusted — same precedent as
             # the engagement-disabled / pending-question / cross-team / cycle
@@ -805,6 +848,15 @@ def make_delegation_tools(daemon: DaemonServices, owner: str) -> list:
                 # flag → Job stamp. The kernel never reads it; a skin verifier does.
                 verification_leg=flags.verification_leg,
             )
+            # submit()'s contract is `-> Job`; guard the seam so a runner impl
+            # that violates it (returns None, or a Job-shaped object without an
+            # id) fails with an actionable message instead of an opaque
+            # "'NoneType' object has no attribute 'id'" deep in dispatch.
+            if child_job is None or getattr(child_job, "id", None) is None:
+                raise TypeError(
+                    f"{name}: runner.submit() must return a Job with an 'id'; got {child_job!r}"
+                )
+            child_job_id = child_job.id
             with suppress(Exception):
                 observer.on_submit(child_job)
             # In-process write-back sink (same family as the routing flags —
@@ -885,6 +937,9 @@ def make_delegation_tools(daemon: DaemonServices, owner: str) -> list:
             )
             try:
                 job = await asyncio.wait_for(fut, timeout=timeout)
+                # The child replied — its lifetime ended on its own, so the
+                # finally must NOT reap it.
+                child_completed = True
             except TimeoutError:
                 return _text(
                     f"error: {name} did not reply within wait window",
@@ -928,18 +983,87 @@ def make_delegation_tools(daemon: DaemonServices, owner: str) -> list:
                 result = observer.finalize(result)
             return _text(result)
         finally:
+            # Is THIS ask_agent task itself being externally cancelled? If so we
+            # must not block its forced return by awaiting the child-stop here —
+            # an `await` in `finally` re-raises the cancellation immediately and
+            # aborts the rest of cleanup. We shield+park the stop and let daemon
+            # teardown join it instead. Requires Python 3.11+ (Task.cancelling).
+            # NOTE: an operator-cancelled *child* future raises CancelledError
+            # with cancelling()==0 — that is NOT this task being cancelled, so we
+            # still (correctly) await the reap in that case.
+            _ct = asyncio.current_task()
+            parent_cancelled = _ct is not None and _ct.cancelling() > 0
+            deferred_cancel: BaseException | None = None
+
             # Tear down the delegated-stream echo: cancel the pump and drop our
-            # subscription so the child's subscriber list doesn't leak. The
-            # pump never unsubscribes itself (it may be mid-`get`); the queue
-            # lifecycle is owned here. `runner` is the re-fetched target whose
-            # stream we subscribed to in Phase 3 (unchanged since).
+            # subscription so the child's subscriber list doesn't leak. The pump
+            # never unsubscribes itself (it may be mid-`get`); the queue lifecycle
+            # is owned here.
             if echo_pump is not None:
                 echo_pump.cancel()
-                with suppress(asyncio.CancelledError):
+                try:
                     await echo_pump
+                except asyncio.CancelledError as exc:
+                    # A cancellation landing on THIS await may be the parent's
+                    # (not the pump's own) — suppress(CancelledError) would eat
+                    # it. Re-check and defer it past the mandatory cleanup below.
+                    if _ct is not None and _ct.cancelling() > 0:
+                        parent_cancelled = True
+                        deferred_cancel = exc
+                except Exception:
+                    pass
             if child_q is not None and runner is not None:
                 runner.unsubscribe(child_q)
-            daemon.bus_call_resolve(call_id)
+
+            # Structured-concurrency reap: if we're leaving without the child's
+            # reply (timeout, caller cancellation, or an error after submit) and
+            # the caller didn't opt into detachment, stop the child runner so it
+            # doesn't keep burning tokens after its caller stopped waiting. This
+            # is the ask_agent-initiated twin of `bus_call_cancel`'s operator
+            # path — we can't route through bus_call_cancel here because
+            # `asyncio.wait_for` has already settled the caller future.
+            #
+            # The stop is created as a tracked task either way (so daemon
+            # teardown joins it). On an ordinary timeout/error exit we AWAIT it
+            # (bounded, shielded) so the child has actually stopped before we
+            # return — the shield keeps a late-arriving parent-cancel from
+            # destroying the stop mid-interrupt, and the bound keeps a hung stop
+            # from wedging us. When the parent is being cancelled we skip the
+            # await and let teardown join the parked task.
+            if (
+                not child_completed
+                and not detach
+                and child_job_id is not None
+                and runner is not None
+            ):
+                cancel_task = _spawn_child_stop(runner, child_job_id, name)
+                if not parent_cancelled:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(cancel_task), _REAP_CHILD_TIMEOUT)
+                    except asyncio.CancelledError as exc:
+                        # Parent cancel landed mid-reap; cancel_task survives
+                        # (shielded) and teardown joins it. Defer the re-raise.
+                        deferred_cancel = exc
+                    except TimeoutError:
+                        # Slow stop: shielded task survives, teardown joins it.
+                        _log.warning(
+                            "reap-child %s did not stop within %ss; backgrounded for teardown join",
+                            child_job_id,
+                            _REAP_CHILD_TIMEOUT,
+                        )
+                    except Exception:
+                        # cancel_job itself failed fast (not a timeout).
+                        _log.exception("reap-child %s: cancel_job failed", child_job_id)
+            # A cancellation that arrived mid-cleanup is re-raised only AFTER the
+            # mandatory synchronous cleanup (unsubscribe + bus_call_resolve) has
+            # run — the try/finally guarantees the re-raise even if resolve throws
+            # — so a cancelled task finishes cancelled without leaking the bus
+            # call or the subscription.
+            try:
+                daemon.bus_call_resolve(call_id)
+            finally:
+                if deferred_cancel is not None:
+                    raise deferred_cancel
 
     @bus_tool(
         "ask_partner",
@@ -1036,9 +1160,10 @@ def make_delegation_tools(daemon: DaemonServices, owner: str) -> list:
         "  children — REQUIRED. List of {name, prompt, max_turns?, "
         "             deliverable?, prefer_primary?} objects, 1..20. "
         "             Each `prompt` MUST be different.\n"
-        "  aggregate — 'all' (gather all N), 'any' (return "
-        "             first to complete), 'race' (return first AND "
-        "             cancel siblings).\n"
+        "  aggregate — 'all' (gather all N results), or 'any' / 'race' "
+        "             (return the FIRST child to complete AND cancel the "
+        "             pending siblings so they don't burn tokens after the "
+        "             parent has its winner).\n"
         "  concurrency — Max children in flight at once. Throttle for "
         "             LiteLLM-proxied endpoint shadows.\n"
         "  deliverable — Optional shared deliverable string joined into "
@@ -1449,18 +1574,22 @@ def make_delegation_tools(daemon: DaemonServices, owner: str) -> list:
                 )
                 winner = next(iter(done))
                 winner_result = winner.result()
-                if aggregate == "race":
-                    # Cancel the pending siblings. v1 cancels the FUTURE
-                    # only via bus_call_cancel — the inner ask_agent's
-                    # await will see RuntimeError. Don't interrupt the
-                    # runners themselves yet (v2).
+                if aggregate in ("race", "any"):
+                    # Explicit ownership contract for the losing siblings: once
+                    # the winner is chosen, neither `race` nor `any` uses the
+                    # other results, so the siblings are cancelled rather than
+                    # left orphaned burning tokens after the parent returns.
+                    # `bus_call_cancel` settles each child future AND stops its
+                    # child runner (cancel_job); cancelling the awaiting task
+                    # then unblocks the parent. (Previously only `race` cleaned
+                    # up and `any` leaked its pending children — same orphan-
+                    # resource class as the ask_agent timeout fix.)
                     daemon.bus_call_cancel(parent_call_id=parent_call_id)
                     for p in pending:
                         p.cancel()
                     cancelled_siblings = [
                         children[i].get("name") for i, t in enumerate(tasks) if t in pending
                     ]
-                # any: leave pending tasks running, their results are discarded
                 payload = _format_swarm_payload(
                     parent_call_id,
                     aggregate,

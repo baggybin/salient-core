@@ -12,9 +12,9 @@ Each agent gets its own bus MCP server bound to its identity, exposing:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import create_sdk_mcp_server
 from claude_agent_sdk.types import McpSdkServerConfig
@@ -22,7 +22,7 @@ from claude_agent_sdk.types import McpSdkServerConfig
 if TYPE_CHECKING:
     from ..protocols import DaemonServices
 
-
+from ..runtime import AgentTool, JsonValue, ToolBundle
 from ._audit import make_audit_tools
 from ._common import *  # noqa: F401,F403
 from ._consensus import make_consensus_tools
@@ -276,6 +276,32 @@ def make_bus_tools(daemon: DaemonServices, owner: str) -> tuple[list, list[str]]
         return [], list(_BUS_TOOL_NAMES)
     tool_fns, bare = sink[0]
     return list(tool_fns), list(bare)
+
+
+def make_bus_tool_bundle(
+    daemon: DaemonServices,
+    owner: str,
+) -> tuple[ToolBundle, tuple[str, ...]]:
+    sdk_tools, bare_wires = make_bus_tools(daemon, owner)
+    neutral_tools: list[AgentTool] = []
+    for sdk_tool in sdk_tools:
+
+        async def handler(
+            arguments: Mapping[str, JsonValue],
+            _sdk_tool: Any = sdk_tool,
+        ) -> JsonValue:
+            result: dict[str, Any] = await _sdk_tool.handler(dict(arguments))
+            return result
+
+        neutral_tools.append(
+            AgentTool(
+                name=sdk_tool.name,
+                description=sdk_tool.description,
+                input_schema=sdk_tool.input_schema,
+                handler=handler,
+            )
+        )
+    return ToolBundle(tuple(neutral_tools)), tuple(bare_wires)
 
 
 # ── Bus-builder seam ─────────────────────────────────────────────────

@@ -12,7 +12,8 @@ import os
 import sqlite3
 import threading
 import time
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -176,6 +177,25 @@ class ContextStore:
         # the operator's audit trail is silently vanishing. Warn once, then
         # stay quiet.
         self._record_warned = False
+        # Observable degraded-health. A swallowed audit/recovery write (job,
+        # prompt-version, question, answer, approval-bypass, event) keeps agents
+        # running but means recovery/audit records are silently vanishing —
+        # which changes the system's trust properties. Flip a flag operators can
+        # read (`degraded` / `health()`) instead of failing only into a log line.
+        self._degraded = False
+        self._degraded_reason: str | None = None
+        self._degraded_count = 0
+        # Per-sink failure counts, so health() can identify WHICH swallowed
+        # persistence class is failing (migration vs prune vs event vs …), not
+        # just a total. Initialized before migrations run (they report here).
+        self._degraded_sinks: dict[str, int] = {}
+        # Dedicated lock for the health counters. Every _mark_degraded call runs
+        # in an `except` OUTSIDE `self._lock` (the `with self._lock` exits before
+        # the exception reaches the handler), and off-loop worker threads write
+        # too, so the read-modify-write counters need their own guard for an
+        # accurate count + a coherent health() snapshot. Separate from self._lock
+        # to keep the critical section tiny. Initialized before migrations run.
+        self._health_lock = threading.Lock()
         if db_path is not None:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -188,6 +208,11 @@ class ContextStore:
                 os.chmod(db_path, 0o600)
             # WAL gives better concurrent-read behavior with one writer.
             self._conn.execute("PRAGMA journal_mode=WAL")
+            # WAL allows only one writer DB-wide; without a busy timeout the
+            # default is 0ms, so a concurrent writer makes commit() fail
+            # instantly (SQLITE_BUSY) — the exact failure that would exercise
+            # the rollback path in _txn. A short wait absorbs most of them.
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
             self._migrate_events_source_recipient()
@@ -202,13 +227,15 @@ class ContextStore:
         attribution — correct)."""
         assert self._conn is not None
         try:
-            with self._lock:
-                cols = {row[1] for row in self._conn.execute("PRAGMA table_info(questions)")}
+            with self._lock, self._txn() as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(questions)")}
                 if "answered_by" not in cols:
-                    self._conn.execute("ALTER TABLE questions ADD COLUMN answered_by TEXT")
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+                    conn.execute("ALTER TABLE questions ADD COLUMN answered_by TEXT")
+        except sqlite3.Error as e:
+            # An additive schema migration that fails leaves the DB on the old
+            # shape; later writes may drop columns. Flip health so it isn't
+            # silently invisible (was: bare `pass`).
+            self._mark_degraded("migration", e)
 
     def _migrate_events_source_recipient(self) -> None:
         """Additive migration: pre-2026-05-16 DBs have no `source` or
@@ -218,22 +245,24 @@ class ContextStore:
         weren't tagged with provenance anyway."""
         assert self._conn is not None
         try:
-            with self._lock:
-                cols = {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}
+            with self._lock, self._txn() as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
                 if "source" not in cols:
-                    self._conn.execute("ALTER TABLE events ADD COLUMN source TEXT")
+                    conn.execute("ALTER TABLE events ADD COLUMN source TEXT")
                 if "recipient" not in cols:
-                    self._conn.execute("ALTER TABLE events ADD COLUMN recipient TEXT")
-                self._conn.execute(
+                    conn.execute("ALTER TABLE events ADD COLUMN recipient TEXT")
+                conn.execute(
                     "CREATE INDEX IF NOT EXISTS events_by_source_ts ON events(source, ts DESC)"
                 )
-                self._conn.execute(
+                conn.execute(
                     "CREATE INDEX IF NOT EXISTS events_by_recipient_ts "
                     "ON events(recipient, ts DESC)"
                 )
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as e:
+            # An additive schema migration that fails leaves the DB on the old
+            # shape; later writes may drop columns. Flip health so it isn't
+            # silently invisible (was: bare `pass`).
+            self._mark_degraded("migration", e)
 
     def _migrate_events_engagement_id(self) -> None:
         """Additive migration: pre-retention-feature DBs have no
@@ -245,17 +274,19 @@ class ContextStore:
         want."""
         assert self._conn is not None
         try:
-            with self._lock:
-                cols = {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}
+            with self._lock, self._txn() as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
                 if "engagement_id" not in cols:
-                    self._conn.execute("ALTER TABLE events ADD COLUMN engagement_id TEXT")
-                self._conn.execute(
+                    conn.execute("ALTER TABLE events ADD COLUMN engagement_id TEXT")
+                conn.execute(
                     "CREATE INDEX IF NOT EXISTS events_by_engagement_ts "
                     "ON events(engagement_id, ts DESC)"
                 )
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as e:
+            # An additive schema migration that fails leaves the DB on the old
+            # shape; later writes may drop columns. Flip health so it isn't
+            # silently invisible (was: bare `pass`).
+            self._mark_degraded("migration", e)
 
     def _migrate_jobs_prompt_sha(self) -> None:
         """Additive migration: pre-prompt-versioning DBs have no
@@ -264,13 +295,15 @@ class ContextStore:
         feature)."""
         assert self._conn is not None
         try:
-            with self._lock:
-                cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+            with self._lock, self._txn() as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
                 if "prompt_sha" not in cols:
-                    self._conn.execute("ALTER TABLE jobs ADD COLUMN prompt_sha TEXT")
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+                    conn.execute("ALTER TABLE jobs ADD COLUMN prompt_sha TEXT")
+        except sqlite3.Error as e:
+            # An additive schema migration that fails leaves the DB on the old
+            # shape; later writes may drop columns. Flip health so it isn't
+            # silently invisible (was: bare `pass`).
+            self._mark_degraded("migration", e)
 
     def _prune_events(self) -> int:
         """Apply the per-agent ring-buffer cap. Returns total rows
@@ -297,28 +330,31 @@ class ContextStore:
                 # Re-check under the lock (off-loop writer vs on-loop close()).
                 if self._conn is None:
                     return 0
-                over = [
-                    row[0]
-                    for row in self._conn.execute(
-                        "SELECT agent FROM events GROUP BY agent HAVING COUNT(*) > ?",
-                        (cap,),
-                    )
-                ]
-                deleted = 0
-                for agent in over:
-                    cur = self._conn.execute(
-                        "DELETE FROM events WHERE rowid IN ("
-                        " SELECT rowid FROM events WHERE agent=? "
-                        " ORDER BY ts ASC "
-                        " LIMIT MAX(0, "
-                        "   (SELECT COUNT(*) FROM events WHERE agent=?) - ?"
-                        " ))",
-                        (agent, agent, cap),
-                    )
-                    deleted += cur.rowcount or 0
-                self._conn.commit()
+                with self._txn() as conn:
+                    over = [
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT agent FROM events GROUP BY agent HAVING COUNT(*) > ?",
+                            (cap,),
+                        )
+                    ]
+                    deleted = 0
+                    for agent in over:
+                        cur = conn.execute(
+                            "DELETE FROM events WHERE rowid IN ("
+                            " SELECT rowid FROM events WHERE agent=? "
+                            " ORDER BY ts ASC "
+                            " LIMIT MAX(0, "
+                            "   (SELECT COUNT(*) FROM events WHERE agent=?) - ?"
+                            " ))",
+                            (agent, agent, cap),
+                        )
+                        deleted += cur.rowcount or 0
                 return deleted
-        except sqlite3.Error:
+        except sqlite3.Error as e:
+            # A failed ring-buffer prune lets the events table grow unbounded;
+            # surface it in health rather than swallowing silently.
+            self._mark_degraded("prune", e)
             return 0
 
     def _hydrate(self) -> None:
@@ -332,6 +368,56 @@ class ContextStore:
             self._meta.clear()
             for k, v in self._conn.execute("SELECT key, value FROM meta"):
                 self._meta[k] = v
+
+    @contextmanager
+    def _txn(self) -> Iterator[sqlite3.Connection]:
+        """Run DML in a transaction that rolls back on ANY failure before
+        propagating. sqlite3's default isolation opens an implicit transaction
+        on the first write; if commit() fails and we do NOT roll back, that
+        pending statement stays in the connection and a later unrelated commit()
+        flushes it — durable state then diverges from the in-memory cache (which
+        we update only after a clean commit). Rolling back on failure discards
+        the pending write so no later commit can resurrect it.
+
+        Enter under self._lock with self._conn set. Callers mutate their cache
+        only AFTER this context exits cleanly (the failure path re-raises past
+        any post-block cache write).
+
+        Note: under sqlite3's legacy isolation only DML (INSERT/UPDATE/DELETE)
+        opens the implicit transaction; SELECT/PRAGMA and DDL (ALTER) run in
+        autocommit, so this wrapper does not make a multi-statement DDL migration
+        atomic. Must not be re-entered while already inside another _txn on this
+        connection (a nested commit would prematurely flush the outer work) — the
+        non-reentrant self._lock already prevents that by construction."""
+        conn = self._conn
+        if conn is None:  # defensive: callers guard, and asserts vanish under -O
+            raise sqlite3.ProgrammingError("transaction on a closed ContextStore")
+        if conn.in_transaction:
+            # A transaction is already open on entry => a prior write leaked a
+            # dirty transaction (exactly the state this wrapper exists to
+            # prevent). Refuse rather than nest onto or flush it.
+            raise sqlite3.ProgrammingError(
+                "ContextStore connection has a dirty/open transaction on _txn entry"
+            )
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            # BaseException so a cancellation / KeyboardInterrupt mid-commit
+            # still clears the dirty transaction before propagating.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                # Rollback itself failed — the pending statement may still be in
+                # the transaction, and reusing this connection would let a later
+                # commit() flush it (the original bug). Drop the connection so the
+                # store degrades to cache-only rather than silently persisting
+                # rejected state; the original failure still propagates below.
+                if self._conn is conn:
+                    self._conn = None
+                with suppress(sqlite3.Error):
+                    conn.close()
+            raise
 
     def meta_get(self, key: str) -> str | None:
         with self._lock:
@@ -348,38 +434,45 @@ class ContextStore:
     def meta_set(self, key: str, value: str) -> None:
         ts = time.time()
         with self._lock:
-            self._meta[key] = value
+            # Commit-first, publish-second: persist to SQLite BEFORE mutating the
+            # in-memory cache, so a DB failure raises with the cache untouched
+            # rather than leaving an unpersisted value visible until restart
+            # (read-your-writes divergence between live and restarted state).
             if self._conn is not None:
-                self._conn.execute(
-                    "INSERT INTO meta (key, value, ts) VALUES (?, ?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts=excluded.ts",
-                    (key, value, ts),
-                )
-                self._conn.commit()
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO meta (key, value, ts) VALUES (?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts=excluded.ts",
+                        (key, value, ts),
+                    )
+            self._meta[key] = value
 
     def meta_delete(self, key: str) -> bool:
         """Remove a daemon-wide meta singleton. Returns True if it existed.
         Used to fully delete a study project's state envelope."""
         with self._lock:
             existed = key in self._meta
-            self._meta.pop(key, None)
+            # Commit-first: durable delete before the cache eviction, so a failed
+            # commit leaves the cache consistent with disk.
             if self._conn is not None:
-                self._conn.execute("DELETE FROM meta WHERE key=?", (key,))
-                self._conn.commit()
+                with self._txn() as conn:
+                    conn.execute("DELETE FROM meta WHERE key=?", (key,))
+            self._meta.pop(key, None)
             return existed
 
     def write(self, agent: str, key: str, value: str) -> None:
         ts = time.time()
         with self._lock:
-            self._mem[(agent, key)] = (value, ts)
+            # Commit-first, publish-second (see meta_set).
             if self._conn is not None:
-                self._conn.execute(
-                    "INSERT INTO context (agent, key, value, ts) VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT(agent, key) DO UPDATE SET "
-                    "value=excluded.value, ts=excluded.ts",
-                    (agent, key, value, ts),
-                )
-                self._conn.commit()
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO context (agent, key, value, ts) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(agent, key) DO UPDATE SET "
+                        "value=excluded.value, ts=excluded.ts",
+                        (agent, key, value, ts),
+                    )
+            self._mem[(agent, key)] = (value, ts)
 
     def read(self, agent: str, key: str) -> str | None:
         with self._lock:
@@ -388,10 +481,12 @@ class ContextStore:
 
     def delete(self, agent: str, key: str) -> bool:
         with self._lock:
-            existed = self._mem.pop((agent, key), None) is not None
+            existed = (agent, key) in self._mem
+            # Commit-first: durable delete before cache eviction (see meta_set).
             if self._conn is not None:
-                self._conn.execute("DELETE FROM context WHERE agent = ? AND key = ?", (agent, key))
-                self._conn.commit()
+                with self._txn() as conn:
+                    conn.execute("DELETE FROM context WHERE agent = ? AND key = ?", (agent, key))
+            self._mem.pop((agent, key), None)
             return existed
 
     def keys(self, agent: str | None = None) -> list[tuple[str, str]]:
@@ -423,6 +518,20 @@ class ContextStore:
                 self._conn.close()
                 self._conn = None
 
+    def __enter__(self) -> ContextStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Safety net so a caller (or test) that drops the store without an
+        # explicit close() doesn't leak the SQLite handle (ResourceWarning).
+        # close() is idempotent and lock-guarded; suppress everything since
+        # __del__ must never raise during interpreter finalization.
+        with suppress(Exception):
+            self.close()
+
     @property
     def db_path(self) -> Path | None:
         return self._db_path
@@ -437,9 +546,10 @@ class ContextStore:
         if self._conn is None:
             return 0
         with self._lock:
-            cur = self._conn.execute("DELETE FROM context WHERE key GLOB 'job_*'")
-            self._conn.commit()
-            # Refresh the in-memory cache to drop the deleted entries.
+            with self._txn() as conn:
+                cur = conn.execute("DELETE FROM context WHERE key GLOB 'job_*'")
+            # Refresh the in-memory cache to drop the deleted entries (only
+            # after a clean commit).
             self._mem = {k: v for k, v in self._mem.items() if not k[1].startswith("job_")}
             return cur.rowcount or 0
 
@@ -475,31 +585,27 @@ class ContextStore:
                 # under the lock) between the early no-DB check and here.
                 if self._conn is None:
                     return
-                self._conn.execute(
-                    "INSERT INTO events "
-                    "(ts, agent, kind, job_id, tool, source, recipient, "
-                    " engagement_id, content) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        ts if ts is not None else time.time(),
-                        agent,
-                        kind,
-                        job_id,
-                        tool,
-                        source,
-                        recipient,
-                        self._engagement_id,
-                        payload,
-                    ),
-                )
-                self._conn.commit()
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO events "
+                        "(ts, agent, kind, job_id, tool, source, recipient, "
+                        " engagement_id, content) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            ts if ts is not None else time.time(),
+                            agent,
+                            kind,
+                            job_id,
+                            tool,
+                            source,
+                            recipient,
+                            self._engagement_id,
+                            payload,
+                        ),
+                    )
         except sqlite3.Error as e:
-            if not self._record_warned:
-                self._record_warned = True
-                _log.warning(
-                    "events DB write failed (dropping event; silencing further warnings): %r",
-                    e,
-                )
+            self._mark_degraded("event", e)
+            self._record_warned = True
             return
         # Periodic prune: bounded growth via per-agent ring buffer.
         # Counter check happens OUTSIDE the insert try/except so a
@@ -509,6 +615,47 @@ class ContextStore:
         if self._inserts_since_prune >= self._prune_check_interval:
             self._prune_events()
             self._inserts_since_prune = 0
+
+    def _mark_degraded(self, op: str, exc: BaseException) -> None:
+        """Record that a persistence/audit write failed. Sets a sticky health
+        flag operators can read; logs once so a full-disk / read-only DB isn't
+        wholly invisible, then stays quiet to avoid a log storm."""
+        with self._health_lock:
+            self._degraded_count += 1
+            self._degraded_sinks[op] = self._degraded_sinks.get(op, 0) + 1
+            self._degraded_reason = f"{op}: {exc!r}"
+            first = not self._degraded
+            self._degraded = True
+        if first:
+            # Log once outside the lock (keeps the critical section tiny), then
+            # stay quiet to avoid a log storm on a full-disk / read-only DB.
+            _log.warning(
+                "context store DEGRADED — %s failed; audit/recovery records may "
+                "be lost (silencing further warnings): %r",
+                op,
+                exc,
+            )
+
+    @property
+    def degraded(self) -> bool:
+        """True once any persistence/audit write has been swallowed."""
+        return self._degraded
+
+    def health(self) -> dict[str, Any]:
+        """Operator-facing health snapshot. ``ok`` is False after any dropped
+        audit/recovery write; ``reason``/``dropped_writes`` give the detail."""
+        with self._health_lock:
+            return {
+                "ok": not self._degraded,
+                "degraded": self._degraded,
+                "reason": self._degraded_reason,
+                # Total swallowed persistence/audit failures (kept as
+                # `dropped_writes` for back-compat with existing status callers).
+                "dropped_writes": self._degraded_count,
+                # {sink -> failure count}: which swallowed persistence class failed
+                # and how often (migration / prune / event / job / question / …).
+                "sinks": dict(self._degraded_sinks),
+            }
 
     def record_job(
         self,
@@ -536,25 +683,25 @@ class ContextStore:
                 # Re-check under the lock (off-loop writer vs on-loop close()).
                 if self._conn is None:
                     return
-                self._conn.execute(
-                    "INSERT INTO jobs (agent, job_id, submitted_at, started_at, "
-                    "finished_at, prompt, result, error, prompt_sha) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        agent,
-                        job_id,
-                        submitted_at,
-                        started_at,
-                        finished_at,
-                        prompt,
-                        result or "",
-                        error,
-                        prompt_sha,
-                    ),
-                )
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO jobs (agent, job_id, submitted_at, started_at, "
+                        "finished_at, prompt, result, error, prompt_sha) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            agent,
+                            job_id,
+                            submitted_at,
+                            started_at,
+                            finished_at,
+                            prompt,
+                            result or "",
+                            error,
+                            prompt_sha,
+                        ),
+                    )
+        except sqlite3.Error as e:
+            self._mark_degraded("job", e)
 
     def record_prompt_version(self, agent: str, sha: str, text: str) -> None:
         """Snapshot a distinct per-agent prompt body (deduped by sha).
@@ -565,17 +712,17 @@ class ContextStore:
         ts = time.time()
         try:
             with self._lock:
-                self._conn.execute(
-                    "INSERT INTO prompt_versions "
-                    "(agent, sha, text, first_seen, last_seen, run_count) "
-                    "VALUES (?, ?, ?, ?, ?, 1) "
-                    "ON CONFLICT(agent, sha) DO UPDATE SET "
-                    "last_seen=excluded.last_seen, run_count=run_count+1",
-                    (agent, sha, text, ts, ts),
-                )
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO prompt_versions "
+                        "(agent, sha, text, first_seen, last_seen, run_count) "
+                        "VALUES (?, ?, ?, ?, ?, 1) "
+                        "ON CONFLICT(agent, sha) DO UPDATE SET "
+                        "last_seen=excluded.last_seen, run_count=run_count+1",
+                        (agent, sha, text, ts, ts),
+                    )
+        except sqlite3.Error as e:
+            self._mark_degraded("prompt_version", e)
 
     def prompt_versions(self, agent: str) -> list[dict[str, Any]]:
         """Distinct prompt bodies this agent has been constructed with,
@@ -638,15 +785,15 @@ class ContextStore:
             return
         try:
             with self._lock:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO questions "
-                    "(id, agent, text, job_id, kind, asked_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (qid, agent, text, job_id, kind, asked_at),
-                )
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO questions "
+                        "(id, agent, text, job_id, kind, asked_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (qid, agent, text, job_id, kind, asked_at),
+                    )
+        except sqlite3.Error as e:
+            self._mark_degraded("question", e)
 
     def mark_question_answered(
         self,
@@ -660,20 +807,20 @@ class ContextStore:
             return
         try:
             with self._lock:
-                self._conn.execute(
-                    "UPDATE questions SET answered_at = ?, answer = ?, "
-                    "answer_job_id = ?, answered_by = ? WHERE id = ?",
-                    (
-                        answered_at if answered_at is not None else time.time(),
-                        answer,
-                        answer_job_id,
-                        answered_by,
-                        qid,
-                    ),
-                )
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+                with self._txn() as conn:
+                    conn.execute(
+                        "UPDATE questions SET answered_at = ?, answer = ?, "
+                        "answer_job_id = ?, answered_by = ? WHERE id = ?",
+                        (
+                            answered_at if answered_at is not None else time.time(),
+                            answer,
+                            answer_job_id,
+                            answered_by,
+                            qid,
+                        ),
+                    )
+        except sqlite3.Error as e:
+            self._mark_degraded("answer", e)
 
     def load_pending_questions(self) -> list[dict[str, Any]]:
         """Return unanswered questions for inbox hydration at startup."""
@@ -739,15 +886,23 @@ class ContextStore:
             return
         try:
             with self._lock:
-                self._conn.execute(
-                    "INSERT INTO approval_bypass "
-                    "(ts, caller, target, gate, prompt, trust_scope, "
-                    "engagement_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (time.time(), caller, target, gate, prompt, trust_scope, self._engagement_id),
-                )
-                self._conn.commit()
-        except sqlite3.Error:
-            pass
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO approval_bypass "
+                        "(ts, caller, target, gate, prompt, trust_scope, "
+                        "engagement_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            time.time(),
+                            caller,
+                            target,
+                            gate,
+                            prompt,
+                            trust_scope,
+                            self._engagement_id,
+                        ),
+                    )
+        except sqlite3.Error as e:
+            self._mark_degraded("approval_bypass", e)
 
     def load_bypasses(
         self,

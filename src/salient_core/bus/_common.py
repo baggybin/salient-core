@@ -16,12 +16,17 @@ from __future__ import annotations
 import json
 import logging
 import re as _re
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, overload, runtime_checkable
 
 from claude_agent_sdk import tool
 from pydantic import BaseModel, ValidationError
 
+from ..policy.redaction import (
+    _redact_secret_fields,
+    register_cred_tool_markers,
+    register_secret_fields,
+)
 from ._flags import _NO_FLAGS, BusFlags
 
 if TYPE_CHECKING:
@@ -689,108 +694,6 @@ def _redact_operator_infra(
             out = new_out
 
     return out, redactions
-
-
-# Tool-call argument field names whose VALUES are credentials. Their values are
-# replaced before a tool-call event is written to the JSONL log / events table /
-# evidence, so captured secrets don't sit in plaintext on disk. Same generous
-# philosophy as _SECRET_PATTERNS: a missed field is worse than the occasional
-# over-redaction. NOTE: `ccache_path` is deliberately ABSENT — it's a filesystem
-# path to a ticket cache, not the secret itself, and is load-bearing for debugging.
-_SECRET_FIELD_NAMES = frozenset(
-    {
-        "password",
-        "passwd",
-        "pass",
-        "pwd",
-        "ssh_key",
-        "private_key",
-        "privkey",
-        "api_token",
-        "apitoken",
-        "auth_token",
-        "bearer_token",
-        "secret",
-    }
-)
-# Generic names that hold a secret ONLY inside a credential tool
-# (cred_record(value=...), cred_search). Outside those, `value` / `hash` /
-# `token` are ordinary fields and must NOT be redacted — doing so would gut
-# unrelated log content. A downstream skin extends these sets for its own
-# credential tools' field vocabulary.
-_SECRET_FIELD_NAMES_CRED_ONLY = frozenset({"value", "hash", "token", "secret_value"})
-_CRED_TOOL_MARKERS = ("cred_record", "cred_search")
-
-_REDACTED_SECRET = "<redacted-secret>"
-
-# Domain field names a downstream skin adds to the redaction set (lowercased).
-# Mutable + separate from the frozen generic base so registration is additive and
-# the kernel ships no domain vocabulary of its own — the same seam idiom as
-# register_credential_vocab.
-_EXTRA_SECRET_FIELD_NAMES: set[str] = set()
-
-
-def register_secret_fields(names: Iterable[str]) -> None:
-    """Register additional dict field NAMES whose values are redacted from logs,
-    events, and evidence. The kernel ships a generic set (password / ssh_key /
-    api_token / …); a downstream skin adds its domain credential field vocabulary
-    here at startup. Call-time registration; read on every redaction pass."""
-    _EXTRA_SECRET_FIELD_NAMES.update(n.lower() for n in names)
-
-
-# Credential-tool name markers a downstream skin registers (lowercased). When a
-# tool's name contains a marker, _redact_secret_fields also redacts the generic
-# credential keys (value / hash / token) in its content. Mutable + separate so
-# the kernel ships only its own generic tool names.
-_EXTRA_CRED_TOOL_MARKERS: list[str] = []
-
-
-def register_cred_tool_markers(markers: Iterable[str]) -> None:
-    """Register additional credential-tool name markers. When a tool's name
-    contains a marker, _redact_secret_fields widens redaction to the generic
-    credential keys (value / hash / token) in that tool's content — the same
-    call-time registration idiom as register_secret_fields."""
-    _EXTRA_CRED_TOOL_MARKERS.extend(m.lower() for m in markers)
-
-
-def _redact_secret_fields(content: Any, *, tool: str | None = None) -> Any:
-    """Return a copy of ``content`` with secret-named dict-field VALUES replaced
-    by ``<redacted-secret>``.
-
-    Structural only — keys are matched by name; free text is NOT regex-scrubbed
-    (intentional: result-text scrubbing is imperfect and would mangle tool
-    output — persisted files are chmod 0600 instead). Recurses through nested
-    dicts/lists so a secret under ``input`` (the tool-call arg dict) is caught.
-
-    ``tool`` (the tool name carrying this content, if known) widens redaction to
-    the generic credential keys (``value`` / ``hash`` / ``token``) for the cred
-    pool tools only, where those keys hold the secret itself.
-    """
-    cred = tool is not None and any(
-        m in tool.lower() for m in (*_CRED_TOOL_MARKERS, *_EXTRA_CRED_TOOL_MARKERS)
-    )
-
-    def _walk(obj: Any) -> Any:
-        if isinstance(obj, dict):
-            out: dict[Any, Any] = {}
-            for k, v in obj.items():
-                key = k.lower() if isinstance(k, str) else k
-                if (
-                    key in _SECRET_FIELD_NAMES
-                    or key in _EXTRA_SECRET_FIELD_NAMES
-                    or (cred and key in _SECRET_FIELD_NAMES_CRED_ONLY)
-                ):
-                    out[k] = _REDACTED_SECRET
-                else:
-                    out[k] = _walk(v)
-            return out
-        if isinstance(obj, list):
-            return [_walk(x) for x in obj]
-        if isinstance(obj, tuple):
-            return tuple(_walk(x) for x in obj)
-        return obj
-
-    return _walk(content)
 
 
 def _render_delegation_envelope(

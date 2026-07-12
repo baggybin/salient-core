@@ -20,8 +20,15 @@ Protocols:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from .runtime import AgentBackend as AgentBackend
+from .runtime import AgentTool, JsonValue, ToolBundle
+
+if TYPE_CHECKING:
+    from .policy.scope import ScopeStore
 
 
 @runtime_checkable
@@ -150,6 +157,30 @@ class ToolBuilder(Protocol):
 
 
 @runtime_checkable
+class ToolBundleBuilder(Protocol):
+    def __call__(
+        self,
+        tool_type: str,
+        config: Mapping[str, JsonValue],
+        *,
+        context: ToolBuildContext,
+    ) -> ToolBundle: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ToolBuildContext:
+    server_name: str | None
+    scope_store: ScopeStore | None
+    agent_name: str
+    extra_tools: tuple[AgentTool, ...] = ()
+    extra_bare_wires: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "extra_tools", tuple(self.extra_tools))
+        object.__setattr__(self, "extra_bare_wires", tuple(self.extra_bare_wires))
+
+
+@runtime_checkable
 class AliasProtocol(Protocol):
     """Tool-name aliasing (wire name ↔ real name mapping).
 
@@ -163,36 +194,3 @@ class AliasProtocol(Protocol):
     def rewrite_inbound(self, text: str) -> str: ...
     def mapping(self) -> dict[str, str]: ...
     def enabled(self) -> bool: ...
-
-
-@runtime_checkable
-class AgentBackend(Protocol):
-    """The exact surface `AgentRunner` needs from an agent SDK client — kept
-    minimal and faithful to real usage (seven members, no more). Anything that
-    crosses a process/network boundary implements this; the local default
-    (``daemon/_backend.py`` ``LocalClaudeBackend``) is a direct passthrough over
-    a ``ClaudeSDKClient`` subprocess.
-
-    v2 multi-SDK note: a future backend might wrap OpenAI's Responses API,
-    Gemini, or a local model server — it only needs these seven members.
-    """
-
-    async def connect(self) -> None: ...
-    async def disconnect(self) -> None: ...
-    async def query(self, prompt: str) -> None: ...
-
-    def receive_response(self) -> AsyncIterator[Any]:
-        """Return the async iterator of response messages for the in-flight
-        turn. NOT a coroutine — callers do
-        ``async for msg in backend.receive_response()``."""
-        ...
-
-    async def interrupt(self) -> None: ...
-    async def get_context_usage(self) -> dict[str, Any] | None: ...
-
-    @property
-    def raw(self) -> Any:
-        """The underlying client object, for the death-probe in
-        ``classify_run_loop_error`` (which reads the subprocess returncode). A
-        remote backend returns whatever object carries its own liveness signal."""
-        ...

@@ -16,6 +16,7 @@ import os
 import re as _re
 import sqlite3
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -658,7 +659,7 @@ def _peek_swarms(db_path: Path | None) -> dict[str, dict[str, Any]]:
     if db_path is None or not db_path.exists():
         return {}
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'swarms'").fetchone()
         if not row or not row[0]:
             return {}
@@ -707,7 +708,7 @@ def _peek_active_engagement(db_path: Path | None) -> str | None:
     if db_path is None or not db_path.exists():
         return None
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute(
                 "SELECT value FROM meta WHERE key = 'active_engagement_run_id'"
             ).fetchone()
@@ -724,7 +725,7 @@ def _peek_running_agents(db_path: Path | None) -> list[str]:
     if db_path is None or not db_path.exists():
         return []
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'running_agents'").fetchone()
         if not row or not row[0]:
             return []
@@ -750,7 +751,7 @@ def _peek_spawned_cfgs(db_path: Path | None) -> dict[str, dict]:
     if db_path is None or not db_path.exists():
         return {}
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = 'spawned_agent_cfgs'").fetchone()
         if not row or not row[0]:
             return {}

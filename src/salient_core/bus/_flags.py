@@ -47,6 +47,13 @@ class BusFlags(BaseModel):
     # sets it at dispatch and reads the stamped Job to scope the leg's trace.
     # INVARIANT: core may carry this bit, but must NEVER read/branch on it.
     verification_leg: bool = False
+    # Detached delegation opt-in. Default False = structured concurrency: a
+    # timed-out or caller-cancelled ``ask_agent`` STOPS its child runner
+    # (``cancel_job``) instead of leaving it burning tokens after the caller
+    # gave up. Set True only for deliberate fire-and-forget where the child is
+    # meant to outlive its caller's await (it then keeps its own Job identity
+    # and runs to its own completion/timeout).
+    detach: bool = False
     # In-process ONLY: never serialized (excluded from model_dump/schema) and
     # kept out of reprs/traces. The wire path never constructs BusFlags by
     # validation, so a callable can't arrive from JSON.

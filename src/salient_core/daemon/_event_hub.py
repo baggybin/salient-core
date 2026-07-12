@@ -27,10 +27,33 @@ mutating a frame in place corrupts it for every other observer.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections import deque
 from contextlib import suppress
 from typing import Any
+
+
+def fork_event(evt: dict[str, Any]) -> dict[str, Any]:
+    """Return an isolated copy of ``evt`` for handoff to ONE consumer.
+
+    The producer's rings (``recent_events``, the hub ring) keep the canonical
+    birth object, which nobody mutates after publish. Every object handed to a
+    consumer — a subscriber ``put_nowait`` or a replay snapshot frame — is a
+    fresh fork instead, so one subscriber annotating ``evt["meta"][...]`` can't
+    corrupt another subscriber or a later replay.
+
+    Only ``meta`` is deep-copied: every other top-level field is an immutable
+    scalar/string, so a shallow ``dict(evt)`` isolates them. Stays plain-dict
+    all the way down (no proxies/tuples) so the web console can still
+    ``json.dumps`` the frame. Cheap in the common case — token-delta events
+    usually carry no ``meta``, degrading this to a single shallow copy."""
+    c = dict(evt)
+    m = c.get("meta")
+    if m is not None:
+        c["meta"] = copy.deepcopy(m)
+    return c
+
 
 # Capabilities the daemon advertises on the ``whoami`` surface so a client can
 # detect skew (e.g. a standalone desktop bundle running ahead of the older
@@ -96,10 +119,12 @@ class EventHub:
         # backlog from genuinely live events DETERMINISTICALLY — no wall-clock
         # "bootstrap window" guessing on the client (which mis-counts a slow
         # replay as live, or swallows a block that lands right after connect).
-        # Shallow copies: the ring + the live queue keep the original unmarked
-        # event, so other consumers and the live delivery of an event that
-        # races between append-queue and read-ring are unaffected.
-        snapshot = [{**evt, "replay": True} for evt in self._ring]
+        # Fork each ring frame: the ring keeps the canonical unmarked event, so
+        # other consumers and the live delivery of an event that races between
+        # append-queue and read-ring are unaffected — and this replay consumer
+        # gets a deeply-isolated copy it can annotate without corrupting the
+        # ring or another subscriber.
+        snapshot = [{**fork_event(evt), "replay": True} for evt in self._ring]
         return q, snapshot
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
@@ -134,7 +159,9 @@ class EventHub:
                 self._full_streak.pop(q, None)
                 self._full_since.pop(q, None)
                 streak = 0
-            q.put_nowait(evt)
+            # Fork per subscriber so one tailer can't corrupt another's frame
+            # (the ring above keeps the canonical object).
+            q.put_nowait(fork_event(evt))
             # Evict a consumer that has made ZERO progress for `evict_after`
             # consecutive publishes AND for at least `evict_min_seconds` of
             # real time: functionally dead even if its socket is technically

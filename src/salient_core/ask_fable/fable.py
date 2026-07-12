@@ -22,6 +22,8 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
+import anyio
+
 from .prompts import FABLE_SYSTEM_PROMPT
 
 FABLE_MODEL = "claude-fable-5"
@@ -48,6 +50,10 @@ def _timeout_default() -> float:
         return float(os.environ.get("ASK_FABLE_TIMEOUT") or 120.0)
     except (TypeError, ValueError):
         return 120.0
+
+
+async def _offload_blocking_io(func, *args, **kwargs):
+    return await anyio.to_thread.run_sync(func, *args, **kwargs)
 
 
 def _compose(question: str, context: str) -> str:
@@ -188,7 +194,7 @@ async def _run_cli(message: str, timeout: float) -> FableResult:
         )
 
     try:
-        proc = await asyncio.to_thread(_call)
+        proc = await _offload_blocking_io(_call)
     except subprocess.TimeoutExpired:
         return FableResult(
             "error", kind="timeout", text=f"Fable CLI timed out after {timeout:.0f}s"

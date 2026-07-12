@@ -12,12 +12,14 @@ engine APPLIES, and only the unambiguous, reversible, archive-first operations:
     a since-removed write path nothing reads).
 
 Everything is archived to JSON + SHA256 BEFORE removal, so a mistake is
-recoverable. The caller (daemon) supplies the archive dir. No agent pause is
-needed for the current op set: `purge_expired` re-checks each row's expiry at
-DELETE time, so if an agent revives an expired-but-unpurged fact between the
-export and the purge (kg_assert refreshes its `expires_at` to the future), the
-DELETE simply won't match it — the revived fact is preserved. (A future
-live-fact prune WOULD need agents paused; this MVP doesn't touch live facts.)
+recoverable. The caller (daemon) supplies the archive dir. The purge deletes the
+archived id set with a delete-time expiry re-check (`kg.purge_expired_ids`),
+never a blind re-selection: a fact that expires — or is inserted already-expired
+— after the archive is not in the id set and survives to the next run, and a
+fact revived (its `expires_at` pushed to the future) before the delete fails the
+re-check and is preserved. Archive and deletion cover the same rows, and no
+still-live fact is ever purged. (A future live-fact prune WOULD need agents
+paused; this MVP doesn't touch live facts.)
 There is no LLM in this path — the "smart" part (judging live facts,
 distillation) is the analyst's proposal, which a human reviews; it is NOT
 executed here.
@@ -27,9 +29,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # Credential predicates the engine NEVER purges, even when expired, are sourced
 # at call time from the credential-vocabulary seam (generic kernel defaults +
@@ -42,6 +48,47 @@ from .credentials import cred_predicates  # noqa: E402
 # against a misconfigured/empty store. Expired-only purge doesn't change the
 # active count, so this mainly guards future live-prune ops.
 DEFAULT_SAFETY_FLOOR = 1
+
+
+def _atomic_write_text(path: Path, body: str) -> None:
+    """Write ``body`` to ``path`` durably: write a temp sibling, fsync it, then
+    atomically ``os.replace`` over the target. The archive is the ONLY recovery
+    point for a compaction, so a torn/partial file from an interrupted write (or
+    a reader seeing a half-written archive) would defeat the "archived before
+    deleted" invariant. rename-over-target is atomic on POSIX."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(body)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    # fsync the directory too: the file's contents are durable (fsync above), but
+    # the rename/directory entry isn't guaranteed on-disk until the dir is synced.
+    # Best-effort — O_DIRECTORY/dir-fsync is POSIX-only; skip cleanly elsewhere.
+    try:
+        dir_fd = os.open(path.parent, getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def _delete_facts_atomic(kg: Any, fact_ids: list[int]) -> int:
+    """Delete a set of facts all-or-nothing; return the number removed. Prefers
+    the KG's transactional ``delete_many`` (one commit for the whole set); falls
+    back to per-fact ``delete`` only for a duck-typed KG double that predates
+    it."""
+    if not fact_ids:
+        return 0
+    if hasattr(kg, "delete_many"):
+        return int(kg.delete_many(fact_ids))
+    removed = 0
+    for fid in fact_ids:  # pragma: no cover - legacy/test doubles without delete_many
+        if kg.delete(fid):
+            removed += 1
+    return removed
 
 
 def survey(kg: Any, context_store: Any, *, now: float | None = None) -> dict[str, Any]:
@@ -71,8 +118,12 @@ def apply(
 ) -> dict[str, Any]:
     """Archive-then-remove the safe/reversible compaction set. Returns a report
     including the archive path + SHA256. Refuses (no mutation) if the KG's
-    active-fact count is below `floor`. Concurrency-safe without an agent pause
-    (see module docstring): the purge re-checks expiry at DELETE time."""
+    active-fact count is below `floor`. The KG purge deletes the archived id set
+    with a delete-time expiry re-check (never a blind re-selection), so archive
+    and deletion cover the same rows and no fact that expired-later or was
+    revived concurrently is mishandled. The context-store GC is a separate,
+    idempotent phase reported independently (see `phases`) — never claimed as
+    cross-database-atomic."""
     now = now if now is not None else time.time()
     # Defense-in-depth: a negative floor would disable the tripwire; clamp it
     # so even a bad direct caller can't bypass the guard. (The daemon also
@@ -104,15 +155,51 @@ def apply(
     body = json.dumps(payload, indent=2, sort_keys=True)
     sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
     archive_path = archive_dir / f"compact_{stamp}_{sha[:8]}.json"
-    archive_path.write_text(body)
+    _atomic_write_text(archive_path, body)
 
     # Now mutate — only after the archive is safely on disk.
-    purged = kg.purge_expired(now, exclude_predicates=cred_predicates())
-    job_keys_removed = (
-        context_store.gc_stale_job_keys() if hasattr(context_store, "gc_stale_job_keys") else 0
-    )
+    #
+    # Phase 1 (KG): delete the archived facts BY ID, re-checking expiry at DELETE
+    # time. Two properties, both required:
+    #   - by-id (not a re-select): a fact that expires — or is inserted
+    #     already-expired — between the export above and this delete is NOT in
+    #     the archived id set, so it survives to the next run rather than being
+    #     purged without an archive entry.
+    #   - re-check expiry/predicate (purge_expired_ids, not a raw delete): a fact
+    #     revived (expires_at pushed to the future) or reclassified between the
+    #     archive and this delete is left intact — deleting it by id alone would
+    #     remove a now-live fact whose current state was never archived.
+    expired_ids = [f["id"] for f in expired if isinstance(f, dict) and f.get("id") is not None]
+    if hasattr(kg, "purge_expired_ids"):
+        purged = kg.purge_expired_ids(expired_ids, now, exclude_predicates=cred_predicates())
+    else:  # pragma: no cover - duck-typed KG double without the conditional method
+        purged = _delete_facts_atomic(kg, expired_ids)
+
+    # Phase 2 (context store): a SEPARATE database, so we do NOT claim cross-DB
+    # atomicity. The KG phase is already archived + committed; this idempotent
+    # GC (DELETE ... WHERE key GLOB 'job_*') carries no state a retry would need
+    # — it self-heals on the next scheduled run, which re-scans from scratch. So
+    # on failure we report a degraded phase and log it (persistent silent
+    # failure must surface out-of-band) rather than raising past the completed,
+    # load-bearing KG phase.
+    job_keys_removed = 0
+    context_gc_ok = True
+    context_gc_error: str | None = None
+    if hasattr(context_store, "gc_stale_job_keys"):
+        try:
+            job_keys_removed = context_store.gc_stale_job_keys()
+        except Exception as exc:  # noqa: BLE001 - best-effort GC; report + log, never crash the run
+            context_gc_ok = False
+            context_gc_error = repr(exc)
+            log.warning(
+                "compaction context gc_stale_job_keys failed (self-healing on next run): %s",
+                exc,
+            )
 
     return {
+        # The KG phase (the load-bearing one) succeeded; the context GC is
+        # best-effort, so overall ok stays True and any GC failure is surfaced
+        # via `warnings` / `phases` rather than by flipping ok to False.
         "ok": True,
         "archive_path": str(archive_path),
         "archive_sha256": sha,
@@ -120,6 +207,20 @@ def apply(
         "context_job_keys_removed": job_keys_removed,
         "kg_active_facts_before": active_before,
         "kg_active_facts_after": kg.stats(now).get("total_facts", 0),
+        "warnings": (
+            []
+            if context_gc_ok
+            else [f"context gc_stale_job_keys failed (self-heals next run): {context_gc_error}"]
+        ),
+        "phases": {
+            "kg_purge": {"ok": True, "count": purged},
+            "context_gc": {
+                "ok": context_gc_ok,
+                "count": job_keys_removed,
+                "error": context_gc_error,
+                "retry": "automatic-next-run",
+            },
+        },
     }
 
 
@@ -218,10 +319,11 @@ def curate(
     )
     sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
     archive_path = archive_dir / f"curate_{stamp}_{sha[:8]}.json"
-    archive_path.write_text(body)
+    _atomic_write_text(archive_path, body)
 
-    for f in to_delete:
-        kg.delete(f["id"])
+    # All-or-nothing: one transaction so a mid-set failure can't leave the plan
+    # half-applied against an archive that claims every fact was selected.
+    _delete_facts_atomic(kg, [f["id"] for f in to_delete])
 
     report["archive_path"] = str(archive_path)
     report["archive_sha256"] = sha
@@ -300,10 +402,10 @@ def compact_study(
     )
     sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
     archive_path = archive_dir / f"study_{study_id}_compact_{stamp}_{sha[:8]}.json"
-    archive_path.write_text(body)
+    _atomic_write_text(archive_path, body)
 
-    for f in to_delete:
-        kg.delete(f["id"])
+    # All-or-nothing (same invariant as curate).
+    _delete_facts_atomic(kg, [f["id"] for f in to_delete])
 
     report["archive_path"] = str(archive_path)
     report["archive_sha256"] = sha

@@ -26,7 +26,6 @@ Public surface (everything else is internal):
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import ipaddress
 import json
@@ -36,11 +35,15 @@ import sqlite3
 import subprocess
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, get_args
+
+from .decision import InvocationIdentity, InvocationTransport, ToolInvocation
+from .scope_evaluation import evaluate_scope
 
 if TYPE_CHECKING:
     from .registry import PolicyDataset
@@ -509,7 +512,7 @@ class ExtractorSpec:
     commands with shell substitution, hex-encoded IPs, etc.
     """
 
-    fields: dict[str, str] = field(default_factory=dict)
+    fields: Mapping[str, str] = field(default_factory=dict)
     local_only: bool = False
     none: bool = False
     at_least_one: bool = False
@@ -538,6 +541,14 @@ class ExtractorSpec:
     split-horizon resolver. Passive DB-lookup research tools
     (research=True, research_active=False) fail OPEN — they only ever query
     public databases, never the target itself."""
+
+    def __post_init__(self) -> None:
+        # Freeze `fields` so registered policy cannot change through a retained
+        # caller reference or a nested mutation of `dataset.tool_targets[…].fields`
+        # after `set_active()`. `dict(...)` decouples from the caller's original
+        # mapping (blocks mutating the source dict); MappingProxyType makes the
+        # stored copy read-only (blocks direct mutation of the registered spec).
+        object.__setattr__(self, "fields", MappingProxyType(dict(self.fields)))
 
     def has_any_target_field(self) -> bool:
         return bool(self.fields)
@@ -2383,6 +2394,21 @@ def _rule_matches(rule: ScopeRule, target: Target) -> bool:
 # ─── the gate (wraps an SdkMcpTool) ────────────────────────────────────────
 
 
+@dataclass(frozen=True, slots=True)
+class _ScopeGatedHandler:
+    identity: InvocationIdentity
+    store: ScopeStore
+    dataset: PolicyDataset
+    original: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+    async def __call__(self, args: dict[str, Any]) -> dict[str, Any]:
+        invocation = ToolInvocation.normalize(self.identity, args)
+        evaluation = await evaluate_scope(invocation, self.store, self.dataset)
+        if not evaluation.allowed:
+            return _refused(evaluation.reason)
+        return await self.original(args)
+
+
 def gate(
     sdk_tool: Any,  # claude_agent_sdk.SdkMcpTool — duck-typed to avoid hard dep
     wire_name: str,
@@ -2415,144 +2441,26 @@ def gate(
     """
     from .registry import get_active
 
-    tool_targets = (dataset or get_active()).tool_targets
-    spec = None
-    if tool_type:
-        spec = tool_targets.get(f"{tool_type}.{wire_name}")
-    if spec is None:
-        spec = tool_targets.get(wire_name)
-    original_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] = sdk_tool.handler
+    if isinstance(sdk_tool.handler, _ScopeGatedHandler):
+        return sdk_tool
 
-    async def gated_handler(args: dict[str, Any]) -> dict[str, Any]:
-        # 1) Unclassified tool → fail-closed.
-        if spec is None:
-            store.log_decision(
-                agent=agent_name,
-                tool=wire_name,
-                args=args,
-                targets=[],
-                result=CheckResult(
-                    allowed=False,
-                    decisions=[],
-                    summary=f"tool {wire_name!r} has no scope classification",
-                ),
-            )
-            return _refused(
-                f"tool {wire_name!r} has no scope classification — "
-                f"refusing fail-closed. Add an entry to the active "
-                f"PolicyDataset.tool_targets (policy.registry.set_active)."
-            )
-
-        # 3) Bus tool / target-less → bypass entirely.
-        if spec.none:
-            return await original_handler(args)
-
-        # 3b) Relayed session command (a skin's established-session relay):
-        # only scope-checked when the engagement opted into session_strict.
-        # Off (default) ⇒ legacy established-session trust, bypass like `none`
-        # (no log, byte-for-byte the prior behaviour). On ⇒ fall through to the
-        # normal extract→check path below, where a skin-registered command extractor
-        # sweeps the command for embedded out-of-scope relay targets. See SC-1.
-        if spec.session_scoped and not store.session_strict():
-            return await original_handler(args)
-
-        # 2) Local-only → log allow but skip the check.
-        if spec.local_only:
-            store.log_decision(
-                agent=agent_name,
-                tool=wire_name,
-                args=args,
-                targets=[],
-                result=CheckResult(
-                    allowed=True,
-                    decisions=[],
-                    summary="local-only tool — scope check skipped",
-                ),
-            )
-            return await original_handler(args)
-
-        # 4) Target-bearing tool → extract + check.
-        try:
-            targets = extract_targets(spec, args)
-        except ExtractorError as e:
-            store.log_decision(
-                agent=agent_name,
-                tool=wire_name,
-                args=args,
-                targets=[],
-                result=CheckResult(
-                    allowed=False,
-                    decisions=[],
-                    summary=f"extractor: {e}",
-                ),
-            )
-            return _refused(f"extractor refused: {e}")
-
-        # Empty target list with no extractor error = "no scope check needed
-        # for this call" (e.g. command navigation like `jobs -l`, or a tool
-        # whose at_least_one fields were all empty in a permissive spec).
-        # Log an allow + skip the check. Documented in docs/SCOPE.md.
-        if not targets:
-            store.log_decision(
-                agent=agent_name,
-                tool=wire_name,
-                args=args,
-                targets=[],
-                result=CheckResult(
-                    allowed=True,
-                    decisions=[],
-                    summary="extraction returned no targets — call allowed",
-                ),
-            )
-            return await original_handler(args)
-
-        # Research/OSINT tools (research=True) use the broad RESEARCH lane when
-        # it's enabled: public hosts allowed without a scope add, private/
-        # internal still denied. Everything else stays on strict engagement
-        # scope. `mode: off` makes research tools fall back to strict too.
-        use_research = spec.research and store.research_active()
-        # The research path may do a blocking DNS lookup (the public floor),
-        # so run it on the dedicated bounded executor — off the event loop
-        # (no daemon stall) and off the shared default pool (no starving
-        # infra tools). check_research snapshots the rule list, so the worker
-        # thread is safe. The strict path is pure-CPU and stays inline.
-        if use_research:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                _RESEARCH_EXECUTOR,
-                store.check_research,
-                targets,
-                spec.research_active,
-            )
-        else:
-            result = store.check(targets)
-        store.log_decision(
-            agent=agent_name,
-            tool=wire_name,
-            args=args,
-            targets=targets,
-            result=result,
-        )
-        if not result.allowed:
-            example = targets[0].value if targets else "<target>"
-            if use_research:
-                return _refused(
-                    f"research target refused — {result.summary}\n\n"
-                    f"The research lane reaches any PUBLIC host but denies "
-                    f"internal/private infrastructure and `out_targets`. To "
-                    f"reach an internal target, add it to engagement scope: "
-                    f"`salientctl scope add {example} --reason '…'`."
-                )
-            return _refused(
-                f"out of scope — {result.summary}\n\n"
-                f"To allow: `salientctl scope add <pattern> --reason '…'` "
-                f"(or `--once` for single-use). "
-                f"To inspect: `salientctl scope test {example}` "
-                f"or `salientctl scope deny-log --since 5m`."
-            )
-        return await original_handler(args)
-
-    return replace(sdk_tool, handler=gated_handler)
+    qualified_name = f"{tool_type}.{wire_name}" if tool_type else wire_name
+    identity = InvocationIdentity(
+        transport=InvocationTransport.MCP,
+        wire_name=wire_name,
+        qualified_name=qualified_name,
+        agent_id=agent_name,
+    )
+    active_dataset = dataset or get_active()
+    return replace(
+        sdk_tool,
+        handler=_ScopeGatedHandler(
+            identity=identity,
+            store=store,
+            dataset=active_dataset,
+            original=sdk_tool.handler,
+        ),
+    )
 
 
 def _refused(reason: str) -> dict[str, Any]:
@@ -2605,13 +2513,20 @@ def _matched_pattern(result: CheckResult) -> str | None:
 
 # ─── extractor table (which tool fields hold targets) ──────────────────────
 #
-# Keys are MCP tool wire-names. A tool absent from the active dataset fails
-# CLOSED at the gate, so the kernel's GENERIC default must cover the kernel's
-# own tools: none-specs for the built-in bus tools (they don't network → no
-# scope target) plus a handful of generic networking examples so the gate stays
-# exercised standalone. A downstream skin swaps in its real, domain-specific
-# taxonomy via `registry.set_active(PolicyDataset(tool_targets=...))`.
+# Keys are qualified SDK names or MCP/bus compatibility wire names. A tool
+# absent from the active dataset fails CLOSED, so the kernel's GENERIC default
+# covers only its known SDK schemas, built-in bus tools, and generic networking
+# examples. A downstream skin swaps in its domain-specific taxonomy via
+# `registry.set_active(PolicyDataset(tool_targets=...))`.
 _DEFAULT_TOOL_TARGETS: dict[str, ExtractorSpec] = {
+    "builtin.Bash": ExtractorSpec(fields={"command": "raw_argv"}),
+    "builtin.Read": ExtractorSpec(local_only=True),
+    "builtin.Grep": ExtractorSpec(local_only=True),
+    "builtin.Glob": ExtractorSpec(local_only=True),
+    "builtin.Write": ExtractorSpec(local_only=True),
+    "builtin.Edit": ExtractorSpec(local_only=True),
+    "builtin.Agent": ExtractorSpec(none=True),
+    "builtin.Task": ExtractorSpec(none=True),
     # Built-in bus tools — never scope-checked (in-process, no remote target).
     # Kept in sync with salient_core.bus._BUS_TOOL_NAMES (minus the domain
     # tools a skin supplies). Listed literally to avoid a policy->bus import.

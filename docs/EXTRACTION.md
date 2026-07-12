@@ -101,6 +101,10 @@ _tool_registry.set_tool_builder(my_tool_builder)
 _tool_registry.set_tool_wire_names({"exec": ["run", "shell"]})   # advertised primary tools
 _tool_registry.set_daemon_skin_modules(commands=my_commands_module)
 
+# How daemon.kg is constructed (default builds the local SQLite store; swap in
+# e.g. a network client with the same method surface):
+_tool_registry.set_kg_builder(lambda db_path: RemoteKnowledgeGraph(url, token))
+
 # Prompt assembly:
 _prompts.set_thinking_provider(is_match, resolve)   # model-specific thinking config
 _prompts.set_prompts_root("/path/to/prompt/addenda")
@@ -119,6 +123,25 @@ set_bus_builder(my_bus_builder)
 policy_registry.set_active(my_policy_dataset)   # scope targets, safeguard patterns, structural-transfer tools
 alias.set_active(MyAlias())                      # optional, default is IdentityAlias
 
+# SDK capability exposure and policy authorization are separate. `builtin_tools`
+# enables SDK capabilities; qualified `tool_targets` entries classify policy
+# handling without enabling anything in the SDK:
+my_policy_dataset = PolicyDataset(
+    tool_targets={
+        "builtin.Bash": scope.ExtractorSpec(fields={"command": "raw_argv"}),
+        "builtin.Read": scope.ExtractorSpec(local_only=True),
+        "builtin.Agent": scope.ExtractorSpec(none=True),
+        "bus.context_write": scope.ExtractorSpec(none=True),
+    },
+    prohibited_patterns=...,
+    loud_patterns=...,
+    # Deprecated: temporary shadow-only migration input. Remove after every
+    # enabled tool has a qualified tool_targets classification.
+    trusted_builtins=frozenset({"LegacyKnownTool"}),
+)
+# TodoWrite, ExitPlanMode, WebSearch, and future SDK names stay absent until their
+# schemas and intended policy handling are explicitly known.
+
 # Additive vocabulary seams — each EXTENDS a generic built-in with domain
 # specifics (rather than replacing a provider), so the kernel ships a working
 # generic default and your skin layers its vocabulary on top:
@@ -131,6 +154,17 @@ _common.register_secret_fields({"nt_hash", "aes256_key"})        # extra log-red
 _common.register_cred_tool_markers({"secretsdump"})              # tools whose value/hash/token hold secrets
 _prompts.register_swarm_bootstrap_addendum("domain swarm guidance …")
 ```
+
+Migrate one agent at a time:
+
+1. Inventory its actual `builtin_tools` and auto-enabled `Agent`/`Task` tools.
+2. Add a qualified `builtin.<name>` classification for every known schema; use
+   `none=True` only for a deliberately targetless tool.
+3. Run in shadow mode and resolve `builtin_policy_shadow` and
+   `legacy_trusted_builtin` records. The legacy field never bypasses safeguards.
+4. Remove the tool from `trusted_builtins`, then set
+   `enforce_builtin_policy: true`. Enforce mode ignores legacy trust and denies
+   any remaining unclassified call before dispatch.
 
 See the seam table in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for every seam,
 its module, and its default.

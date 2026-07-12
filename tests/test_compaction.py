@@ -9,6 +9,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from salient_core.memory import compaction
 from salient_core.memory.kg import KnowledgeGraph
@@ -111,6 +112,84 @@ class CompactionEngineTests(unittest.TestCase):
             rep = compaction.apply(kg, _FakeCtx(), archive_dir=Path(tmp) / "a", floor=-999)
             self.assertTrue(rep["ok"])
             self.assertEqual(rep["kg_expired_purged"], 1)
+
+    def test_fact_expiring_at_archive_boundary_survives_unarchived(self):
+        # A fact that becomes expired AFTER the archive snapshot but BEFORE the
+        # delete must NOT be removed — the delete covers exactly the archived id
+        # set, never a re-selection. Otherwise it would be purged without a
+        # recovery archive (data loss). (Finding #3.)
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = _kg(tmp)
+            self._seed(kg)  # host:c is the single expired non-cred fact
+
+            real_write = compaction._atomic_write_text
+
+            def _write_then_inject(path, body):
+                real_write(path, body)
+                # Simulate a fact expiring at the archive/delete boundary.
+                kg.assert_fact("host:d", "had_banner", "late", expires_at=_PAST)
+
+            with mock.patch.object(compaction, "_atomic_write_text", _write_then_inject):
+                rep = compaction.apply(kg, _FakeCtx(), archive_dir=Path(tmp) / "archive")
+
+            # Only the archived fact (host:c) was deleted.
+            self.assertEqual(rep["kg_expired_purged"], 1)
+            archived = json.loads(Path(rep["archive_path"]).read_text())["kg_expired_noncred"]
+            self.assertEqual({f["subject"] for f in archived}, {"host:c"})
+
+            survivors = {f["subject"] for f in kg.export_expired()}
+            self.assertIn("host:d", survivors)  # boundary-injected → survived this run
+            self.assertNotIn("host:c", survivors)  # archived → deleted
+
+    def test_fact_revived_at_archive_boundary_is_not_deleted(self):
+        # A fact archived while expired but REVIVED (expires_at pushed to the
+        # future) before the delete must be preserved — the by-id purge re-checks
+        # expiry at DELETE time, so a now-live fact whose current state was never
+        # archived is never removed. (Finding #3 — regression guard.)
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = _kg(tmp)
+            self._seed(kg)  # host:c is the single expired non-cred fact
+
+            real_write = compaction._atomic_write_text
+
+            def _write_then_revive(path, body):
+                real_write(path, body)
+                # Revive host:c: same (s,p,o), expiry pushed far into the future.
+                kg.assert_fact("host:c", "had_banner", "old", expires_at=_FUTURE)
+
+            with mock.patch.object(compaction, "_atomic_write_text", _write_then_revive):
+                rep = compaction.apply(kg, _FakeCtx(), archive_dir=Path(tmp) / "archive")
+
+            # host:c was revived at the boundary → NOT deleted (now live).
+            self.assertEqual(rep["kg_expired_purged"], 0)
+            self.assertTrue(kg.query(subject="host:c"))
+
+    def test_context_gc_failure_reports_degraded_phase_not_crash(self):
+        # The context store is a SEPARATE database. If its idempotent GC fails
+        # after the KG phase committed, apply() must report a degraded phase
+        # (self-healing next run) rather than raise past the completed, archived
+        # KG work or claim cross-DB atomicity. (Finding #3.)
+        class _FailingCtx(_FakeCtx):
+            def gc_stale_job_keys(self):
+                raise RuntimeError("context db locked")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            kg = _kg(tmp)
+            self._seed(kg)
+            rep = compaction.apply(kg, _FailingCtx(), archive_dir=Path(tmp) / "a")
+
+            # KG phase (load-bearing) succeeded and applied.
+            self.assertTrue(rep["ok"])
+            self.assertEqual(rep["kg_expired_purged"], 1)
+            self.assertTrue(rep["phases"]["kg_purge"]["ok"])
+            self.assertFalse(kg.query(subject="host:c"))  # archived + deleted
+
+            # Context GC phase reported as failed + self-healing, not raised.
+            ctx_phase = rep["phases"]["context_gc"]
+            self.assertFalse(ctx_phase["ok"])
+            self.assertIn("context db locked", ctx_phase["error"])
+            self.assertEqual(ctx_phase["retry"], "automatic-next-run")
+            self.assertTrue(rep["warnings"])
 
 
 # NOTE: the cred-predicate sync check (compaction.CRED_PREDICATES vs the

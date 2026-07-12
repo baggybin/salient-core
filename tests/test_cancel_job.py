@@ -15,14 +15,11 @@ import unittest
 
 
 def _make_runner(name: str = "child"):
-    from claude_agent_sdk import ClaudeAgentOptions
-
     from salient_core.daemon import AgentRunner
 
     return AgentRunner(
         name=name,
         cfg={},
-        options=ClaudeAgentOptions(),
         prompt_timeout=60.0,
         idle_timeout=0.0,
     )

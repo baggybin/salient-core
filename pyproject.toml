@@ -1,11 +1,11 @@
 [project]
 name = "salient-core"
-version = "0.4.0"
+version = "0.7.6"
 description = "A multi-agent coordination kernel with policy gates, knowledge graph, and operator-mediated delegation."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "Jon O'Brien" }]
 keywords = ["agents", "multi-agent", "coordination", "mcp", "knowledge-graph", "claude"]
 classifiers = [
@@ -39,6 +39,11 @@ ask-fable = "salient_core.ask_fable.__main__:_main"
 # ask_fable's MCP server transport. Kept optional so the base kernel stays lean;
 # install with `pip install 'salient-core[ask-fable]'`.
 ask-fable = ["mcp>=1.0"]
+codex = [
+    "openai-codex==0.1.0b3",
+    "openai-codex-cli-bin==0.137.0a4",
+    "mcp>=1.0,<2",
+]
 dev = [
     "ruff==0.15.20",
     "mypy>=1.13",
@@ -98,7 +103,7 @@ check_untyped_defs = true
 disable_error_code = ["attr-defined"]
 
 [[tool.mypy.overrides]]
-module = "claude_agent_sdk.*"
+module = ["claude_agent_sdk.*", "openai_codex", "openai_codex.*"]
 ignore_missing_imports = true
 
 # numpy is an undeclared, best-effort accelerator (memory.embeddings guards

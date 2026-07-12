@@ -25,8 +25,9 @@ src/salient_core/
 ├── policy/
 │   ├── scope.py          Scope gate — target extraction + allow/deny per tool call
 │   ├── safeguards.py     Safeguards engine — posture + pattern matching
+│   ├── decision.py       Normalized tool invocation and neutral policy decision types
 │   ├── registry.py       Active PolicyDataset registry (set_active seam)
-│   ├── defaults.py       Empty default scope/safeguard dataset
+│   ├── defaults.py       Generic defaults, including known qualified SDK classifications
 │   └── _safeguard_vocab.py  Encoded trigger vocabulary (injectable)
 │
 ├── bus/                  The inter-agent bus (single MCP server per agent)
@@ -52,7 +53,7 @@ src/salient_core/
 │   ├── _tool_registry.py Tool-builder / wire-name / daemon-skin-module seams
 │   ├── _backend.py       AgentBackend abstraction (v2 multi-SDK seam)
 │   ├── _event_hub.py     Fan-out event hub with replay support
-│   ├── _tasks.py         Background task spawning
+│   ├── _tasks.py         Background tasks: spawn_background/track_background + join_background_tasks (teardown join)
 │   ├── _helpers.py       Job, BusCall dataclasses, shared utilities
 │   ├── _prompts.py       Prompt-addendum loader + thinking-provider / prompts-root seams
 │   └── _questions.py     Question/answer RPC handler + operator-authz seam
@@ -107,9 +108,11 @@ surfaces a downstream implements:
 
 The dominant idiom: a `set_*` function read at **call time** (never bound at
 import time), each with a safe default so the kernel stays runnable standalone.
-A downstream skin calls the relevant `set_*` at startup. Defaults are either a
+A downstream skin calls the relevant `set_*` at startup. Defaults are usually a
 raising stub (fail loud if a required provider is missing) or a permissive
-no-op.
+no-op; the exception is `set_kg_builder`, whose default actually **builds** (the
+kernel has a perfectly good local SQLite store), so the seam only exists for a
+downstream to substitute an alternative — e.g. a network-backed KnowledgeGraph.
 
 A second family — `register_*` — is **additive** rather than provider-replacing:
 each extends a generic built-in set (credential kinds, redaction field names,
@@ -117,11 +120,21 @@ credential-tool markers, scope-extractor kinds, swarm-prompt guidance) with a
 skin's domain vocabulary, so the kernel ships a working generic default and a
 skin layers its specifics on top. Same call-time idiom, called once at startup.
 
+**Lifecycle contract — background tasks.** `daemon/_tasks.py` exposes
+`spawn_background` (create + park a fire-and-forget task), `track_background`
+(park an already-created task whose handle the caller keeps — e.g. to await it
+shielded with a bound), and `join_background_tasks(timeout)`. A downstream daemon
+MUST call `join_background_tasks()` during shutdown **before it tears down agent
+backends**: `ask_agent`'s non-detached child-stop is a tracked task that calls
+`runner.cancel_job` → `backend.interrupt()`, so joining after backend teardown
+would drop it mid-interrupt.
+
 | Seam | Module | Default |
 |---|---|---|
 | `set_tool_builder` | `daemon/_tool_registry.py` | raising stub (fail-loud) |
 | `set_tool_wire_names` | `daemon/_tool_registry.py` | empty → omits primary-tool line |
 | `set_daemon_skin_modules` | `daemon/_tool_registry.py` | none registered |
+| `set_kg_builder` | `daemon/_tool_registry.py` | builds local SQLite `KnowledgeGraph` (consumed downstream) |
 | `set_thinking_provider` | `daemon/_prompts.py` | claims no model (static config) |
 | `set_prompts_root` | `daemon/_prompts.py` | packaged `prompts/` dir |
 | `set_authz_provider` | `daemon/_questions.py` | permissive no-op |
@@ -131,12 +144,39 @@ skin layers its specifics on top. Same call-time idiom, called once at startup.
 | `set_bus_skin_modules` | `bus/_common.py` | none registered |
 | `set_bus_builder` | `bus/__init__.py` | default `make_bus` |
 | `alias.set_active` | `alias.py` | `IdentityAlias` passthrough |
-| `policy.registry.set_active` | `policy/registry.py` | empty scope/safeguard dataset |
+| `policy.registry.set_active` | `policy/registry.py` | generic safeguards, bus targets, and known qualified SDK classifications |
 | `register_extractor` | `policy/scope.py` | generic kinds; unknown kind fails closed |
 | `register_credential_vocab` | `memory/credentials.py` | generic kinds (password/ssh_key/api_token) |
 | `register_secret_fields` | `bus/_common.py` | generic secret field names |
 | `register_cred_tool_markers` | `bus/_common.py` | generic markers (cred_record/cred_search) |
 | `register_swarm_bootstrap_addendum` | `daemon/_prompts.py` | none — generic swarm guidance only |
+
+### Tool-authorization boundary
+
+Every tool invocation is classified below the model, not just MCP-namespaced
+ones. Two branches feed one conceptual choke-point:
+
+- **MCP tools** (`mcp__<server>__<tool>`) — the PreToolUse safeguard hook and
+  external-scope hook run the scope + safeguards gates. External-MCP lookups are
+  **server-qualified** (`{server}.{tool}` then bare fallback), so two servers
+  exposing the same bare tool name classify independently.
+- **Built-in SDK tools / text-mode dispatch** — SDK-native calls resolve
+  `builtin.<wire-name>` and text calls resolve `bus.<wire-name>` against
+  `PolicyDataset.tool_targets`. A qualified entry defines how policy handles the
+  call; it does not expose the capability to the model. `ExtractorSpec(none=True)`
+  is an explicit targetless classification, not a blanket exemption for unknown
+  tools. Unknown SDK names remain unclassified and fail policy closed.
+
+`builtin_tools` and the derived SDK `allowed_tools` list control capability
+exposure and headless permission prompts only; neither authorizes policy. Rollout
+is **staged**: shadow mode records `builtin_policy_shadow` denials but permits
+dispatch, while `enforce_builtin_policy: true` makes the same denial effective.
+The deprecated `PolicyDataset.trusted_builtins` field is accepted only as a
+bounded shadow-migration aid: an unclassified tool must also be actually
+SDK-enabled, and reliance emits one structured `legacy_trusted_builtin` warning
+per runner/tool. Enforce mode ignores the field completely. Universal safeguards
+and narrower read-containment, subagent-approval, and approval hooks remain able
+to deny independently in both modes.
 
 ### `_launch_profile` — per-agent privilege separation
 
@@ -164,7 +204,10 @@ AgentRunner loop:
        a. Bus tools (ask_agent, kg_assert, record_review, etc.)
        b. Tool-builder tools (downstream-provided; run in a
           privilege-separated subprocess when a `_launch_profile` is present)
-    4. Each tool call passes through scope + safeguards gates
+    4. Every tool call is classified below the model (see
+       "Tool-authorization boundary"): MCP-namespaced tools through the
+       scope + safeguards gates; SDK-native and text tools through explicit
+       qualified `PolicyDataset.tool_targets` classifications
     5. Cross-agent delegations land in the operator's QuestionInbox
     6. Response text → evidence capture → KG updates
     ↓

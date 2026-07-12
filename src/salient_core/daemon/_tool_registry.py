@@ -12,8 +12,12 @@ See ``protocols.ToolBuilder`` for the builder's call contract.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
+
+from ..protocols import ToolBuildContext, ToolBundleBuilder
+from ..runtime import JsonValue, ToolBundle
 
 
 def _stub_build(*args: Any, **kwargs: Any) -> Any:
@@ -33,6 +37,22 @@ _build: Callable[..., Any] = _stub_build
 _build_subagents: Callable[..., list] = _stub_build_subagents
 
 
+def _stub_build_bundle(
+    tool_type: str,
+    config: Mapping[str, JsonValue],
+    *,
+    context: ToolBuildContext,
+) -> ToolBundle:
+    del tool_type, config, context
+    raise NotImplementedError(
+        "tool bundle builder not registered — call "
+        "salient_core.daemon.set_tool_bundle_builder(build) at startup"
+    )
+
+
+_build_bundle: ToolBundleBuilder = _stub_build_bundle
+
+
 def set_tool_builder(
     build: Callable[..., Any],
     build_subagents: Callable[..., list] | None = None,
@@ -48,6 +68,15 @@ def set_tool_builder(
 def get_tool_builder() -> Callable[..., Any]:
     """The active tool builder (raising stub until a skin registers one)."""
     return _build
+
+
+def set_tool_bundle_builder(build: ToolBundleBuilder) -> None:
+    global _build_bundle
+    _build_bundle = build
+
+
+def get_tool_bundle_builder() -> ToolBundleBuilder:
+    return _build_bundle
 
 
 def get_subagent_builder() -> Callable[..., list]:
@@ -74,6 +103,38 @@ def set_tool_wire_names(mapping: dict[str, str | list[str]]) -> None:
 def get_tool_wire_names() -> dict[str, str | list[str]]:
     """The active tool-type → wire-name map (empty until a skin registers)."""
     return _wire_names
+
+
+# KG-builder seam — how a daemon's KnowledgeGraph gets constructed. Unlike the
+# tool builder there is a perfectly good kernel default (the local SQLite
+# store), so the unregistered state BUILDS rather than raises. A downstream
+# registers an alternative at startup — e.g. a network client with the same
+# method surface (e.g. a remote KnowledgeGraph client) — and every daemon
+# that constructs its KG through get_kg_builder() picks it up, with zero
+# changes to the bus tools that consume ``daemon.kg``.
+
+
+def _default_build_kg(db_path: Any) -> Any:
+    from ..memory.kg import KnowledgeGraph  # lazy: keep daemon import light
+
+    return KnowledgeGraph(Path(db_path))
+
+
+_build_kg: Callable[..., Any] = _default_build_kg
+
+
+def set_kg_builder(build: Callable[..., Any]) -> None:
+    """Register the KG builder — ``build(db_path)`` returns the object bound as
+    ``daemon.kg`` (anything with the KnowledgeGraph method surface). Called once
+    at startup by a downstream skin; the default builds the local SQLite store."""
+    global _build_kg
+    _build_kg = build
+
+
+def get_kg_builder() -> Callable[..., Any]:
+    """The active KG builder (the local-KnowledgeGraph default until a skin
+    registers one)."""
+    return _build_kg
 
 
 # Daemon skin-module registry — the runner-factory reaches into a few downstream
@@ -114,7 +175,9 @@ def get_daemon_skin_module(name: str, *, required: bool = True) -> Any:
 
 def reset() -> None:
     """Restore the raising/no-op defaults. Test-only."""
-    global _build, _build_subagents, _wire_names
+    global _build, _build_bundle, _build_subagents, _build_kg, _wire_names
     _build, _build_subagents = _stub_build, _stub_build_subagents
+    _build_bundle = _stub_build_bundle
+    _build_kg = _default_build_kg
     _wire_names = {}
     _daemon_skin_modules.clear()

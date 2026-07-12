@@ -50,5 +50,6 @@ graphify-out/
 # Claude Code local settings
 .claude/
 
-# Internal roadmap — not for the public repo
+# Internal roadmap / launch material — not for the public repo
 PLAN.md
+HN-LAUNCH.md

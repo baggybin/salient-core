@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-07-12
+
+Second public snapshot, consolidating the `0.7.x` line (`0.7.0`–`0.7.6`).
+
+### Added
+- **Codex runtime provider**: a provider-neutral runner seam (`providers.py`,
+  `runtime.py`) so agents can run on OpenAI Codex as well as the Claude SDK —
+  `codex.py` (thread runtime, reasoning-effort wiring, persona via
+  `baseInstructions`) and `codex_mcp.py` (MCP gateway so codex agents can use
+  the bus). Install with the optional `codex` extra.
+- Codex MCP tool calls are surfaced as tool-call / tool-result events, and
+  streamed text is coalesced to one event/message.
+
+### Changed
+- Bus substitute routing skips operator-disabled candidates.
+- `ask_agents` "any" mode cancels sibling legs like "race".
+
+### Fixed
+- Runner no longer re-prompts a delegated agent that replied in text
+  (silent-completion detection).
+- Read/poll tools (e.g. `context_read`) are exempt from loop detection, and
+  loop questions get a cooldown so operators aren't re-asked in a tight loop.
+- Codex provider errors surface the real cause instead of a bare
+  "Codex provider error"; long-running `ask_*` gateway calls get an adequate
+  blocking timeout.
+
+## [0.6.0] - 2026-07-10
+
+Kernel-hardening release: a transport-neutral tool-authorization boundary plus
+a 7-finding invariant review, all closed with regression tests. See
+[`docs/KERNEL-HARDENING-v0.6.0.md`](docs/KERNEL-HARDENING-v0.6.0.md) for the
+engineering log. (Consolidates the untagged `0.5.0` KG work.)
+
+### Added
+- **Transport-neutral tool-authorization boundary**: every tool invocation —
+  SDK built-ins, internal MCP, external MCP, and model-emitted text — is
+  classified and gated below the model via qualified
+  `PolicyDataset.tool_targets` entries (`policy/decision.py`,
+  `daemon/_policy_hook_adapter.py`, `daemon/_text_policy.py`). Capability
+  exposure and policy authorization are separate; unknown tools fail closed.
+  Staged rollout: shadow mode records denials, `enforce_builtin_policy: true`
+  makes them effective. Raw-vs-redacted dual audit snapshots
+  (`policy/redaction.py`, `policy/scope_audit.py`).
+- **KG transactional writes + snapshot readers**: one-writer /
+  snapshot-isolated-readers connection discipline; a mutating method that
+  raises mid-transaction rolls back cleanly. `set_kg_builder` seam for
+  substituting a network-backed KnowledgeGraph. `Fact.source_ref` provenance.
+- **Subject-prefix scoping on `KnowledgeGraph.query` / `neighbors` /
+  `embedding_counts`**: optional `subject_prefix` keyword restricts reads to
+  a subject namespace, matched in SQL via the `kg_subject` index (LIKE,
+  escaped). For `neighbors`, the BFS only follows in-prefix edges, so the walk
+  stays bounded by the namespace size rather than a foreign hub's degree.
+  Backward-compatible: `None`/`""` is the unrestricted behavior.
+
+### Fixed
+- `ContextStore` commit failures roll back the transaction (no dirty
+  transaction flushed by a later commit); the connection is invalidated if
+  rollback itself fails.
+- Compaction deletes exactly the archived id set with a delete-time expiry
+  re-check — a fact revived between archive and delete is no longer lost.
+- `ExtractorSpec.fields` is frozen after registration
+  (`MappingProxyType`), so active policy can't be mutated.
+- `ask_agent`'s non-detached child-stop is awaited (bounded, shielded) and
+  joined at teardown via `track_background` / `join_background_tasks`.
+- `ContextStore.health()` attributes every degraded sink with per-sink counts.
+- Startup SQLite `_peek_*` readers no longer leak connection handles.
+- `runner.submit()` contract violations raise an actionable `TypeError`
+  instead of an opaque `NoneType.id` crash.
+
 ## [0.4.0] - 2026-07-07
 
 First public snapshot. Consolidates the pre-public `0.3.x`–`0.4.0` kernel work

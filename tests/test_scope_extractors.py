@@ -218,5 +218,38 @@ class ExtractorRegistryTests(unittest.TestCase):
             self.assertIn(k, _scope._CORE_KINDS)
 
 
+class ExtractorSpecImmutabilityTests(unittest.TestCase):
+    """Registered policy cannot change through a retained input reference or a
+    nested mutation of the spec after construction (kernel-invariant #4)."""
+
+    def test_mutating_the_original_fields_mapping_does_not_affect_extraction(self):
+        original = {"target": "ip_or_host"}
+        spec = ExtractorSpec(fields=original)
+
+        # Caller mutates the dict it passed in — the spec must be decoupled.
+        original["target"] = "none"
+        original["injected"] = "raw_argv"
+
+        self.assertEqual(dict(spec.fields), {"target": "ip_or_host"})
+        ts = extract_targets(spec, {"target": "10.0.0.5"})
+        self.assertEqual(_kv(ts), [("ip", "10.0.0.5")])
+
+    def test_direct_mutation_of_spec_fields_is_rejected(self):
+        spec = ExtractorSpec(fields={"target": "ip_or_host"})
+
+        # The registered spec's nested mapping is read-only.
+        with self.assertRaises(TypeError):
+            spec.fields["target"] = "raw_argv"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            spec.fields["injected"] = "none"  # type: ignore[index]
+
+        self.assertEqual(dict(spec.fields), {"target": "ip_or_host"})
+
+    def test_default_empty_fields_is_also_immutable(self):
+        spec = ExtractorSpec()
+        with self.assertRaises(TypeError):
+            spec.fields["x"] = "y"  # type: ignore[index]
+
+
 if __name__ == "__main__":
     unittest.main()

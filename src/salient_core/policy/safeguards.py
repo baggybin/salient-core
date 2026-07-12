@@ -15,6 +15,7 @@ without dooming the engagement.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -80,7 +81,7 @@ _DELEGATION_QUALIFIED: frozenset[str] = frozenset(
 # detectable by argument SHAPE (e.g. recursive system-tree copy).
 def _structural_block(
     qualified: str,
-    tool_input: dict[str, Any],
+    tool_input: Mapping[str, Any],
     transfer_tools: frozenset[str],
 ) -> tuple[str, str] | None:
     """Return (label, reason) if a structural prohibited pattern fires,
@@ -100,7 +101,7 @@ def _structural_block(
     return None
 
 
-def _string_haystack(tool_input: dict[str, Any]) -> str:
+def _string_haystack(tool_input: Mapping[str, Any]) -> str:
     """Concatenate every string value of a tool input — at ANY nesting
     depth — into one searchable blob, so a regex sweep doesn't care which
     field (or nested options dict) the model put the command/flag in (some
@@ -112,7 +113,7 @@ def _string_haystack(tool_input: dict[str, Any]) -> str:
     def _walk(v: Any) -> None:
         if isinstance(v, str):
             parts.append(v)
-        elif isinstance(v, dict):
+        elif isinstance(v, Mapping):
             for item in v.values():
                 _walk(item)
         elif isinstance(v, (list, tuple)):
@@ -125,7 +126,7 @@ def _string_haystack(tool_input: dict[str, Any]) -> str:
 
 def check_intent(
     qualified: str,
-    tool_input: dict[str, Any],
+    tool_input: Mapping[str, Any],
     *,
     config: SafeguardConfig | None = None,
     dataset: PolicyDataset | None = None,
@@ -189,7 +190,7 @@ _DEFAULT_LOUD_PATTERNS: dict[str, list[tuple[str, str]]] = {}
 
 def check_posture(
     qualified: str,
-    tool_input: dict[str, Any],
+    tool_input: Mapping[str, Any],
     *,
     posture: str = "normal",
     dataset: PolicyDataset | None = None,

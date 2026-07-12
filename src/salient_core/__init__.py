@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.4.0"
+__version__ = "0.7.6"
 
 # The supported public surface, resolved lazily (PEP 562) so that
 # `import salient_core` — and any submodule import, which runs this file
@@ -42,7 +42,22 @@ if TYPE_CHECKING:
     from .protocols import AgentBackend as AgentBackend
     from .protocols import AliasProtocol as AliasProtocol
     from .protocols import DaemonServices as DaemonServices
+    from .protocols import ToolBuildContext as ToolBuildContext
     from .protocols import ToolBuilder as ToolBuilder
+    from .protocols import ToolBundleBuilder as ToolBundleBuilder
+    from .providers import AgentProvider as AgentProvider
+    from .providers import ProviderCapabilities as ProviderCapabilities
+    from .providers import ProviderName as ProviderName
+    from .providers import ProviderProbe as ProviderProbe
+    from .providers import ProviderRegistry as ProviderRegistry
+    from .providers import builtin_provider_registry as builtin_provider_registry
+    from .providers import get_provider_registry as get_provider_registry
+    from .providers import reset_provider_registry as reset_provider_registry
+    from .providers import set_provider_registry as set_provider_registry
+    from .runtime import AgentEvent as AgentEvent
+    from .runtime import AgentTool as AgentTool
+    from .runtime import ToolBundle as ToolBundle
+    from .runtime import TurnUsage as TurnUsage
     from .tutor import bucketed_profile as bucketed_profile
 
 _LAZY_EXPORTS = {
@@ -66,11 +81,38 @@ _LAZY_EXPORTS = {
     "AliasProtocol": ".protocols",
     "DaemonServices": ".protocols",
     "ToolBuilder": ".protocols",
+    "ToolBuildContext": ".protocols",
+    "ToolBundleBuilder": ".protocols",
+    "AgentProvider": ".providers",
+    "ProviderCapabilities": ".providers",
+    "ProviderName": ".providers",
+    "ProviderProbe": ".providers",
+    "ProviderRegistry": ".providers",
+    "builtin_provider_registry": ".providers",
+    "get_provider_registry": ".providers",
+    "reset_provider_registry": ".providers",
+    "set_provider_registry": ".providers",
+    "AgentEvent": ".runtime",
+    "AgentTool": ".runtime",
+    "ToolBundle": ".runtime",
+    "TurnUsage": ".runtime",
     "bucketed_profile": ".tutor",
 }
 
 _SUBPACKAGES = frozenset(
-    {"alias", "bus", "coord", "daemon", "display", "memory", "policy", "protocols", "tutor"}
+    {
+        "alias",
+        "bus",
+        "coord",
+        "daemon",
+        "display",
+        "memory",
+        "policy",
+        "protocols",
+        "providers",
+        "runtime",
+        "tutor",
+    }
 )
 
 # Derived, not hand-listed: _LAZY_EXPORTS is the single source of truth for

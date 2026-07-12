@@ -14,6 +14,7 @@ Together with the silent-completion nudge in runner.py (failure-mode
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import types
 import unittest
@@ -310,24 +311,38 @@ class BusCallReaperTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_reaper_survives_single_bad_call(self):
-        """An exception in one iteration must not kill the reaper —
-        otherwise a single malformed bus call orphans the watchdog for
-        the rest of the engagement."""
+        """A genuinely MALFORMED call (started_at=None) raises inside the
+        per-pass loop (`now - None` → TypeError); the reaper's `except
+        Exception` must swallow it and the task must stay alive — otherwise one
+        bad entry orphans the watchdog for the rest of the engagement.
+
+        The previous version of this test inserted a *valid* call and asserted
+        only that nothing propagated — so it never triggered the exception path
+        it claimed to cover. Here a valid stalled call is processed FIRST and a
+        malformed one raises SECOND, proving three things at once: the bad call
+        really does raise, the pass's work-so-far persists, and the reaper task
+        survives to keep polling."""
         d = _ReaperDaemon(prompt_timeout=60.0)
-        # A "call" without a started_at attribute would AttributeError.
-        # Use a real call so the rest of the logic exercises; rely on
-        # the broad `except Exception` in the reaper to swallow any
-        # future regression.
-        d._bus_calls[1] = _stale_call(1, age_seconds=200.0)
-        # Run multiple times; if the reaper swallowed an exception, it
-        # keeps running. If it died, the second pass would see no new
-        # state changes — but flagged_stalled prevents a second file
-        # either way, so the meaningful check is that NO exception
-        # propagates out of the task.
-        await self._run_reaper_once(d)
-        await self._run_reaper_once(d)
-        # No assertion beyond "no exception bubbled up" — covered by
-        # the suite passing.
+        good = _stale_call(1, age_seconds=200.0)
+        bad = _stale_call(2, age_seconds=200.0)
+        bad.started_at = None  # type: ignore[assignment]  # `now - None` → TypeError
+        # Insertion order == iteration order: `good` is handled before `bad`
+        # raises and aborts the rest of the pass.
+        d._bus_calls[1] = good
+        d._bus_calls[2] = bad
+
+        task = asyncio.create_task(d._bus_call_reaper(interval=0.01, stall_multiplier=3.0))
+        await asyncio.sleep(0.05)  # several passes
+        self.assertFalse(task.done(), "reaper died on the malformed call")
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        # Work completed before the bad call persisted, and the malformed call
+        # was never (mis)flagged.
+        self.assertTrue(good.flagged_stalled, "valid call before the bad one was not processed")
+        self.assertEqual(len(d.inbox.added), 1)
+        self.assertFalse(bad.flagged_stalled)
 
 
 if __name__ == "__main__":

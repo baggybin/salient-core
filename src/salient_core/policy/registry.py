@@ -25,7 +25,8 @@ can't outlive a ``set_active`` — the dataset is the single source.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -35,11 +36,23 @@ if TYPE_CHECKING:
 Pattern = tuple[str, str]
 
 
+def _freeze_patterns(m: Mapping[str, Sequence[Pattern]]) -> Mapping[str, Sequence[Pattern]]:
+    """Canonicalize a {tool → [(label, regex), ...]} mapping into a read-only
+    mapping of tuples so external code holding the original list/dict can't
+    mutate registered policy after the fact."""
+    return MappingProxyType({k: tuple(v) for k, v in m.items()})
+
+
 @dataclass(frozen=True)
 class PolicyDataset:
     """Immutable bundle of the data the policy gate consults. Frozen so live
     security policy can't be mutated after registration; swap the whole
-    dataset via ``set_active`` instead."""
+    dataset via ``set_active`` instead.
+
+    ``frozen=True`` only blocks field REASSIGNMENT; the mutable mapping/sequence
+    inputs are canonicalized into read-only structures in ``__post_init__`` so
+    DEEP mutation through a retained reference to the original input can't reach
+    live policy either."""
 
     tool_targets: Mapping[str, ExtractorSpec]
     prohibited_patterns: Mapping[str, Sequence[Pattern]]
@@ -51,6 +64,31 @@ class PolicyDataset:
     # structural prohibited shape (see ``safeguards._structural_block``). Empty
     # by default; a downstream dataset lists its own file-transfer tools.
     structural_transfer_tools: frozenset[str] = frozenset()
+    # Deprecated compatibility input for shadow-mode migration only. It never
+    # authorizes enforce mode; use qualified ``tool_targets`` classifications.
+    trusted_builtins: frozenset[str] = field(
+        default_factory=frozenset,
+        metadata={
+            "deprecated": (
+                "trusted_builtins is shadow-only compatibility; migrate each "
+                "tool to a qualified PolicyDataset.tool_targets entry"
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        # Canonicalize into read-only structures. object.__setattr__ is the
+        # frozen-dataclass idiom for writing a field inside __post_init__.
+        object.__setattr__(self, "tool_targets", MappingProxyType(dict(self.tool_targets)))
+        object.__setattr__(self, "prohibited_patterns", _freeze_patterns(self.prohibited_patterns))
+        object.__setattr__(self, "loud_patterns", _freeze_patterns(self.loud_patterns))
+        object.__setattr__(
+            self, "natural_language_prohibited", tuple(self.natural_language_prohibited)
+        )
+        object.__setattr__(
+            self, "structural_transfer_tools", frozenset(self.structural_transfer_tools)
+        )
+        object.__setattr__(self, "trusted_builtins", frozenset(self.trusted_builtins))
 
 
 _active: PolicyDataset | None = None
