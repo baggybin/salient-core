@@ -25,11 +25,13 @@ __version__ = "0.7.6"
 if TYPE_CHECKING:
     from .bus import ContextStore as ContextStore
     from .bus import make_bus as make_bus
+    from .codex import codex_command_is_read_only as codex_command_is_read_only
     from .coord import Question as Question
     from .coord import QuestionInbox as QuestionInbox
     from .daemon import AgentRunner as AgentRunner
     from .daemon import EventHub as EventHub
     from .daemon import Job as Job
+    from .daemon import LocalClaudeBackend as LocalClaudeBackend
     from .daemon import spawn_background as spawn_background
     from .memory import Action as Action
     from .memory import ActionLedger as ActionLedger
@@ -63,11 +65,13 @@ if TYPE_CHECKING:
 _LAZY_EXPORTS = {
     "ContextStore": ".bus",
     "make_bus": ".bus",
+    "codex_command_is_read_only": ".codex",
     "Question": ".coord",
     "QuestionInbox": ".coord",
     "AgentRunner": ".daemon",
     "EventHub": ".daemon",
     "Job": ".daemon",
+    "LocalClaudeBackend": ".daemon",
     "spawn_background": ".daemon",
     "Action": ".memory",
     "ActionLedger": ".memory",
@@ -103,6 +107,7 @@ _SUBPACKAGES = frozenset(
     {
         "alias",
         "bus",
+        "codex",
         "coord",
         "daemon",
         "display",

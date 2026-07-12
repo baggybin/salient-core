@@ -7,6 +7,7 @@ finer control.
 from __future__ import annotations
 
 from ..protocols import DaemonServices
+from ._backend import LocalClaudeBackend
 from ._event_hub import EventHub, _EventObservationMixin
 from ._helpers import Job, _wrap_context_value
 from ._prompts import set_prompts_root, set_thinking_provider
@@ -30,6 +31,7 @@ __all__ = [
     "DaemonServices",
     "EventHub",
     "Job",
+    "LocalClaudeBackend",
     "_EventObservationMixin",
     "_wrap_context_value",
     "get_kg_builder",

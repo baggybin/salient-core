@@ -57,6 +57,15 @@ class PublicSurfaceTests(unittest.TestCase):
         self.assertIs(ContextStore, salient_core.bus.ContextStore)
         self.assertIs(KnowledgeGraph, salient_core.memory.KnowledgeGraph)
         self.assertIs(QuestionInbox, salient_core.coord.QuestionInbox)
+        self.assertIs(salient_core.LocalClaudeBackend, salient_core.daemon.LocalClaudeBackend)
+        self.assertIs(
+            salient_core.codex_command_is_read_only,
+            salient_core.codex.codex_command_is_read_only,
+        )
+        # Downstream approval handlers classify with the public function; the
+        # mixin's private staticmethod must stay behavior-identical to it.
+        self.assertTrue(salient_core.codex_command_is_read_only({"command": "git status --short"}))
+        self.assertFalse(salient_core.codex_command_is_read_only({"command": "rm -rf /"}))
         # Referenced so the imports are load-bearing, not dead.
         self.assertTrue(callable(make_bus))
         self.assertTrue(callable(AgentRunner))

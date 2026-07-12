@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -143,6 +144,181 @@ def approval_response(
             followup_handler(edited_instruction)
         return {"decision": "decline"}
     return {"decision": decision.value}
+
+
+# ── Codex read-only command classifier: safe-flag allowlist ──────────
+# Default-deny per-binary flag tables. A Codex-proposed command auto-approves
+# (skips the operator gate) only when its binary is known read-only AND every
+# flag token is on that binary's safe list. Unknown flags fall through to
+# operator approval (classifier returns False) — the safe direction, since a
+# false deny only costs a prompt while a false accept auto-executes. Denylists
+# rot open as tools grow new flags (rg --pre, git --output/--ext-diff, tail -f
+# all slipped a bare-binary allowlist); this allowlist rots closed. Value True =
+# the flag consumes the next argv token as a data-only value; False = valueless.
+_CODEX_SAFE_FLAGS: dict[str | tuple[str, str], dict[str, bool]] = {
+    "ls": {
+        "-l": False,
+        "-a": False,
+        "-h": False,
+        "-A": False,
+        "-R": False,
+        "-t": False,
+        "-r": False,
+        "-S": False,
+        "-1": False,
+        "-d": False,
+    },
+    "grep": {
+        "-r": False,
+        "-n": False,
+        "-i": False,
+        "-l": False,
+        "-c": False,
+        "-v": False,
+        "-w": False,
+        "-x": False,
+        "-F": False,
+        "-E": False,
+        "-o": False,
+        "-H": False,
+        "-e": True,
+        "-A": True,
+        "-B": True,
+        "-C": True,
+        "--include": True,
+        "--exclude": True,
+    },
+    "rg": {
+        "-i": False,
+        "-n": False,
+        "-l": False,
+        "-c": False,
+        "-v": False,
+        "-w": False,
+        "-x": False,
+        "-F": False,
+        "-S": False,
+        "-s": False,
+        "-o": False,
+        "-e": True,
+        "-g": True,
+        "-t": True,
+        "-A": True,
+        "-B": True,
+        "-C": True,
+        "-m": True,
+        "--json": False,
+        "--no-heading": False,
+        "--hidden": False,
+        "--max-columns": True,
+    },
+    "head": {"-n": True, "-c": True},
+    "tail": {"-n": True, "-c": True},
+    "cat": {"-n": False, "-A": False, "-b": False},
+    "wc": {"-l": False, "-c": False, "-w": False, "-m": False},
+    "stat": {"-c": True, "--format": True},
+    "pwd": {},
+    ("git", "diff"): {
+        "--stat": False,
+        "--name-only": False,
+        "--name-status": False,
+        "--cached": False,
+        "--staged": False,
+        "-U": True,
+        "--no-color": False,
+    },
+    ("git", "log"): {
+        "--oneline": False,
+        "--stat": False,
+        "-n": True,
+        "--graph": False,
+        "--follow": False,
+        "--no-color": False,
+        "--format": True,
+        "--pretty": True,
+        "--since": True,
+        "--until": True,
+        "--author": True,
+        "--grep": True,
+    },
+    ("git", "show"): {
+        "--stat": False,
+        "--name-only": False,
+        "--no-color": False,
+        "--format": True,
+        "--pretty": True,
+    },
+    ("git", "status"): {"-s": False, "--short": False, "--porcelain": False, "-b": False},
+}
+
+
+def _codex_flags_all_safe(table: dict[str, bool], argv: list[str]) -> bool:
+    """True when every flag token in argv is on ``table`` (valueless or
+    data-valued); positional args (paths/patterns) pass. An unrecognized flag
+    returns False (→ operator approval). Bundled shorts (``-lah``) pass only
+    when each constituent is a valueless safe flag, so ``tail -fn5`` / ``rg
+    -zi`` still deny. A trailing value-taking flag with no value → False."""
+    i = 0
+    expect_value = False
+    while i < len(argv):
+        tok = argv[i]
+        i += 1
+        if expect_value:
+            expect_value = False
+            continue
+        if tok == "--":
+            return True  # end of options — the rest are paths/patterns
+        if not tok.startswith("-") or tok == "-":
+            continue  # positional (path / pattern / stdin)
+        flag, _, inline_val = tok.partition("=")
+        if flag in table:  # exact long/short flag, optional --flag=value
+            expect_value = table[flag] and not inline_val
+            continue
+        if not flag.startswith("--") and len(flag) > 2:
+            head = flag[:2]  # e.g. "-A" of "-A3"
+            if head in table and table[head]:
+                continue  # value-taking short with glued value, e.g. -A3 / -n50
+            if all(f"-{ch}" in table and not table[f"-{ch}"] for ch in flag[1:]):
+                continue  # bundle of valueless shorts, e.g. -lah / -rn
+        return False
+    return not expect_value
+
+
+def codex_command_is_read_only(params: Mapping[str, Any]) -> bool:
+    """Classify a Codex command-approval request as read-only (safe to
+    auto-accept without an operator gate). Public seam for downstream skins
+    that build their own approval handlers."""
+    if params.get("networkApprovalContext"):
+        return False
+    command = params.get("command")
+    if isinstance(command, list):
+        if not command or not all(isinstance(part, str) and part for part in command):
+            return False
+        parts = list(command)
+        command_text = " ".join(parts)
+    elif isinstance(command, str):
+        command_text = command
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return False
+    else:
+        return False
+    if any(marker in command_text for marker in ("\r", "\n", "&", "|", ";", "<", ">", "$", "`")):
+        return False
+    if not parts:
+        return False
+    # Per-binary safe-flag allowlist (default-deny). The `git` global-option
+    # slot (parts[1]) must be a read-only subcommand, which already rejects
+    # `git -c …` / `git --exec-path …`; the subcommand's own flags are then
+    # allowlisted so `git log --output=…` / `git diff --ext-diff` deny.
+    if parts[0] == "git":
+        if len(parts) < 2 or parts[1] not in {"diff", "log", "show", "status"}:
+            return False
+        table = _CODEX_SAFE_FLAGS.get(("git", parts[1]))
+        return table is not None and _codex_flags_all_safe(table, parts[2:])
+    table = _CODEX_SAFE_FLAGS.get(parts[0])
+    return table is not None and _codex_flags_all_safe(table, parts[1:])
 
 
 @dataclass(frozen=True, slots=True)
