@@ -150,6 +150,82 @@ async def test_truly_silent_completion_to_awaiting_caller_is_re_prompted_once() 
     assert "ended a turn with no tool calls" in backend.queries[1]
 
 
+class _RunawayBackend(_NormalizedBackend):
+    """Emits a long stream of assistant turns — a runaway agent that never
+    delivers. Ends with a TurnCompletedEvent so the un-capped control case
+    terminates normally."""
+
+    def __init__(self, *, turns: int) -> None:
+        super().__init__()
+        self._turns = turns
+
+    async def receive_response(self) -> AsyncIterator[AgentEvent]:
+        for i in range(self._turns):
+            yield AssistantEvent(content=(TextContent(f"step {i} "),), model="fake")
+        yield TurnCompletedEvent(
+            turns=self._turns,
+            duration_ms=1,
+            usage=TurnUsage(input_tokens=1, output_tokens=1, cost_usd=None),
+        )
+
+
+@pytest.mark.anyio
+async def test_cfg_max_turns_caps_job_without_dispatch_hint() -> None:
+    # Backends with no native turn enforcement (codex) rely on the runner's
+    # hard cap; a job submitted without a max_turns_hint must fall back to the
+    # agent's static cfg max_turns instead of running unbounded.
+    backend = _RunawayBackend(turns=50)
+    runner = AgentRunner(
+        name="runaway",
+        cfg={"max_turns": 3, "hard_cap_buffer": 0},
+        prompt_timeout=60.0,
+        idle_timeout=0.0,
+    )
+    runner._backend = backend
+    job = Job(id=1, prompt="go", submitted_at=0.0)
+
+    await runner._process(job)
+
+    assert backend.interrupted is True
+    assert "[PARTIAL: runner hard cap" in (job.result or "")
+    assert "(budget was 3" in job.result
+
+
+@pytest.mark.anyio
+async def test_dispatch_hint_wins_over_cfg_max_turns() -> None:
+    # A per-dispatch budget hint is the caller's explicit envelope — it takes
+    # precedence over the agent's static cfg cap.
+    backend = _RunawayBackend(turns=50)
+    runner = AgentRunner(
+        name="runaway",
+        cfg={"max_turns": 1000, "hard_cap_buffer": 0},
+        prompt_timeout=60.0,
+        idle_timeout=0.0,
+    )
+    runner._backend = backend
+    job = Job(id=2, prompt="go", submitted_at=0.0, max_turns_hint=2)
+
+    await runner._process(job)
+
+    assert backend.interrupted is True
+    assert "(budget was 2" in (job.result or "")
+
+
+@pytest.mark.anyio
+async def test_no_cap_when_neither_hint_nor_cfg_max_turns() -> None:
+    # Without a hint or a cfg max_turns the runner imposes no cap — the
+    # backend's own completion ends the job untouched.
+    backend = _RunawayBackend(turns=10)
+    runner = AgentRunner(name="free", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
+    runner._backend = backend
+    job = Job(id=3, prompt="go", submitted_at=0.0)
+
+    await runner._process(job)
+
+    assert backend.interrupted is False
+    assert "[PARTIAL" not in (job.result or "")
+
+
 @pytest.mark.anyio
 async def test_context_read_polling_does_not_trip_loop_detection() -> None:
     # Swarm workers poll `context_read` (a side-effect-free read) waiting for peers

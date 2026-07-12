@@ -1840,6 +1840,13 @@ class AgentRunner:
         # more retry/recovery slack than single-shot agents; set to 24 in
         # their cfg. Single-shot agents stay at 12.
         _HARD_CAP_BUFFER = int((self.cfg or {}).get("hard_cap_buffer", 12))
+        # Per-dispatch budget hint wins; otherwise fall back to the agent's
+        # static cfg max_turns so backends with no native turn enforcement
+        # (codex — ClaudeAgentOptions.max_turns never reaches them) still get
+        # this runner-level backstop. Claude-path backends stop at cfg
+        # max_turns inside the SDK first, so the fallback only ever fires for
+        # backends that don't self-enforce.
+        turn_cap: int | None = job.max_turns_hint or (self.cfg or {}).get("max_turns")
         # Reset the runner-exposed counter at job start so the budget-
         # chip hook reads 0 → N progression cleanly per dispatch. The
         # local `turn_count` alias keeps the rest of the function
@@ -1950,15 +1957,11 @@ class AgentRunner:
                     # interrupt the SDK and synthesize a PARTIAL completion
                     # note so the caller's BusCall future resolves promptly
                     # rather than dangling until the prompt_timeout deadline.
-                    if (
-                        job.max_turns_hint
-                        and not cap_fired
-                        and turn_count > job.max_turns_hint + _HARD_CAP_BUFFER
-                    ):
+                    if turn_cap and not cap_fired and turn_count > turn_cap + _HARD_CAP_BUFFER:
                         cap_fired = True
                         cap_note = (
                             f"\n\n[PARTIAL: runner hard cap at turn "
-                            f"{turn_count} (budget was {job.max_turns_hint} "
+                            f"{turn_count} (budget was {turn_cap} "
                             f"+ buffer {_HARD_CAP_BUFFER}). Agent did not "
                             f"deliver before exhausting its turn budget. "
                             f"Consider re-dispatching with a larger budget "
@@ -1968,7 +1971,7 @@ class AgentRunner:
                         await self._log("hard-cap", cap_note.strip())
                         self._last_interrupt_reason = (
                             f"RUNNER HARD-CAP at turn {turn_count} "
-                            f"(budget {job.max_turns_hint} + buffer "
+                            f"(budget {turn_cap} + buffer "
                             f"{_HARD_CAP_BUFFER}). Operator did NOT "
                             f"reject; the runner cut the dispatch to "
                             f"keep the caller's future from dangling."
