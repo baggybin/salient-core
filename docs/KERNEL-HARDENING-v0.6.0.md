@@ -166,7 +166,7 @@ rollout described in [`EXTRACTION.md`](EXTRACTION.md).
 - **Adopt enforce mode** downstream once `tool_targets` coverage is complete
   (mine the shadow audit events first).
 - The review's cross-subsystem **runtime health aggregator** (folding the daemon
-  JSONL-log + ask_fable audit sinks into the status RPC) lives in the downstream
+  JSONL-log audit sinks into the status RPC) lives in the downstream
   daemon; the kernel `ContextStore.health()` surface it would consume is now
   complete.
 

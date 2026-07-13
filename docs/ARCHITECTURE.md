@@ -58,8 +58,6 @@ src/salient_core/
 │   ├── _prompts.py       Prompt-addendum loader + thinking-provider / prompts-root seams
 │   └── _questions.py     Question/answer RPC handler + operator-authz seam
 │
-├── ask_fable/            Gated Fable (claude-fable-5) reasoning MCP tool
-│
 └── tutor/
     └── schedule.py       SM-2 / FSRS-lite spaced-repetition scheduler
 ```

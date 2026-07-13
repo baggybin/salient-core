@@ -31,14 +31,7 @@ Repository = "https://github.com/baggybin/salient-core"
 Issues = "https://github.com/baggybin/salient-core/issues"
 Changelog = "https://github.com/baggybin/salient-core/blob/main/CHANGELOG.md"
 
-[project.scripts]
-# Standalone launcher for the ask_fable MCP server (also `python -m salient_core.ask_fable`).
-ask-fable = "salient_core.ask_fable.__main__:_main"
-
 [project.optional-dependencies]
-# ask_fable's MCP server transport. Kept optional so the base kernel stays lean;
-# install with `pip install 'salient-core[ask-fable]'`.
-ask-fable = ["mcp>=1.0"]
 codex = [
     "openai-codex==0.1.0b3",
     "openai-codex-cli-bin==0.137.0a4",

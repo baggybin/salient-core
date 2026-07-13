@@ -124,7 +124,6 @@ into your own daemon.
 | **Bus-as-MCP** | ~40 typed inter-agent tools (delegation, context, KG, discovery, audit) exposed as a single MCP server per agent, with an `extra_tools` slot for domain add-ons |
 | **Noisy-OR KG** | Cross-session knowledge graph with corroboration, embeddings, subject-namespace scoping, provenance, and archive-first compaction |
 | **SM-2 scheduler** | Spaced-repetition gradebook for durable recall tracking |
-| **[`ask_fable`](src/salient_core/ask_fable/README.md)** | Gated MCP sidecar: any agent can request narrow code/architecture reasoning from Fable (`claude-fable-5`), behind the same denylist guard + a hashed, owner-only audit log — concrete proof the policy gates are real, not aspirational (optional `[ask-fable]` extra) |
 | **Runner** | Provider-neutral: the **Claude Agent SDK** is the primary backend, and an **OpenAI Codex** provider ships behind the optional `[codex]` extra (thread runtime + an MCP gateway so Codex agents use the same bus and pass the same gates). Further providers register via the `salient.agent_providers` entry point behind the `AgentBackend` seam. Per-agent tool subprocesses can be privilege-separated via an opaque `_launch_profile` seam |
 
 ## Requirements
@@ -132,11 +131,8 @@ into your own daemon.
 - **Python ≥ 3.11, < 3.14**
 - **[`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) `>=0.2.110,<0.3`** —
   pulled in automatically. The runner drives Claude agents through it, so you
-  need Claude access: either an `ANTHROPIC_API_KEY`, or (for the `ask_fable`
-  sidecar) an existing Claude Code OAuth session.
-- Optional extra: `pip install 'salient-core[ask-fable]'` adds the `mcp`
-  transport for the [`ask_fable`](src/salient_core/ask_fable/README.md) reasoning
-  server.
+  need Claude access: either an `ANTHROPIC_API_KEY` or an existing Claude Code
+  OAuth session.
 - Optional extra: `pip install 'salient-core[codex]'` adds the **OpenAI Codex
   provider**, so agents can run on Codex instead of the Claude SDK (bus access
   via an MCP gateway; requires your own Codex/OpenAI auth).

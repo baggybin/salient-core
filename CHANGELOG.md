@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Dropped an optional, self-contained auxiliary module (and its packaging
+  entry points and tests) that is no longer required by the kernel. It had no
+  internal callers, so the removal is transparent to the base package.
+
 ## [0.7.6] - 2026-07-12
 
 Second public snapshot, consolidating the `0.7.x` line (`0.7.0`–`0.7.6`).
