@@ -469,6 +469,12 @@ def test_default_client_factory_requests_bare_mcp_tool_names() -> None:
     `non_prefixed_mcp_tool_names` is flipped — flip it so tool_search returns the
     bare names the prompts reference. (This flag IS honored; the defer flag is
     not.)"""
+    import pytest
+
+    # _default_client_factory builds a real openai_codex CodexConfig; the codex
+    # SDK is the optional `salient-core[codex]` extra, absent in the default CI
+    # env. The behavior is covered where the extra is installed.
+    pytest.importorskip("openai_codex")
     from salient_core.codex import CodexBackendConfig, _default_client_factory
 
     def approve(_m: str, _p: Any) -> dict[str, Any]:
