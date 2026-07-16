@@ -225,6 +225,10 @@ def test_gateway_runs_handler_on_owner_loop_and_cancels_on_revoke() -> None:
         gateway.revoke(credential.token)
         await asyncio.wait_for(cancelled.wait(), 1)
         await asyncio.wait_for(request, 1)
+        # revoke cancels the in-flight handler but (post codex-bus-race fix) the
+        # server stays up for the daemon's life — only close() stops it.
+        assert gateway.running
+        gateway.close()
         assert not gateway.running
 
     asyncio.run(scenario())
@@ -314,5 +318,148 @@ def test_gateway_bounds_runaway_handler_with_deadline(monkeypatch) -> None:
             await asyncio.wait_for(cancelled.wait(), 1)
         finally:
             gateway.close()
+
+    asyncio.run(scenario())
+
+
+# ── codex-bus-gateway-race fix (regression pins) ─────────────────────────────
+def _bus_bundle():
+    return ToolBundle((AgentTool("ask_agent", "delegate", {"type": "object"}, _echo),))
+
+
+def test_revoke_keeps_server_up_and_url_stable() -> None:
+    """Regression: revoking the LAST credential must NOT stop the server, and a
+    subsequent issue() must keep the same url — the check-then-act race that left
+    a rebuilt codex agent connected to a dead endpoint with zero bus tools."""
+    from salient_core.codex_mcp import CodexMcpGateway
+
+    async def scenario() -> None:
+        gw = CodexMcpGateway()
+        try:
+            c1 = gw.issue("manager", _bus_bundle())
+            assert gw.running
+            url1 = c1.url
+            gw.revoke(c1.token)  # last credential gone
+            assert gw.running, "server must stay up after last revoke"
+            assert gw.url == url1, "url must not change"
+            c2 = gw.issue("manager", _bus_bundle())
+            assert c2.url == url1, "reissued credential keeps the stable url"
+            assert gw.running
+        finally:
+            gw.close()
+
+    asyncio.run(scenario())
+
+
+def test_supersede_one_catalog_per_owner() -> None:
+    from salient_core.codex_mcp import CodexMcpGateway
+
+    async def scenario() -> None:
+        gw = CodexMcpGateway()
+        try:
+            c1 = gw.issue("manager", _bus_bundle())
+            c2 = gw.issue("manager", _bus_bundle())  # supersedes c1
+            assert gw._catalog(c1.token) is None
+            assert gw._catalog(c2.token) is not None
+        finally:
+            gw.close()
+
+    asyncio.run(scenario())
+
+
+def test_revoke_is_idempotent() -> None:
+    from salient_core.codex_mcp import CodexMcpGateway
+
+    async def scenario() -> None:
+        gw = CodexMcpGateway()
+        try:
+            c = gw.issue("manager", _bus_bundle())
+            gw.revoke(c.token)
+            gw.revoke(c.token)  # no-op, must not raise
+        finally:
+            gw.close()
+
+    asyncio.run(scenario())
+
+
+def test_wait_attached_returns_once_tools_list_seen() -> None:
+    from salient_core.codex_mcp import CodexMcpGateway
+
+    async def scenario() -> None:
+        gw = CodexMcpGateway()
+        try:
+            c = gw.issue("manager", _bus_bundle())
+            status, _ = gw._dispatch(
+                gw._catalog(c.token), {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
+            assert status == 200
+            await gw.wait_attached(c.token, timeout=1.0)  # returns fast
+        finally:
+            gw.close()
+
+    asyncio.run(scenario())
+
+
+def test_wait_attached_times_out_and_raises() -> None:
+    from salient_core.codex_mcp import CodexMcpGateway, GatewayAttachError
+
+    async def scenario() -> None:
+        gw = CodexMcpGateway()
+        try:
+            c = gw.issue("manager", _bus_bundle())
+            raised = False
+            try:
+                await gw.wait_attached(c.token, timeout=0.2)
+            except GatewayAttachError:
+                raised = True
+            assert raised, "must raise GatewayAttachError on attach timeout"
+        finally:
+            gw.close()
+
+    asyncio.run(scenario())
+
+
+def test_runner_attach_retry_then_fault() -> None:
+    """The runner retries a codex attach failure on its own budget, then FAULTS
+    visibly (never runs a silently bus-less agent); a transient failure recovers."""
+    from salient_core.codex_mcp import GatewayAttachError
+    from salient_core.daemon import AgentRunner
+    from salient_core.daemon import runner as runner_mod
+
+    class _FailBackend:
+        def __init__(self, fail_times: int) -> None:
+            self._left = fail_times
+
+        async def connect(self) -> None:
+            if self._left > 0:
+                self._left -= 1
+                raise GatewayAttachError("manager", "no tools/list")
+
+        async def disconnect(self) -> None:
+            return None
+
+    async def scenario() -> None:
+        orig = runner_mod._GATEWAY_ATTACH_BACKOFF
+        runner_mod._GATEWAY_ATTACH_BACKOFF = (0.0, 0.0)
+        try:
+            # Exhausts retries -> FAULTED.
+            b = _FailBackend(99)
+            r = AgentRunner(name="manager", cfg={}, backend_factory=lambda: b)
+            r._backend = b
+            faulted = False
+            try:
+                await r._connect_with_attach_retry()
+            except GatewayAttachError:
+                faulted = True
+            assert faulted and r.status == "faulted"
+
+            # Fails once then a fresh backend connects -> recovers.
+            seq = iter([_FailBackend(1), _FailBackend(0)])
+            r2 = AgentRunner(name="manager", cfg={}, backend_factory=lambda: next(seq))
+            r2._backend = _FailBackend(1)
+            await r2._connect_with_attach_retry()  # must NOT raise
+            assert r2.status != "faulted"
+        finally:
+            runner_mod._GATEWAY_ATTACH_BACKOFF = orig
 
     asyncio.run(scenario())

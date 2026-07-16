@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import secrets
 import select
 import socket
@@ -11,11 +12,26 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError, Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Final
 
 from .runtime import AgentTool, JsonValue, ToolBundle
+
+_log = logging.getLogger("salient.daemon.codex_mcp")
+
+
+class GatewayAttachError(RuntimeError):
+    """The codex MCP bus gateway did not confirm the agent's tool schemas were
+    delivered (no `tools/list` within the attach timeout). Raised by
+    `wait_attached`; the backend fails closed and the runner retries/faults
+    rather than run a silently bus-less agent."""
+
+    def __init__(self, owner: str, rung: str) -> None:
+        super().__init__(f"codex gateway attach failed for {owner!r}: {rung}")
+        self.owner = owner
+        self.rung = rung
+
 
 _PROTOCOL_VERSION: Final = "2025-03-26"
 # Ceiling on a single tool handler. Enforced on BOTH sides: the HTTP thread's
@@ -79,6 +95,11 @@ class _Catalog:
     loop: asyncio.AbstractEventLoop
     pending: set[Future[JsonValue]]
     revoked: bool = False
+    # Set by the `tools/list` handler on the first authenticated schema fetch for
+    # this token — i.e. "codex actually received the bus tool schemas". A
+    # threading.Event so the HTTP-server thread can set it and the async
+    # backend.connect() can await it (via wait_attached). T2.4b-adjacent codex-bus fix.
+    attach_event: threading.Event = field(default_factory=threading.Event)
 
 
 class _Server(ThreadingHTTPServer):
@@ -188,15 +209,41 @@ class CodexMcpGateway:
         *,
         bearer_token_env_var: str = "SALIENT_CODEX_MCP_TOKEN",
     ) -> McpCredential:
-        if self._server is None:
-            self.start()
         token = secrets.token_urlsafe(32)
         loop = asyncio.get_running_loop()
+        # Start-check AND url read happen UNDER the lock so the returned
+        # credential can never capture a URL that a concurrent teardown is about
+        # to invalidate. Since revoke() no longer stops the server, the URL is a
+        # process-lifetime constant once bound (lazy start preserved).
         with self._lock:
+            if self._server is None:
+                self.start()
+            url = self.url
+            # Supersede any stale catalog for the same owner (a prior backend
+            # instance that didn't cleanly revoke). Deterministic, under the
+            # lock, so at most one catalog per owner ever — self-healing against
+            # leaks, and NOT the agent-name-keyed revoke hazard (there is no
+            # server-lifecycle side effect here).
+            for stale, cat in tuple(self._catalogs.items()):
+                if cat.owner == owner:
+                    self._catalogs.pop(stale, None)
+                    _log.warning("codex gateway: superseding stale catalog for %s", owner)
             self._catalogs[token] = _Catalog(owner, tools, loop, set())
-        return McpCredential(owner, token, self.url, bearer_token_env_var)
+        return McpCredential(owner, token, url, bearer_token_env_var)
 
     def revoke(self, token: str) -> None:
+        """Drop a credential. IDEMPOTENT (contractual): a double-revoke — which
+        the backend's fail-closed connect path deliberately does vs the later
+        disconnect() — is a no-op on the second call.
+
+        The server is intentionally NOT stopped when the last credential is
+        revoked. The old stop-on-last-revoke was a check-then-act race:
+        `_stop_async` tore the server down on a background thread while the very
+        next `issue()` still saw `self._server` set, skipped `start()`, and
+        minted a credential capturing a URL whose server was already dying — the
+        codex subprocess then connected to a dead endpoint and silently got zero
+        bus tools. The server now lives for the daemon's life; it is torn down
+        only by `close()` at shutdown. See the codex-bus-gateway-race fix."""
         catalog: _Catalog | None = None
         with self._lock:
             for stored in tuple(self._catalogs):
@@ -207,29 +254,27 @@ class CodexMcpGateway:
                     # bails, or is already in `pending` and gets cancelled below.
                     catalog.revoked = True
                     break
-            stop = not self._catalogs
         if catalog is not None:
             for pending in tuple(catalog.pending):
                 pending.cancel()
-        if stop:
-            self._stop_async()
 
-    def _stop_async(self) -> None:
-        server = self._server
-        self._server = None
-        self._url = None
-        thread = self._thread
-        self._thread = None
-        if server is None:
-            return
-
-        def stop() -> None:
-            server.shutdown()
-            server.server_close()
-            if thread is not None and thread is not threading.current_thread():
-                thread.join(timeout=2)
-
-        threading.Thread(target=stop, name="salient-codex-mcp-stop", daemon=True).start()
+    async def wait_attached(self, token: str, timeout: float = 25.0) -> None:
+        """Block until codex has fetched this token's bus-tool schemas (the
+        first authenticated `tools/list`), i.e. the tools are actually in the
+        model's session. Returns fast on success; on timeout raises
+        GatewayAttachError with the failure rung so the backend can fail closed
+        instead of running a silently bus-less agent."""
+        catalog = self._catalog(token)
+        if catalog is None:
+            raise GatewayAttachError("?", "credential not found (revoked before attach)")
+        attached = await asyncio.to_thread(catalog.attach_event.wait, timeout)
+        if not attached:
+            # Diagnose the rung reached, for the operator.
+            rung = (
+                f"no tools/list within {timeout:.0f}s "
+                "(codex never connected, bad token, or empty schema)"
+            )
+            raise GatewayAttachError(catalog.owner, rung)
 
     def close(self) -> None:
         server = self._server
@@ -277,6 +322,15 @@ class CodexMcpGateway:
             return 200, {"jsonrpc": "2.0", "id": request_id, "result": {}}
         if method == "tools/list":
             tools = [self._tool_schema(tool) for tool in catalog.tools.tools]
+            if not catalog.attach_event.is_set():
+                # First schema fetch for this token = the bus tools are now in
+                # codex's session. Signals wait_attached() that attach succeeded.
+                catalog.attach_event.set()
+                _log.info(
+                    "codex gateway: %s attached (%d bus tools delivered)",
+                    catalog.owner,
+                    len(tools),
+                )
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -418,3 +472,13 @@ def get_codex_mcp_gateway() -> CodexMcpGateway:
     if _SHARED_GATEWAY is None:
         _SHARED_GATEWAY = CodexMcpGateway()
     return _SHARED_GATEWAY
+
+
+def close_codex_mcp_gateway() -> None:
+    """Tear down the shared gateway server at daemon shutdown. No-op if it was
+    never started (lazy). Since revoke() no longer stops-on-last, this is the
+    ONLY place the server is stopped for the daemon's life."""
+    global _SHARED_GATEWAY
+    if _SHARED_GATEWAY is not None:
+        _SHARED_GATEWAY.close()
+        _SHARED_GATEWAY = None

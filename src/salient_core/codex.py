@@ -6,8 +6,9 @@ import os
 import shlex
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -436,6 +437,7 @@ class CodexBackend:
         approval_handler: ApprovalHandler | None = None,
         followup_handler: FollowupHandler | None = None,
         revoke_mcp: Callable[[], None] | None = None,
+        attach_check: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._config = config
         self._approval_handler = approval_handler or (lambda _request: ApprovalDecision.DECLINE)
@@ -450,6 +452,10 @@ class CodexBackend:
         self._closed = False
         self._followup_handler = followup_handler
         self._revoke_mcp = revoke_mcp
+        # Confirms codex actually received the bus-tool schemas from the gateway
+        # (fail-closed). Set by create_backend ONLY when a gateway credential was
+        # issued; None => this agent has no bus tools, nothing to confirm.
+        self._attach_check = attach_check
         self._approval_cancellations: set[threading.Event] = set()
         self._approval_lock = threading.Lock()
         self._started_actions: set[str] = set()
@@ -550,6 +556,21 @@ class CodexBackend:
             params["config"] = config_obj
         started = await self._run(self._client.thread_start, params)
         self._thread_id = _id(started, "thread")
+        # Fail closed: confirm codex actually fetched the bus-tool schemas from
+        # the gateway. If it didn't (dead endpoint, bad token, empty schema), the
+        # model would silently have NO ask_agent — worse than a visibly failed
+        # start for a delegation hub. Revoke the token we minted and raise so the
+        # runner retries / faults instead of running bus-less.
+        if self._attach_check is not None:
+            try:
+                await self._attach_check()
+            except BaseException:
+                if self._revoke_mcp is not None:
+                    with suppress(Exception):
+                        self._revoke_mcp()
+                with suppress(Exception):
+                    await self._run(self._client.close)
+                raise
 
     async def _login_api_key(self, api_key: str) -> None:
         try:
@@ -881,6 +902,7 @@ class CodexProvider:
             mcp_config={"mcp_servers": mcp_servers} if mcp_servers else None,
         )
         revoke_mcp: Callable[[], None] | None = None
+        attach_check: Callable[[], Awaitable[None]] | None = None
         if tool_bundle.tools:
             from .codex_mcp import get_codex_mcp_gateway
 
@@ -897,10 +919,12 @@ class CodexProvider:
                 },
             )
             revoke_mcp = lambda: gateway.revoke(credential.token)
+            attach_check = lambda: gateway.wait_attached(credential.token)
         return CodexBackend(
             backend_config,
             client_factory=self._client_factory,
             approval_handler=approval_handler or self._approval_handler,
             followup_handler=followup_handler or self._followup_handler,
             revoke_mcp=revoke_mcp,
+            attach_check=attach_check,
         )

@@ -359,6 +359,9 @@ def test_codex_provider_passes_isolated_mcp_credential_and_revokes() -> None:
         def revoke(self, token: str) -> None:
             revoked.append(token)
 
+        async def wait_attached(self, token: str, timeout: float = 25.0) -> None:
+            return None  # fake gateway: attach is instantaneous
+
     async def handler(arguments):
         return arguments
 

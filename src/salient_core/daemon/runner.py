@@ -54,6 +54,13 @@ _AUTH_RECOVER_ERRORS = frozenset({"authentication_failed"})
 _MAX_AUTH_RECOVERIES = 1
 _AUTH_RECOVER_BACKOFF = 2.0  # seconds — let any in-flight token refresh settle
 
+# Bounded retry for a codex bus-gateway attach failure — its OWN budget, kept
+# separate from the auth-401 recovery above so a wedged gateway can't burn (or be
+# mis-attributed to) the auth budget. On exhaustion the runner FAULTS visibly
+# rather than run a delegation agent that silently lacks ask_agent.
+_MAX_GATEWAY_ATTACH_RETRIES = 2
+_GATEWAY_ATTACH_BACKOFF = (1.0, 5.0)  # seconds, per retry
+
 # Stopwords for the task-start skill-hint matcher (_render_skills_hint_block).
 # IDF down-weights tokens that are common ACROSS THE SKILL LIBRARY, but it has
 # no notion of general-English frequency, so a word that's common in prose yet
@@ -76,6 +83,7 @@ below also each both
 )
 
 from ..bus import ContextStore, _redact_secret_fields
+from ..codex_mcp import GatewayAttachError
 from ..display import (
     _emit,
     _format_tool_args,
@@ -1658,10 +1666,47 @@ class AgentRunner:
                 continue
             return
 
+    async def _connect_with_attach_retry(self) -> None:
+        """Connect the backend, with a bounded retry dedicated to codex
+        bus-gateway attach failures (own budget, separate from auth-401
+        recovery). The gateway race is fixed upstream, so an attach failure here
+        means a genuinely broken gateway/codex; retry a couple times with
+        backoff (fresh credential each time), then FAULT loudly — a delegation
+        agent that silently lacks ask_agent is worse than one that visibly failed
+        to start."""
+        attempt = 0
+        while True:
+            assert self._backend is not None
+            try:
+                await self._backend.connect()
+                return
+            except GatewayAttachError as err:
+                if attempt >= _MAX_GATEWAY_ATTACH_RETRIES:
+                    self.status = "faulted"
+                    _log.error("agent %s FAULTED (codex bus): %s", self.name, err)
+                    with suppress(Exception):
+                        await self._log(
+                            "tool-error",
+                            f"codex bus gateway attach failed after "
+                            f"{attempt + 1} attempts ({err.rung}); agent NOT "
+                            f"started — it would have no ask_agent/bus tools.",
+                        )
+                    raise
+                backoff = _GATEWAY_ATTACH_BACKOFF[min(attempt, len(_GATEWAY_ATTACH_BACKOFF) - 1)]
+                attempt += 1
+                with suppress(Exception):
+                    await self._log(
+                        "system",
+                        f"codex bus gateway attach retry "
+                        f"{attempt}/{_MAX_GATEWAY_ATTACH_RETRIES} in {backoff}s ({err.rung})",
+                    )
+                await asyncio.sleep(backoff)
+                self._backend = self._create_backend()  # fresh credential for the retry
+
     async def _run(self) -> None:
         try:
             self._backend = self._create_backend()
-            await self._backend.connect()
+            await self._connect_with_attach_retry()
             self.status = "idle"
             await self._log("start", "ready")
             while not self._stop_requested:
