@@ -1097,6 +1097,12 @@ class _RunnerFactoryMixin:
             # signals daemon-injected. Factories that don't need it
             # ignore the key.
             factory_config.setdefault("_listener_registry", self.listeners)
+            # Reverse-WSS worker hub, daemon-injected so the remote-worker tool
+            # factory can forward remote.* calls to the enrolled worker. The
+            # `session_id` comes from the agent's own tool.config; the hub is the
+            # shared object (None when the hub isn't running). Leading underscore
+            # signals daemon-injected; factories that don't need it ignore it.
+            factory_config.setdefault("_worker_hub", getattr(self, "worker_hub", None))
             # Engagement posture (stealth/normal/loud), daemon-injected so
             # rate-bearing factories can pick a
             # conservative default. The safeguard hook's loud-technique
