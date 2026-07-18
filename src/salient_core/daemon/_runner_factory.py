@@ -1043,6 +1043,37 @@ class _RunnerFactoryMixin:
                 wires.append(f"mcp__{name}__*")
         return wires
 
+    def _agent_work_dir(self, agent_name: str) -> Path:
+        """Working directory for an agent's file-writing builtin tools (the
+        SDK Bash/Write tools, codex file ops). Inside an engagement everything
+        co-locates under the engagement dir. With NO engagement active, fall
+        back to a dedicated per-agent scratch dir under
+        ``$SALIENT_AGENT_SCRATCH`` (default ``~/.salient/scratch``) — NEVER the
+        daemon's process cwd, which would let an agent dump files (recon
+        output, ``curl -o`` dumps, notes) straight into wherever the daemon was
+        launched, typically the source tree.
+
+        The per-agent subdir keeps two agents' identically-named artifacts
+        (e.g. a target-named ``<handle>.txt``) from colliding. Created 0700 so
+        recon output isn't world-readable. Best-effort: on a mkdir failure we
+        drop to the scratch root rather than the source tree."""
+        if self.engagement_path is not None:
+            return Path(self.engagement_path)
+        base = (os.environ.get("SALIENT_AGENT_SCRATCH") or "").strip()
+        root = Path(base).expanduser() if base else (Path.home() / ".salient" / "scratch")
+        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in agent_name) or "_agent"
+        d = root / safe
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            os.chmod(d, 0o700)
+        except OSError:
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            d = root
+        return d
+
     def _build_options(
         self,
         cfg: dict[str, Any],
@@ -1363,6 +1394,10 @@ class _RunnerFactoryMixin:
             "mcp_servers": mcp_servers,
             "allowed_tools": allowed,
             "tools": builtin_tools,
+            # Confine builtin file tools to a dedicated dir (engagement dir, or
+            # a per-agent scratch dir) so relative writes never land in the
+            # daemon's launch cwd / source tree. See _agent_work_dir.
+            "cwd": str(self._agent_work_dir(cfg["name"])),
             "agents": sub_defs or None,
             "max_turns": max_turns,
             "hooks": hooks_cfg,
@@ -1612,7 +1647,10 @@ class _RunnerFactoryMixin:
                 if not isinstance(provider, CodexProvider):
                     raise TypeError("registered codex provider has an incompatible implementation")
                 config["agent_name"] = cfg["name"]
-                config["cwd"] = str(self.engagement_path or Path.cwd())
+                # Dedicated per-agent scratch dir when no engagement is active,
+                # never the daemon's launch cwd (source tree). See
+                # _agent_work_dir.
+                config["cwd"] = str(self._agent_work_dir(cfg["name"]))
                 config["instructions"] = self._augment_system_prompt(cfg)
                 if cfg.get("mcp_servers"):
                     config["mcp_servers"] = _json_value(cfg["mcp_servers"])
