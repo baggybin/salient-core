@@ -1,159 +1,167 @@
 # salient-core
 
-> A kernel for keeping agents under control: every tool call gated below the
-> model, every delegation mediated, every decision on the record.
-
-![salient-core — an agent-control kernel](imgs/social-preview.jpg)
+**An agent-control kernel for multi-agent systems. We optimize for what agents *can't* do.**
 
 [![CI](https://github.com/baggybin/salient-core/actions/workflows/ci.yml/badge.svg)](https://github.com/baggybin/salient-core/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-`salient-core` is built around a single goal: **give the operator as much
-control over agents as possible** — without making the agents useless. Most
-agent frameworks optimize for what agents *can* do. This kernel optimizes for
-what they *can't* do, and for proving, after the fact, exactly what they did.
+![salient-core — an agent-control kernel](imgs/social-preview.jpg)
 
-Agents run concurrently on your own infrastructure, each scoped to a single
-tool surface, coordinated over a typed inter-agent bus — with the operator,
-not the model, holding the levers.
+Most AI frameworks focus on giving agents more capabilities. `salient-core`
+focuses on **proving what they actually did**, and **stopping them from doing
+what they shouldn't**. It sits below the LLM — between the model and your
+tools — as a **default-deny control kernel**.
 
-## The goal: control
+> Let agents act on your infrastructure, but never outside the box you drew —
+> and always keep the receipts.
 
-Every capable-agent story ends the same way: the model is smart, the prompt
-says "be careful", and nothing *underneath* the model enforces either. The
-kernel's answer is to put the control surfaces below the model, where a
-confused, manipulated, or simply over-eager agent cannot reason its way past
-them:
+**Showcase:** [salient-tutor](https://github.com/baggybin/salient-tutor) — a
+Socratic teaching agent built on this kernel.
 
-- **Capability control.** Each agent gets exactly one tool surface, wired at
-  startup — not a shared grab-bag. Tool subprocesses are per-agent and can be
-  privilege-separated at the OS level via an opaque `_launch_profile` seam, so
-  an agent's tools run with only the capabilities that agent was granted.
-- **Action control.** Scope and safeguard gates run *below* the model on
-  **every** tool invocation and default to **deny**. The authorization
-  boundary is transport-neutral: SDK built-in tools, internal bus tools,
-  external MCP servers, and even model-emitted text commands are all
-  classified against the same policy before anything executes. Capability
-  exposure and authorization are deliberately separate — enabling a tool never
-  implicitly authorizes it, and an unclassified tool fails closed. A denied
-  call never runs.
-- **Delegation control.** Agents don't spawn agents at will. Delegation flows
-  over the typed bus, is observable, and is **operator-mediated**: anything
-  that needs a human lands in a typed question inbox and waits. Cycle
-  detection, loop cooldowns, and operator kill-switches (disable an agent and
-  routing skips it) keep a runaway swarm from spinning.
-- **Accountability.** Every scope decision, tool call, and operator answer is
-  persisted — with secrets redacted, and with both raw and redacted snapshots
-  audited — so you can reconstruct exactly what each agent did, what was
-  allowed or denied, and why. If an audit record can't be written, the store
-  flags itself degraded rather than staying silent. Built for work you must be
-  able to *prove*, not merely trust.
-- **Staged trust.** New policy never has to be a leap: the authorization
-  boundary ships with a **shadow mode** that records what *would* be denied
-  while still permitting dispatch, so you can mine real traffic, classify
-  every tool, and only then flip `enforce_builtin_policy: true`.
+---
 
-The kernel was extracted from Salient, a private multi-agent system operating
-in a domain where the cost of a wrong action is high. The domain-specific code
-stayed behind; what's here is the control and coordination layer, which
-generalizes to any setting where agents must be constrained.
+## The problem
 
-**Showcase application:** [salient-tutor](https://github.com/baggybin/salient-tutor) —
-a Socratic teaching agent built on this kernel.
+Right now, most stacks secure agents with system prompts like *"please don't
+delete that folder"* or *"be careful with production."* That is **probabilistic
+safety**. If the model hallucinates, is manipulated, or simply gets over-eager,
+nothing *underneath* the loop enforces the rule — the destructive tool call
+still runs.
 
-## How it works
+Orchestrators (LangGraph, CrewAI, AutoGen, …) excel at composing workflows and
+roles. They do not put a **transport-neutral, default-deny gate** under every
+tool invocation, across SDK built-ins, MCP, bus tools, and model-emitted text.
 
-Every agent runs its own provider loop — the Claude Agent SDK by default, or
-OpenAI Codex via the optional `codex` extra — with a single **bus MCP server**
-attached. When an agent calls a tool, the call passes through the **scope +
-safeguard gates** *before* it executes; anything that needs a human is routed
-to the **operator inbox**; what agents learn is corroborated into a shared
-**knowledge graph**. The kernel's value is this topology, not any one box.
+## The solution
 
-A denied call never runs. A delegation to another agent, or a decision the
-model isn't allowed to make alone, lands in the operator inbox as a typed
-question and waits for an answer. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full data-flow and
-persistence model, and
-[`docs/KERNEL-HARDENING-v0.6.0.md`](docs/KERNEL-HARDENING-v0.6.0.md) for the
-engineering log of the review that hardened the authorization boundary.
+`salient-core` moves control out of the prompt and into the kernel. Every tool
+call passes through **scope + safeguard gates** *before* anything executes.
+Capability exposure and authorization are separate: enabling a tool never
+implicitly authorizes it. Unclassified tools fail closed. A denied call
+**never runs**.
+
+Delegation is bus-mediated and operator-visible. Anything that needs a human
+lands in a typed **operator inbox** and waits. Every gate decision and tool
+I/O is persisted — secrets redacted — so you can reconstruct what happened.
 
 <p align="center">
-  <img src="imgs/without-kernel-comparison.png" alt="Without the kernel: chaotic cycles, stalls, leaked intent. With salient-core: a typed bus, cycle detection, and operator gates." width="900">
+  <img src="imgs/control-surfaces.png" alt="Five control surfaces: capability, action, delegation, accountability, and staged trust — levers that live under the model." width="900">
 </p>
 
-## Where it sits
+---
 
-salient-core is **not competing with orchestration frameworks** on workflow
-expressiveness — LangGraph will always have more graph shapes, CrewAI more
-role templates. It occupies a different axis: how much enforced control the
-operator keeps while agents run. If your problem is "compose LLM calls into a
-pipeline", use an orchestrator. If your problem is "let agents act, but never
-outside the box I drew, and show me the receipts", that is what this kernel
-is for.
+## Core features
+
+| | |
+|---|---|
+| **Default-deny policy gates** | Scope + safeguards on every tool call, under the model. Transport-neutral: SDK built-ins, bus tools, external MCP, text commands. Shadow mode first, then flip `enforce_builtin_policy: true`. |
+| **Operator inbox** | Typed Q/A for human decisions. Delegation and policy walls become tickets — not silent failures or free rein. |
+| **Redacted audit trail** | Replayable record of gate decisions and tool I/O. Secrets redacted; if a record can't be written, the store flags itself degraded rather than staying quiet. |
+| **Typed MCP bus** | ~40 inter-agent tools (delegation, context, KG, discovery, audit) as one MCP server per agent, plus `extra_tools` for domain add-ons. |
+| **Noisy-OR knowledge graph** | Cross-session memory with corroboration, embeddings, subject namespaces, provenance, and archive-first compaction. |
+| **Dual runners** | Claude Agent SDK by default; optional OpenAI Codex via `salient-core[codex]` (same bus, same gates). Further providers plug in behind `AgentBackend`. |
+| **Per-agent isolation** | One tool surface per agent; optional OS privilege separation via `_launch_profile`. |
+
+<p align="center">
+  <img src="imgs/kernel-components.png" alt="Kernel components: policy gates, audit trail, operator inbox, bus-as-MCP, noisy-OR knowledge graph, SM-2 scheduler, and runner." width="900">
+</p>
+
+---
+
+## Architecture
+
+Every agent runs its own provider loop with a **bus MCP server** attached.
+Tool calls hit the gates first; human decisions hit the inbox; learning lands
+in the shared KG. The kernel's value is this topology, not any one box.
+
+```
+LLM / agent loop
+       │  tool calls
+       ▼
+┌──────────────────────────────┐
+│        salient-core          │
+│  policy gates · typed bus    │
+│  audit trail · operator inbox│
+└──────────────────────────────┘
+   │            │            │
+   ▼            ▼            ▼
+ Tools      Other agents   Operator
+(scoped)   (bus-mediated)  (typed Q/A)
+```
+
+<p align="center">
+  <img src="imgs/kernel-position.png" alt="Where the kernel sits: LLM above, salient-core in the middle, tools / agents / operator below." width="900">
+</p>
+
+<p align="center">
+  <img src="imgs/policy-gate-flow.png" alt="Policy gates default-deny flow across transports, with shadow then enforce staged trust." width="900">
+</p>
+
+<p align="center">
+  <img src="imgs/delegation-flow.png" alt="Delegation topology: agents on a typed MCP bus with an operator inbox above." width="900">
+</p>
+
+<p align="center">
+  <img src="imgs/without-kernel-comparison.png" alt="Without the kernel: chaotic cycles. With salient-core: typed bus, cycle detection, and gates." width="900">
+</p>
+
+Full data-flow, persistence model, and seams:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+hardening log:
+[`docs/KERNEL-HARDENING-v0.6.0.md`](docs/KERNEL-HARDENING-v0.6.0.md).
+
+---
+
+## Where it sits (not another orchestrator)
 
 | | salient-core | LangGraph | CrewAI / AutoGen |
 |---|---|---|---|
 | **Optimizes for** | operator control over agents | workflow expressiveness | role-based collaboration |
-| **Coordination primitive** | typed **MCP bus** per agent | in-process state graph | in-process agent/role objects |
-| **Policy / gating** | **default-deny gate below the model**, per tool call, transport-neutral | prompt- / code-level, in-graph | prompt-level convention |
-| **Human-in-the-loop** | first-class **operator inbox** (typed Q/A) | interrupts / checkpoints | optional human proxy |
-| **Auditability** | **redacted, replayable trail** of every gate decision + tool call | app-level logging | app-level logging |
-| **Cross-session memory** | **noisy-OR knowledge graph** w/ corroboration + embeddings | checkpointer state | external memory add-ons |
-| **Isolation** | per-agent tool subprocess, optional privilege separation | shared process | shared process |
-| **Backends** | Claude SDK + OpenAI Codex (provider seam for more) | many LLMs | many LLMs |
+| **Coordination** | typed **MCP bus** per agent | in-process state graph | in-process agent/role objects |
+| **Policy / gating** | **default-deny below the model**, every call | prompt- / code-level | prompt-level convention |
+| **Human-in-the-loop** | first-class **operator inbox** | interrupts / checkpoints | optional human proxy |
+| **Audit** | **redacted, replayable** gate + tool trail | app-level logging | app-level logging |
+| **Memory** | **noisy-OR KG** + corroboration | checkpointer state | external add-ons |
 
-The trade is deliberate: salient-core is narrower (a library kernel, not a
-hosted runtime) in exchange for **enforced** scoping and **mediated**
-delegation — built for settings where agents must be *constrained*, not merely
-orchestrated.
+Use an orchestrator to *compose* LLM calls. Use this kernel when agents must
+be *constrained* — and you need receipts.
 
-**When *not* to use it:** single-agent workflows (the control plane is
-overhead you don't need), model providers beyond Claude and OpenAI Codex today
-(others plug in behind the provider seam but none ship yet), or if you want a
-no-code / hosted orchestration runtime — this is a library kernel you wire
-into your own daemon.
+**When *not* to use it:** single-agent toys (control-plane overhead), providers
+beyond Claude/Codex today (seam exists; nothing else ships yet), or if you want
+a hosted no-code runtime. This is a **library kernel** you wire into your own
+daemon.
 
-## What's in the kernel
-
-| Component | What it does |
-|---|---|
-| **Policy gates** | Scope + safeguards enforced *below* the model — default-deny on every tool invocation, across every transport (SDK built-ins, bus tools, external MCP, model-emitted text), with a shadow→enforce rollout path |
-| **Audit trail** | Scope decisions, tool I/O, and operator answers persisted with secret redaction — a replayable record of what ran and what was denied, plus a sticky degraded-health flag when a record can't be written |
-| **Operator inbox** | Typed question/answer pattern for anything that needs a human decision |
-| **Bus-as-MCP** | ~40 typed inter-agent tools (delegation, context, KG, discovery, audit) exposed as a single MCP server per agent, with an `extra_tools` slot for domain add-ons |
-| **Noisy-OR KG** | Cross-session knowledge graph with corroboration, embeddings, subject-namespace scoping, provenance, and archive-first compaction |
-| **SM-2 scheduler** | Spaced-repetition gradebook for durable recall tracking |
-| **Runner** | Provider-neutral: the **Claude Agent SDK** is the primary backend, and an **OpenAI Codex** provider ships behind the optional `[codex]` extra (thread runtime + an MCP gateway so Codex agents use the same bus and pass the same gates). Further providers register via the `salient.agent_providers` entry point behind the `AgentBackend` seam. Per-agent tool subprocesses can be privilege-separated via an opaque `_launch_profile` seam |
+---
 
 ## Requirements
 
 - **Python ≥ 3.11, < 3.14**
-- **[`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) `>=0.2.110,<0.3`** —
-  pulled in automatically. The runner drives Claude agents through it, so you
-  need Claude access: either an `ANTHROPIC_API_KEY` or an existing Claude Code
-  OAuth session.
-- Optional extra: `pip install 'salient-core[codex]'` adds the **OpenAI Codex
-  provider**, so agents can run on Codex instead of the Claude SDK (bus access
-  via an MCP gateway; requires your own Codex/OpenAI auth).
+- **[`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) `>=0.2.110,<0.3`**
+  (pulled in automatically). Claude access via `ANTHROPIC_API_KEY` or an
+  existing Claude Code OAuth session.
+- Optional: `pip install 'salient-core[codex]'` for the OpenAI Codex runner
+  (same bus + gates; your own Codex/OpenAI auth).
 
-> **Default-deny, out of the box.** The kernel ships with an *empty* scope and
-> safeguard dataset, and the scope gate defaults to **deny** — an engagement
-> with no scope set refuses **every** tool call. Populate `ScopeStore` /
-> `SafeguardConfig` at startup (see [`docs/EXTRACTION.md`](docs/EXTRACTION.md#data-tables))
-> before agents can do anything. This is intentional: policy is opt-in-safe.
+> **Default-deny, out of the box.** Empty scope/safeguard datasets mean an
+> engagement with no policy set refuses **every** tool call. Populate
+> `ScopeStore` / `SafeguardConfig` at startup (see
+> [`docs/EXTRACTION.md`](docs/EXTRACTION.md#data-tables)) before agents can act.
+> Policy is opt-in-safe on purpose.
+
+---
 
 ## Quick start
+
+### 1. Install
 
 ```bash
 pip install salient-core
 ```
 
-### Run the multi-agent showcase
+### 2. Run the multi-agent showcase (no API key)
 
-The kernel's actual job — fanning one prompt across a panel of agents over the
-bus, capturing each leg's reasoning, and scoring **semantic convergence** —
-runs offline with no API key:
+Fans one prompt across a panel over the bus, captures each leg, and scores
+**semantic convergence** — real `ask_consensus` machinery, offline:
 
 ```bash
 pip install salient-core starlette uvicorn
@@ -161,17 +169,13 @@ cd examples/consensus_panel
 uvicorn server:app --reload      # → http://127.0.0.1:8055
 ```
 
-This exercises the real `ask_consensus` machinery
-(`salient_core.bus._consensus`): same-prompt fan-out, per-leg trace capture,
-embedding-based agreement scoring, and the parameterizable judge. See
-[`examples/consensus_panel/`](examples/consensus_panel/README.md) for how to
-swap the mock runner for live models. For a full application built on the
-kernel, see [`salient-tutor`](https://github.com/baggybin/salient-tutor).
+See [`examples/consensus_panel/`](examples/consensus_panel/README.md) to swap
+the mock runner for live models. Full app on the kernel:
+[`salient-tutor`](https://github.com/baggybin/salient-tutor).
 
-### Standalone modules
+### 3. Use a standalone module
 
-Several pieces work without wiring up the full daemon — e.g. the SM-2
-scheduler and the knowledge graph:
+Some pieces work without the full daemon — e.g. the SM-2 scheduler:
 
 ```python
 from salient_core.tutor.schedule import next_interval_days, next_mastery
@@ -180,47 +184,71 @@ interval = next_interval_days(prev_days=7.0, grade="good")  # → ~16.1
 mastery = next_mastery(prev_mastery=0.5, grade="easy")      # → ~0.75
 ```
 
-## Seams
+---
 
-The kernel ships no app-specific ("skin") code. Instead it exposes two kinds of
-plug-in points, and a downstream application (a domain skin, the tutor
-showcase, or your own project) fills them in at startup:
+## Configuration & seams
 
-- **Protocol contracts** — the typed surfaces a downstream implements
-  (`DaemonServices`, `ToolBuilder`, `AliasProtocol`, `AgentBackend` in
-  `salient_core.protocols`).
-- **Runtime registration seams** — a family of `set_*` functions read at *call
-  time* (never import time), each with a safe default so the kernel stays
-  runnable standalone (e.g. `set_bus_builder`, `set_tool_builder`,
-  `set_thinking_provider`, `set_kg_assert_hook`, `alias.set_active`).
+The kernel ships **no app-specific ("skin") code**. A downstream daemon fills
+two kinds of plug-in points at startup:
+
+1. **Protocol contracts** — `DaemonServices`, `ToolBuilder`, `AliasProtocol`,
+   `AgentBackend` (`salient_core.protocols`).
+2. **Runtime registration** — `set_*` / `register_*` functions read at *call
+   time* (never import time), each with a safe default.
 
 ```python
-from salient_core.protocols import DaemonServices, ToolBuilder, AliasProtocol
+from pathlib import Path
+from salient_core.protocols import DaemonServices
+from salient_core.memory.kg import KnowledgeGraph
+from salient_core.coord.questions import QuestionInbox
+from salient_core.bus._context_store import ContextStore
+from salient_core.bus import make_bus
 
 class MyDaemon:
-    """A downstream daemon implements DaemonServices."""
-    profile: dict
-    engagement_path: Path | None
+    """Downstream implements DaemonServices; runner only touches this surface."""
+    profile: dict = {}
+    engagement_path: Path | None = None
     context: ContextStore
     kg: KnowledgeGraph
     inbox: QuestionInbox
 
-    def add_question(self, agent: str, question: str, job_id: int | None = None) -> int: ...
+    def add_question(self, agent: str, question: str, job_id: int | None = None) -> int:
+        return self.inbox.add(agent=agent, text=question, job_id=job_id)
+
+# Each agent gets its own bus MCP server (gates + typed tools).
+daemon = MyDaemon(...)  # wire stores at startup
+bus_server, server_name, wire_names = make_bus(daemon, agent_name="researcher")
 ```
 
-See [`docs/EXTRACTION.md`](docs/EXTRACTION.md) for the full guide and the
-complete seam catalogue in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Full extension guide: [`docs/EXTRACTION.md`](docs/EXTRACTION.md). Seam
+catalogue: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Architecture
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module map,
-data flow, and Protocol seams.
+---
 
 ## Status
 
-Pre-alpha. APIs are evolving. See [`CHANGELOG.md`](CHANGELOG.md) for release
-history.
+Pre-alpha. APIs are evolving. See [`CHANGELOG.md`](CHANGELOG.md).
+
+## Contributing
+
+Kernel changes land **here first**. Public API is guarded by
+`tests/test_public_api.py`; new capabilities go through Protocol contracts and
+`set_*` seams — not domain specifics baked into the kernel.
+
+```bash
+git clone https://github.com/baggybin/salient-core.git
+cd salient-core
+pip install -e ".[dev]"
+pre-commit install
+pytest tests/ -q
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
 Apache 2.0 — see [`LICENSE`](LICENSE).
+
+---
+
+*Built for constrained multi-agent systems on the Model Context Protocol (MCP).*
