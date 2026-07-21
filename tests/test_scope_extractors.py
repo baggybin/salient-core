@@ -29,6 +29,10 @@ from salient_core.policy.scope import (
     register_extractor,
     unregister_all_extractors,
 )
+from salient_core.policy.scope_placeholders import (
+    _MAX_SCAN_DEPTH,
+    unresolved_operator_infra_placeholder,
+)
 
 
 def _kv(targets):
@@ -189,6 +193,39 @@ class GenericExtractorTests(unittest.TestCase):
 
         self.assertEqual(_kv(targets), [("ip", "10.0.0.5")])
 
+    def test_raw_argv_refuses_placeholder_in_bytes_arg(self):
+        # bytes is the one non-str scalar that can still carry the literal
+        # token; it must be scanned, not skipped.
+        with self.assertRaisesRegex(
+            ExtractorError, "unresolved operator-infrastructure placeholder"
+        ):
+            extract_targets(
+                ExtractorSpec(fields={"cmd": "raw_argv"}),
+                {"cmd": b"nc <lhost> <lport>"},
+            )
+
+    def test_raw_argv_refuses_placeholder_in_argv_list(self):
+        # Realistic argv shape: the placeholder hides inside a list element.
+        with self.assertRaisesRegex(
+            ExtractorError, "unresolved operator-infrastructure placeholder"
+        ):
+            extract_targets(
+                ExtractorSpec(fields={"cmd": "raw_argv"}),
+                {"cmd": ["nc", "<RHOST>", "<RPORT>"]},
+            )
+
+    def test_deeply_nested_args_fail_closed(self):
+        # An arbitrarily nested container aborts the scan and fails CLOSED
+        # (rather than raising an uncaught RecursionError).
+        nested: object = "leaf"
+        for _ in range(_MAX_SCAN_DEPTH + 5):
+            nested = [nested]
+        with self.assertRaisesRegex(ExtractorError, "max depth"):
+            extract_targets(
+                ExtractorSpec(fields={"cmd": "raw_argv"}),
+                {"cmd": nested},
+            )
+
     # ── raw_argv hardening: IPv6 sweep, NFKC, decode→exec, spliced literals ──
     def test_raw_argv_extracts_ipv6(self):
         # IPv6 targets were invisible to the (IPv4-only) sweep before — a raw_argv
@@ -294,6 +331,54 @@ class UnknownKindTests(unittest.TestCase):
         with self.assertRaises(ExtractorError) as cm:
             extract_targets(ExtractorSpec(fields={"z": "bogus_kind"}), {"z": "x"})
         self.assertEqual(str(cm.exception), "unknown extractor kind: 'bogus_kind'")
+
+
+class PlaceholderScannerTests(unittest.TestCase):
+    """Direct coverage for `unresolved_operator_infra_placeholder`, which runs
+    on every declared field before kind dispatch. It receives untyped tool args
+    (`dict[str, Any]`), so it must total-cover every runtime type: scan the ones
+    that can hold the literal token, and return None (never raise) on the ones
+    it cannot — an uncaught exception here escapes the gate's `except
+    ExtractorError` and crashes scope evaluation."""
+
+    def test_scans_string_and_bytes(self):
+        self.assertEqual(unresolved_operator_infra_placeholder("go <lhost> now"), "<lhost>")
+        self.assertEqual(unresolved_operator_infra_placeholder("PORT=<RPORT>"), "<RPORT>")
+        self.assertEqual(unresolved_operator_infra_placeholder(b"<rhost>"), "<rhost>")
+
+    def test_clean_values_return_none(self):
+        self.assertIsNone(unresolved_operator_infra_placeholder("nmap 10.0.0.1"))
+        self.assertIsNone(unresolved_operator_infra_placeholder(["a", "b"]))
+        self.assertIsNone(unresolved_operator_infra_placeholder({"k": "v"}))
+
+    def test_unscannable_types_return_none_never_raise(self):
+        # The core regression: these fell through to `assert_never` before and
+        # raised an uncaught AssertionError. Each must now return None.
+        for value in (42, 3.14, True, None, {"a", "b"}, object(), 1j, memoryview(b"x")):
+            with self.subTest(value=type(value).__name__):
+                self.assertIsNone(unresolved_operator_infra_placeholder(value))
+
+    def test_finds_placeholder_nested_in_containers(self):
+        self.assertEqual(
+            unresolved_operator_infra_placeholder({"argv": ["nc", ("<lhost>",)]}),
+            "<lhost>",
+        )
+
+    def test_depth_cap_fails_closed(self):
+        nested: object = "x"
+        for _ in range(_MAX_SCAN_DEPTH + 2):
+            nested = [nested]
+        with self.assertRaisesRegex(ExtractorError, "max depth"):
+            unresolved_operator_infra_placeholder(nested)
+
+    def test_cyclic_container_fails_closed_not_recursionerror(self):
+        # A self-referential container would raise RecursionError (a
+        # RuntimeError the gate does not catch); the depth cap converts it to a
+        # clean ExtractorError deny.
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+        with self.assertRaises(ExtractorError):
+            unresolved_operator_infra_placeholder(cyclic)
 
 
 class ExtractorRegistryTests(unittest.TestCase):
