@@ -100,8 +100,9 @@ class ProviderRegistry:
 def builtin_provider_registry() -> ProviderRegistry:
     from .codex import CodexProvider
     from .daemon._backend import ClaudeProvider
+    from .polybrain import PolybrainProvider
 
-    registry = ProviderRegistry((ClaudeProvider(), CodexProvider()))
+    registry = ProviderRegistry((ClaudeProvider(), CodexProvider(), PolybrainProvider()))
     registry.load_entry_points()
     return registry
 

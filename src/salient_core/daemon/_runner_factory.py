@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 from functools import partial
@@ -1687,6 +1688,25 @@ class _RunnerFactoryMixin:
                     )
 
                 backend_factory = _make_codex_backend
+            elif provider_name == ProviderName("polybrain"):
+                from ..polybrain import PolybrainProvider
+
+                if not isinstance(provider, PolybrainProvider):
+                    raise TypeError(
+                        "registered polybrain provider has an incompatible implementation"
+                    )
+                config["agent_name"] = cfg["name"]
+                config["cwd"] = str(self._agent_work_dir(cfg["name"]))
+                config["instructions"] = self._augment_system_prompt(cfg)
+
+                def _make_polybrain_backend() -> AgentBackend:
+                    return provider.create_backend(
+                        config,
+                        tool_bundle=tool_bundle,
+                        safeguard_hook=self._make_polybrain_safeguard_hook(cfg["name"]),
+                    )
+
+                backend_factory = _make_polybrain_backend
             else:
                 backend_factory = partial(
                     provider.create_backend,
@@ -1902,6 +1922,73 @@ class _RunnerFactoryMixin:
         from ..codex import codex_command_is_read_only
 
         return codex_command_is_read_only(params)
+
+    def _make_polybrain_safeguard_hook(self, agent_name: str):
+        """Per-tool-call safeguard gate for polybrain backends.
+
+        The polybrain backend executes `ToolBundle` handlers directly, so the
+        **scope** gate fires inside the handler wrapper (scope.gate) — but the
+        Claude-side **safeguards** (prohibited-intent patterns) and
+        **approve_before** wire enforcement are Claude-SDK PreToolUse hooks
+        that never run on this path. This hook closes that floor: it runs
+        before EVERY handler invocation, and a denial means the handler is
+        never called (the model gets an error tool result instead).
+
+        Layer 1 mirrors `_make_safeguard_hook`'s intent check; layer 2 mirrors
+        `_make_approve_before_hook`'s classification + operator question
+        (simplified: approve/deny only — no edit verdicts in v1). Unlike the
+        codex resolver, no `evaluate_scope` here: the bundle handlers already
+        carry scope.gate.
+        """
+
+        async def guard(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
+            from ..policy.safeguards import check_intent, resolve_config
+
+            runner = self.runners.get(agent_name)
+            agent_cfg = (runner.cfg if runner else None) or {}
+            allowed, reason = check_intent(
+                tool_name,
+                dict(arguments),
+                config=resolve_config(agent_cfg, self.profile),
+            )
+            if not allowed:
+                return reason or "prohibited by safeguards"
+
+            gated = set((agent_cfg.get("policy") or {}).get("approve_before") or [])
+            if gated:
+                classify = get_daemon_skin_module("action_class").classify_tool_action
+                tool_type = (agent_cfg.get("tool") or {}).get("type")
+                hit = gated & classify(tool_type, tool_name, dict(arguments))
+                if hit:
+                    from ..bus import _parse_delegation_answer
+
+                    args_summary = json.dumps(dict(arguments), default=str)[:200]
+                    summary = f"{tool_name}({args_summary}) — classes: {', '.join(sorted(hit))}"[
+                        :300
+                    ]
+                    qid, answer_future = self.add_tool_approval_question(
+                        agent_name,
+                        "polybrain_tool",
+                        summary,
+                        sorted(hit),
+                    )
+                    try:
+                        answer = await asyncio.wait_for(answer_future, timeout=600)
+                    except TimeoutError:
+                        self.inbox.expire(qid, "[timed out]")
+                        return "operator approval timed out (deny-by-default)"
+                    except BaseException:
+                        # Interrupt/cancel (killswitch) or any error while waiting:
+                        # don't leave a phantom approval question dangling in the
+                        # operator inbox for a call that will never run.
+                        self.inbox.expire(qid, "[interrupted]")
+                        raise
+                    verdict, _payload = _parse_delegation_answer(answer)
+                    if verdict != "approve":
+                        return f"operator denied ({verdict or 'no'})"
+            return None
+
+        return guard
 
     def _build_provider_tool_bundle(self, cfg: dict[str, Any]) -> ToolBundle:
         bus_bundle, bus_wires = make_bus_tool_bundle(cast("DaemonServices", self), cfg["name"])
