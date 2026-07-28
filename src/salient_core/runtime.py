@@ -363,3 +363,24 @@ class AgentBackend(Protocol):
         error: BaseException,
         stderr_tail: tuple[str, ...],
     ) -> str: ...
+
+
+@runtime_checkable
+class ReapableBackend(Protocol):
+    """OPTIONAL `AgentBackend` extension: exposes the backend's underlying model
+    subprocess so the runner can *prove* it died during quiescence (T2.4b).
+
+    Kept separate from `AgentBackend` (not a required member) so backends without
+    a locally-reapable child — a remote/HTTP backend, a test fake — stay
+    conforming; the runner probes `isinstance(backend, ReapableBackend)` and a
+    backend that isn't one degrades to `sdk_state="no_pid"` (honest, never a
+    crash)."""
+
+    def child_pid(self) -> int | None:
+        """PID of the model subprocess, or None if not connected / no local
+        child."""
+        ...
+
+    def child_alive(self) -> bool:
+        """Whether `child_pid()` currently names a live process."""
+        ...

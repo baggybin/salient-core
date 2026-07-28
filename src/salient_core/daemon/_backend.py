@@ -142,6 +142,32 @@ class LocalClaudeBackend:
     async def interrupt(self) -> None:
         await self._client.interrupt()
 
+    def _child_process(self) -> Any:
+        """The anyio Process of the SDK CLI subprocess, or None. Reaches through
+        SDK internals defensively — every hop is guarded so an SDK layout change
+        degrades to 'no pid' (→ unverified) instead of crashing quiescence."""
+        transport = getattr(self._client, "_transport", None)
+        if transport is None:  # not connected / already disconnected
+            return None
+        return getattr(transport, "_process", None)
+
+    def child_pid(self) -> int | None:
+        """PID of the SDK CLI subprocess, or None when not connected. Satisfies
+        `salient_core.protocols.ReapableBackend` — lets the runner prove the SDK
+        child died during quiescence (T2.4b)."""
+        proc = self._child_process()
+        if proc is None:
+            return None
+        pid = getattr(proc, "pid", None)
+        return int(pid) if isinstance(pid, int) else None
+
+    def child_alive(self) -> bool:
+        """Whether the SDK CLI subprocess is still running (returncode is None)."""
+        proc = self._child_process()
+        if proc is None:
+            return False
+        return getattr(proc, "returncode", 0) is None
+
     async def get_context_usage(self) -> ContextUsage | None:
         usage = await self._client.get_context_usage()
         if usage is None:

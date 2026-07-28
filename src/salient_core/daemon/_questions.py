@@ -127,11 +127,23 @@ class _QuestionsMixin(_EventObservationMixin):
         cancel instead (see _cmd_questions_answer).
         """
         runner = self.runners.get(agent)
-        if job_id is None and runner and runner.current is not None:
-            job_id = runner.current.id
-        q: Question = self.inbox.add(agent, text, job_id=job_id or 0, kind=kind)
-        if runner and runner.current is not None:
-            runner.current.tool_question_ids.append(q.id)
+        current = runner.current if runner else None
+        # Resolve job_id AND correlation_id from the SAME `current` read so they
+        # can never describe different turns (T3.1 forensic join). Only when the
+        # caller didn't pin an explicit job_id — an explicit job_id points at a
+        # turn we did NOT resolve here, so guessing its correlation from
+        # `current` would write a self-inconsistent row; leave it None instead.
+        # No active turn (idle) → correlation stays None, which honestly reads
+        # as "not attributable to any turn" rather than a fabricated join.
+        correlation_id: str | None = None
+        if current is not None and job_id is None:
+            job_id = current.id
+            correlation_id = current.correlation_id
+        q: Question = self.inbox.add(
+            agent, text, job_id=job_id or 0, kind=kind, correlation_id=correlation_id
+        )
+        if current is not None:
+            current.tool_question_ids.append(q.id)
         self._announce_question(q, source="tool")
         return q.id
 
@@ -455,6 +467,7 @@ class _QuestionsMixin(_EventObservationMixin):
         parent_call_id: int | None = None,
         swarm_role: str | None = None,
         initial_state: str = "awaiting_agent_start",
+        correlation_id: str | None = None,
     ) -> int:
         """Register an in-flight ask_agent call. Returns a call_id the bus
         tool uses to update state and resolve on exit.
@@ -472,6 +485,13 @@ class _QuestionsMixin(_EventObservationMixin):
         preview = prompt.strip().splitlines()[0] if prompt.strip() else ""
         if len(preview) > 120:
             preview = preview[:119] + "…"
+        # T3.1: default the correlation id to the caller's active-job id so a
+        # delegation/fan-out edge joins to the turn that spawned it; an explicit
+        # arg (e.g. a synthetic swarm parent) wins.
+        if correlation_id is None:
+            caller_runner = self.runners.get(caller) if hasattr(self, "runners") else None
+            cur_job = getattr(caller_runner, "current", None)
+            correlation_id = getattr(cur_job, "correlation_id", None)
         self._bus_calls[call_id] = BusCall(
             id=call_id,
             caller=caller,
@@ -483,6 +503,7 @@ class _QuestionsMixin(_EventObservationMixin):
             parent_call_id=parent_call_id,
             swarm_role=swarm_role,
             depth=self._bus_call_depth_for(caller),
+            correlation_id=correlation_id,
         )
         return call_id
 

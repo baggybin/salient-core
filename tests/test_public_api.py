@@ -6,6 +6,7 @@ downstream-facing convenience helpers behave.
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,15 @@ SUBJ = "learner:op"
 
 
 class PublicSurfaceTests(unittest.TestCase):
+    def test_release_version_is_0_8_16(self):
+        self.assertEqual(salient_core.__version__, "0.8.16")
+
+    def test_runtime_version_matches_installed_distribution(self):
+        self.assertEqual(
+            salient_core.__version__,
+            importlib.metadata.version("salient-core"),
+        )
+
     def test_all_names_importable_from_top_level(self):
         for name in salient_core.__all__:
             self.assertTrue(hasattr(salient_core, name), f"missing public name: {name}")

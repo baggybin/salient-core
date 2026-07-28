@@ -497,6 +497,10 @@ class BusCall:
     # down +1. Powers the MAX_DELEGATION_DEPTH admission cap so a runaway
     # ladder/fan-out can't nest unboundedly. 0 for swarm-parent labels.
     depth: int = 0
+    # T3.1 spine. The caller's active-job correlation id (see Job.correlation_id),
+    # copied onto the call at register time so a delegation/fan-out edge joins to
+    # the turn that spawned it. None for calls with no correlating active job.
+    correlation_id: str | None = None
 
 
 @dataclass
@@ -530,3 +534,10 @@ class Job:
     # verification subsystem consumes it. Kept here so the daemon can cut over
     # independently of that subsystem. See salient_core.daemon.runner.submit.
     verification_leg: bool = False
+    # T3.1 spine. Correlation id minted once per job at runner.submit():
+    # ``<engagement_id>:<epoch>:<counter>``. Threaded onto the job's BusCall,
+    # questions, bypasses, and persisted state.db rows so an operator can pick
+    # any event and reconstruct the whole causal chain of the turn. Epoch
+    # namespaces it, so reset / daemon restart can't collide or launder history.
+    # None only for jobs minted before an engagement_id/epoch is available.
+    correlation_id: str | None = None

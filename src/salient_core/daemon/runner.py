@@ -103,7 +103,7 @@ from ..policy.safeguards import (
     resolve_config,
 )
 from ..policy.scope import ScopeStore
-from ..protocols import AgentBackend, DaemonServices
+from ..protocols import AgentBackend, DaemonServices, ReapableBackend
 from ..runtime import (
     AssistantEvent,
     ContextCompactedEvent,
@@ -118,6 +118,7 @@ from ..runtime import (
     ToolResultEvent,
     TurnCompletedEvent,
 )
+from . import proc_registry
 from ._event_hub import fork_event
 from ._helpers import (
     _TEXT_FULL_INLINE_CAP,
@@ -144,6 +145,32 @@ async def _offload_blocking_io(
     if kwargs:
         return await anyio.to_thread.run_sync(functools.partial(func, **kwargs), *args)
     return await anyio.to_thread.run_sync(func, *args)
+
+
+@dataclass(frozen=True)
+class QuiescenceReport:
+    """Evidence that a runner is dead, returned by `AgentRunner.quiesce()`
+    (T2.4b). `state` is honest about what could be *proven*, never optimistic:
+
+    - ``proven_quiescent`` — task terminal, SDK child proven gone (ESRCH) or the
+      backend exposes no local child, and no registered tool subprocess survived.
+    - ``force_reaped`` — the tool children are gone but the task did not exit
+      cleanly (it was cancelled / is wedged past the force deadline).
+    - ``unverified`` — some death could not be proven (SDK child still alive, a
+      tool subprocess survived, or a signal was refused). NEVER faked as
+      quiescent.
+    """
+
+    runner: str
+    task_done: bool
+    task_cancelled: bool
+    sdk_pid: int | None
+    sdk_state: str  # "proven_dead" | "alive" | "no_pid"
+    tool_reaped: tuple[int, ...]
+    tool_survived: tuple[int, ...]
+    state: str  # "proven_quiescent" | "force_reaped" | "unverified"
+    elapsed_ms: int
+    cgroup_state: str = "unavailable"  # "empty" | "reaped" | "survivors" | "unavailable"
 
 
 @dataclass
@@ -178,6 +205,10 @@ class AgentRunner:
     _stop_requested: bool = False
     _next_job_id: int = 1
     _next_seq: int = 1
+    # T3.1 spine. Monotonic per-incarnation counter for the correlation id minted
+    # at submit(). Epoch namespaces it across resets/restarts, so a plain counter
+    # (like _next_job_id) is enough and doesn't need to survive a reset.
+    _next_corr_seq: int = 1
     # Cumulative token usage across this runner's lifetime. Reset by
     # `salientctl reset <agent>` (which destroys+recreates the runner).
     # `last_input_tokens` approximates the conversation's CURRENT context
@@ -231,6 +262,27 @@ class AgentRunner:
     # _dispatch_job, which reconnects the SDK client once and re-runs the job.
     # Reset to False before every attempt.
     _auth_recover_pending: bool = False
+    # ── token-budget enforcement (control-ladder BUDGET rung) ─────────
+    # Armed once this runner has crossed its token ceiling. Read by the
+    # PreToolUse budget-gate hook (hook B) which then DENIES every further
+    # tool call — the floor that blocks new tool spend without cancelling
+    # any in-flight tool subprocess. Cleared only by an explicit operator
+    # resume (raising the ceiling / credit), never implicitly.
+    _budget_gate_armed: bool = False
+    # True when the configured action at the ceiling was "stop" (terminal)
+    # rather than "pause" (resumable park). Terminal also sets _stop_requested.
+    _budget_terminal: bool = False
+    # De-dupe the one-shot warn question at the warn threshold crossing.
+    _budget_warned: bool = False
+    # Resumable park: the runner stays alive (backend connected, context
+    # preserved) but admits no new jobs until budget_resume(). Distinct from
+    # `status == "budget_parked"` for the same race-free-sync reason submit()
+    # prefers `_stop_requested` over `status == "stopped"`.
+    _budget_parked: bool = False
+    # Monotonic per-incarnation turn sequence for the spend ledger's
+    # idempotency key (agent, epoch, turn_seq). Epoch namespaces it, so a
+    # simple counter is enough; a reset bumps the epoch, not this.
+    _budget_turn_seq: int = 0
     # SDK's authoritative context-usage snapshot from the last successful
     # call to client.get_context_usage(). When present, _usage_for prefers
     # these values over the heuristic (which may be off when memory files
@@ -333,6 +385,12 @@ class AgentRunner:
     # sha256 of the agent's resolved prompt-file body (prompts/<name>.md),
     # stamped by _make_runner for prompt-drift provenance (`prompt_diff`).
     _prompt_sha: str = ""
+    # T3.1 spine. sha256 of the ASSEMBLED bus_trusted system prompt the model
+    # actually runs under (inherited + own + lessons + tools/approval/engagement
+    # blocks + addenda), stamped at bake. Unlike _prompt_sha (authored file body
+    # only), this answers "what instructions was the model operating under at
+    # turn N" and is comparable across resets. Stamped onto every job row.
+    _assembled_prompt_sha: str = ""
     # tool_use_id → ledger row id, populated on ToolUseBlock so the
     # matching ToolResultBlock can finish the row. Trimmed in-place
     # when rows are finished; capped at 256 entries to bound memory
@@ -1773,10 +1831,29 @@ class AgentRunner:
         return True
 
     async def _run(self) -> None:
+        # Bind this task's context to the runner name so every tool coroutine
+        # spawned within it registers its subprocesses against this runner
+        # (T2.4b). create_task copied the context at start(); setting it here
+        # scopes it to this task + its children.
+        _proc_token = proc_registry.bind_runner(self.name)
         try:
             self._backend = self._create_backend()
             await self._connect_with_attach_retry()
             self.status = "idle"
+            # Operator-facing start line. It lives HERE — the one point every
+            # start path reaches — and not in `AgentFactory.start_agent`, which
+            # is only one of ~13 call sites that build a runner and call
+            # `start()`. Boot / resume / autostart deliberately bypass
+            # start_agent (see the skin's `daemon/core.py` "_start_initial_
+            # agents"), so a line emitted there missed exactly the long-lived
+            # agents that generate the most work: a resumed roster logged zero
+            # starts against thousands of stops. Symmetric with the stop line
+            # in `stop()`, which has always been correct for the same reason.
+            #
+            # Emitted after the backend connects, so it means "this agent is
+            # up", not "someone asked for it". `model=` names the configured
+            # brain — the same identity `record_usage` writes per turn.
+            _log.info("agent %s started model=%s", self.name, (self.cfg or {}).get("model"))
             await self._log("start", "ready")
             while not self._stop_requested:
                 # Priority lane FIRST: an operator steer jumps ahead of any
@@ -1786,7 +1863,13 @@ class AgentRunner:
                     job = steer
                 else:
                     try:
-                        timeout = self.idle_timeout if self.idle_timeout > 0 else None
+                        # A budget-parked runner must not idle-die — it holds
+                        # its context alive awaiting an operator resume.
+                        timeout = (
+                            self.idle_timeout
+                            if (self.idle_timeout > 0 and not self._budget_parked)
+                            else None
+                        )
                         job = await asyncio.wait_for(self.queue.get(), timeout=timeout)
                     except TimeoutError:
                         await self._log("done", f"idle timeout ({self.idle_timeout}s)")
@@ -1857,11 +1940,16 @@ class AgentRunner:
                         result=job.result,
                         error=job.error,
                         prompt_sha=getattr(self, "_prompt_sha", None),
+                        assembled_prompt_sha=getattr(self, "_assembled_prompt_sha", None),
+                        correlation_id=job.correlation_id,
                     )
                 if job.future and not job.future.done():
                     job.future.set_result(job)
                 self.current = None
-                self.status = "idle"
+                # A budget-parked runner stays parked between jobs (the job
+                # that tripped the ceiling just finished draining) — don't let
+                # the post-job reset paper over the park with 'idle'.
+                self.status = "budget_parked" if self._budget_parked else "idle"
         finally:
             # Resolve any pending futures (current job mid-flight + queued
             # jobs) so callers' ask_agent awaits unblock instead of leaking.
@@ -1872,6 +1960,19 @@ class AgentRunner:
             with suppress(Exception):
                 if self._backend:
                     await self._backend.disconnect()
+            # Reap any tool subprocess this runner leaked (a tool that spawned a
+            # child but exited before deregistering it), then forget the bucket.
+            # Normal-exit reaper for ANY runner death — idle timeout, crash, or
+            # kill; the killswitch quiesce() path is the wedged-task backstop.
+            with suppress(Exception):
+                proc_registry.reap_runner(self.name)
+                proc_registry.clear_runner(self.name)
+            _reaper = proc_registry.cgroup_reaper()
+            if _reaper is not None:
+                with suppress(Exception):
+                    _reaper.kill_runner(self.name)
+                    _reaper.remove_runner(self.name)
+            proc_registry.unbind_runner(_proc_token)
             self.status = "stopped"
             await self._log("done", "stopped")
             if self._jsonl_fh is not None:
@@ -1969,6 +2070,10 @@ class AgentRunner:
         self.current_turn_count = 0
         turn_count = 0
         cap_fired = False
+        # Set when the token-budget floor interrupts this dispatch (mirrors
+        # cap_fired: suppresses the silent-completion re-prompt so a
+        # budget-cut turn isn't nudged back to life).
+        budget_fired = False
         # Silent-completion nudge counters. The receive-response loop is
         # wrapped in a `while True` below so we can re-query the SDK
         # ONCE with a nudge prompt when an agent ends with no tool calls
@@ -2217,6 +2322,25 @@ class AgentRunner:
                     # threshold check happens in Daemon._on_job_complete so
                     # we don't need to know about it here.
                     self._tokens_since_checkpoint += in_t + cache_r + cache_c
+                    # T3.1: durable per-turn usage/cost ledger (a real audit
+                    # record — distinct from the budget accumulator charged
+                    # below). Best-effort + off-loop so a slow/failed write can
+                    # never stall or break the turn.
+                    if self.context is not None:
+                        with suppress(Exception):
+                            await _offload_blocking_io(
+                                self.context.record_usage,
+                                agent=self.name,
+                                model=self.cfg.get("model"),
+                                correlation_id=job.correlation_id,
+                                input_tokens=in_t,
+                                output_tokens=out_t,
+                                cache_read_tokens=cache_r,
+                                cache_create_tokens=cache_c,
+                                reasoning_tokens=msg.usage.reasoning_tokens,
+                                total_tokens=msg.usage.total_tokens,
+                                cost_usd=cost,
+                            )
                     tok_summary = f" tokens={in_t}/{out_t} (in/out)" if (in_t or out_t) else ""
                     cost_summary = f"${cost:.4f}" if cost is not None else "n/a"
                     await self._log(
@@ -2236,6 +2360,37 @@ class AgentRunner:
                             }
                         },
                     )
+                    # ── token-budget floor ────────────────────────────
+                    # Charge this turn against the ceiling and enforce.
+                    # Accounting/verdict is the daemon's (it owns the
+                    # anti-launder ledger); the enforcement action (park /
+                    # interrupt) is ours (only we can interrupt the turn).
+                    # Wrapped so a budget hiccup can never break the loop.
+                    if self._daemon is not None:
+                        self._budget_turn_seq += 1
+                        verdict = None
+                        try:
+                            verdict = self._daemon.budget_charge(
+                                self.name,
+                                msg.usage,
+                                epoch=self._epoch,
+                                turn_seq=self._budget_turn_seq,
+                            )
+                        except Exception:  # noqa: BLE001
+                            verdict = None
+                        if verdict is not None:
+                            note = None
+                            try:
+                                note = await self._apply_budget_verdict(verdict)
+                            except Exception:  # noqa: BLE001
+                                note = None
+                            if note is not None:
+                                budget_fired = True
+                                chunks.append(note)
+                                with suppress(Exception):
+                                    if self._backend is not None:
+                                        await self._backend.interrupt()
+                                break
                 elif isinstance(msg, ProviderErrorEvent):
                     job.error = f"{msg.code}: {msg.message}"
                     await self._log("tool-error", job.error)
@@ -2265,6 +2420,7 @@ class AgentRunner:
             silent = (
                 not nudge_fired
                 and not cap_fired
+                and not budget_fired
                 and not steer_truncated
                 and job.future is not None
                 and tools_this_phase == 0
@@ -2305,6 +2461,108 @@ class AgentRunner:
         if self.cfg.get("endpoint") and job.result:
             await self._dispatch_text_function_calls(job)
 
+    def _file_budget_question(self, text: str) -> None:
+        """File a token-budget breach as an operator inbox question — the
+        'needs-you' idiom (there is no separate needs-you flag). Best-effort:
+        a broken inbox must not break the runner loop."""
+        d = self._daemon
+        if d is None:
+            return
+        with suppress(Exception):
+            d.add_question(self.name, text, job_id=None)
+
+    async def _apply_budget_verdict(self, verdict) -> str | None:
+        """Act on a BudgetVerdict from the daemon's ledger. Returns a
+        PARTIAL note string when the budget floor fires (caller then
+        interrupts the turn and ends the dispatch); returns None to let the
+        turn continue (OK / warn / monitor-only-over).
+
+        WARN files a one-shot operator question. Enforced OVER (pause|stop)
+        arms the PreToolUse deny gate (hook B) and either PARKS the runner
+        (resumable, backend stays alive) or requests a terminal soft-stop.
+        """
+        from ._budget import BudgetAction
+
+        if verdict.action is BudgetAction.OK:
+            return None
+
+        if verdict.action is BudgetAction.WARN:
+            if not self._budget_warned:
+                self._budget_warned = True
+                await self._log("budget-warn", verdict.reason)
+                self._file_budget_question(
+                    f"{self.name} is nearing its token budget "
+                    f"({verdict.spent:,}/{verdict.ceiling:,} tokens, "
+                    f"{verdict.scope} scope). Raise the ceiling or let it wind down."
+                )
+            return None
+
+        if not verdict.enforced:
+            # OVER but on_exhaustion == "warn": monitor-only, never stops.
+            if not self._budget_warned:
+                self._budget_warned = True
+                await self._log("budget-over", verdict.reason)
+                self._file_budget_question(
+                    f"{self.name} is OVER its token budget "
+                    f"({verdict.spent:,}/{verdict.ceiling:,} tokens, "
+                    f"{verdict.scope} scope) — monitor-only, not enforced."
+                )
+            return None
+
+        # Enforced OVER: arm the tool-deny gate and park/stop.
+        first = not self._budget_gate_armed
+        self._budget_gate_armed = True
+        self._budget_terminal = verdict.on_exhaustion == "stop"
+        self._last_interrupt_reason = (
+            f"TOKEN BUDGET floor: {verdict.reason}. Operator did NOT reject; "
+            f"the runner cut the dispatch to hold the token ceiling."
+        )
+        if first:
+            if self._budget_terminal:
+                # Terminal: soft-stop after this turn drains (loop teardown
+                # flips status to 'stopped'). Gate stays armed meanwhile.
+                self._stop_requested = True
+                await self._log("budget-stop", verdict.reason)
+                self._file_budget_question(
+                    f"{self.name} hit its token budget and STOPPED "
+                    f"({verdict.spent:,}/{verdict.ceiling:,} tokens, {verdict.scope} scope)."
+                )
+            else:
+                # Resumable park: keep the runner alive, admit no new jobs
+                # until budget_resume(). Distinct status, orthogonal to the
+                # killswitch quiescence proof.
+                self._budget_parked = True
+                self.status = "budget_parked"
+                await self._log("budget-park", verdict.reason)
+                self._file_budget_question(
+                    f"{self.name} hit its token budget and is PARKED "
+                    f"({verdict.spent:,}/{verdict.ceiling:,} tokens, {verdict.scope} scope). "
+                    f"Raise the ceiling / credit tokens to resume."
+                )
+        return (
+            f"\n\n[PARTIAL: token budget floor at {verdict.spent:,}/"
+            f"{verdict.ceiling:,} tokens ({verdict.scope} scope). Agent "
+            f"{'stopped' if self._budget_terminal else 'parked'} — raise the "
+            f"ceiling or credit tokens to resume.]"
+        )
+
+    async def budget_resume(self) -> None:
+        """Explicit operator resume: clear the budget gate + park and wake a
+        queue-blocked loop. Called by the config RPC when the operator raises
+        the ceiling / credits tokens. Never auto-fires — resume is always an
+        operator decision (no implicit unpark)."""
+        self._budget_gate_armed = False
+        self._budget_warned = False
+        self._budget_terminal = False
+        was_parked = self._budget_parked
+        self._budget_parked = False
+        if self.status == "budget_parked":
+            self.status = "idle"
+        if was_parked:
+            with suppress(Exception):
+                self.queue.put_nowait(_STEER_WAKE)
+        await self._log("budget-resume", "budget gate cleared by operator")
+
     def submit(
         self,
         prompt: str,
@@ -2314,6 +2572,25 @@ class AgentRunner:
         max_turns_hint: int | None = None,
         verification_leg: bool = False,
     ) -> Job:
+        # T3.1: mint the correlation id once, here at job creation, as
+        # `<engagement>:<agent>:<epoch>:<seq>`. Each part earns its place:
+        # engagement scopes it; AGENT makes a cross-agent merge structurally
+        # impossible (two runners can hold the same epoch, and without this an
+        # id minted by `scanner` was indistinguishable from one minted by
+        # `nikto` — reconstruct stitched both turns into one chain and called it
+        # complete); EPOCH is durable per-agent (see
+        # `_RunnerFactoryMixin._allocate_runner_epoch`) so it survives a reset
+        # AND a daemon restart; SEQ orders turns within one incarnation.
+        #
+        # The durability of `epoch` is load-bearing, not incidental: it was a
+        # process-local counter until 2026-07-25, so a restart re-minted ids
+        # that already existed on disk. Ids with three parts are pre-fix and
+        # ambiguous — `salient_core.coord.reconstruct` flags them rather than
+        # trusting them.
+        eng = getattr(self, "_engagement_path", None)
+        eng_id = eng.name if eng is not None else "noeng"
+        correlation_id = f"{eng_id}:{self.name}:{self._epoch}:{self._next_corr_seq}"
+        self._next_corr_seq += 1
         job = Job(
             id=self._next_job_id,
             prompt=prompt,
@@ -2322,6 +2599,7 @@ class AgentRunner:
             future=future,
             max_turns_hint=max_turns_hint,
             verification_leg=verification_leg,
+            correlation_id=correlation_id,
         )
         self._next_job_id += 1
         # Don't queue against a dead OR stopping runner — fail the future
@@ -2334,9 +2612,25 @@ class AgentRunner:
         # on status alone would queue a job that strands the caller's future
         # until the bus reaper (prompt_timeout x3). submit() is synchronous up
         # to put_nowait, so checking _stop_requested here is race-free.
+        # A refused submit sets `job.error` as well as failing the future. The
+        # future only exists on the --wait path, so without the error field a
+        # fire-and-forget caller got a Job back that looked queued and was not:
+        # the operator saw "✓ queued task #N" for a prompt that never ran and
+        # was gone after resume. Callers must treat a returned `job.error` as
+        # "not queued". This is the ONLY signal that covers both paths, so
+        # nothing downstream needs to re-derive the refusal by mirroring the
+        # conditions below — a mirrored predicate drifts (the parked branch was
+        # added after the daemon's stopped-only re-check, and the gap is exactly
+        # what let this through).
         if self.status == "stopped" or self._stop_requested:
+            job.error = f"{self.name}: cannot submit, agent is stopping (reset the agent first)"
             if future is not None and not future.done():
-                future.set_exception(RuntimeError(f"{self.name}: cannot submit, agent is stopping"))
+                future.set_exception(RuntimeError(job.error))
+            return job
+        if self._budget_parked:
+            job.error = f"{self.name}: cannot submit, agent is budget-parked (resume it first)"
+            if future is not None and not future.done():
+                future.set_exception(RuntimeError(job.error))
             return job
         self.queue.put_nowait(job)
         return job
@@ -2355,7 +2649,7 @@ class AgentRunner:
         runner — `_stop_requested` (not just status == "stopped") covers the
         teardown disconnect window where the loop has exited but status hasn't
         flipped yet, so a steer can't strand in the lane of a dead loop."""
-        if self.status == "stopped" or self._stop_requested:
+        if self.status == "stopped" or self._stop_requested or self._budget_parked:
             return False
         job = Job(id=self._next_job_id, prompt=text, submitted_at=time.time())
         self._next_job_id += 1
@@ -2398,6 +2692,150 @@ class AgentRunner:
         with suppress(Exception):
             self.queue.put_nowait(None)
         _log.info("agent %s stopped (kill=%s)", self.name, bool(kill))
+
+    async def quiesce(self, *, grace: float = 5.0, force: float = 3.0) -> QuiescenceReport:
+        """Drive this runner to a *provably* dead state and report the evidence
+        (T2.4b). Assumes ``stop(kill=True)`` was already dispatched (flag +
+        backend interrupt + queue nudge); this is the bounded escalation +
+        proof that ``stop()`` deliberately does not block on.
+
+        Ladder: (1) await the task for ``grace`` so its ``_run`` loop can exit
+        cleanly and reach its own ``disconnect()`` + registry drain; (2) on
+        timeout, ``task.cancel()`` — the ONLY thing that injects ``CancelledError``
+        into an in-flight tool coroutine so ``_kill_launch`` reaps its
+        subprocess — then await ``force`` more; (3) build the report, reaping any
+        registered survivor directly (the backstop for a task that swallowed the
+        cancel and never ran its ``finally``).
+
+        Every await is ``shield``-ed so an operator Ctrl-C into the killswitch
+        can't abort the teardown it is trying to observe.
+        """
+        t0 = time.monotonic()
+        task = self._task
+        cancelled = False
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=grace)
+            except TimeoutError:
+                task.cancel()
+                cancelled = True
+                with suppress(
+                    TimeoutError, asyncio.TimeoutError, asyncio.CancelledError, Exception
+                ):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=force)
+            except (asyncio.CancelledError, Exception):
+                # Task already finishing / errored — either way it's terminal.
+                pass
+        return await self._build_quiescence_report(t0, cancelled)
+
+    async def _build_quiescence_report(self, t0: float, cancelled: bool) -> QuiescenceReport:
+        task = self._task
+        task_done = task is None or task.done()
+
+        # SDK CLI subprocess: prove death via os.kill(pid, 0) → ESRCH.
+        sdk_pid: int | None = None
+        sdk_state = "no_pid"
+        backend = self._backend
+        if isinstance(backend, ReapableBackend):
+            with suppress(Exception):
+                sdk_pid = backend.child_pid()
+                if sdk_pid is not None:
+                    sdk_state = "alive" if backend.child_alive() else "proven_dead"
+
+        # Tool subprocesses: reap any survivor (backstop for the wedged/finally-
+        # skipped case), let SIGKILL land, then re-check what's still alive.
+        before = {h.pid for h in proc_registry.registered(self.name)}
+        with suppress(Exception):
+            proc_registry.reap_runner(self.name)
+        if before:
+            await asyncio.sleep(0.05)
+        survived = {h.pid for h in proc_registry.live_survivors(self.name)}
+        reaped = tuple(sorted(before - survived))
+        tool_survived = tuple(sorted(survived))
+        proc_registry.clear_runner(self.name)
+
+        # Tier-2 (kernel-attested): if a cgroup reaper is installed, reap the
+        # runner's cgroup subtree — this catches grandchildren that fork+setsid'd
+        # out of the in-process registry — and PROVE emptiness. cgroup-empty is
+        # the strong quiescence fact (survives reparenting); a non-empty cgroup
+        # after cgroup.kill forces unverified.
+        cgroup_state = "unavailable"
+        reaper = proc_registry.cgroup_reaper()
+        if reaper is not None and getattr(reaper, "available", False):
+            with suppress(Exception):
+                members = reaper.members(self.name)
+                if members:
+                    reaper.kill_runner(self.name)
+                    await asyncio.sleep(0.05)
+                    members = reaper.members(self.name)
+                    cgroup_state = "survivors" if members else "reaped"
+                else:
+                    cgroup_state = "empty"
+                if members:  # cgroup escapees also fail the tool proof
+                    tool_survived = tuple(sorted(set(tool_survived) | set(members)))
+                reaper.remove_runner(self.name)
+
+        if tool_survived or sdk_state == "alive" or cgroup_state == "survivors":
+            state = "unverified"
+        elif task_done:
+            state = "proven_quiescent"
+        else:
+            state = "force_reaped"
+
+        return QuiescenceReport(
+            runner=self.name,
+            task_done=task_done,
+            task_cancelled=cancelled,
+            sdk_pid=sdk_pid,
+            sdk_state=sdk_state,
+            tool_reaped=reaped,
+            tool_survived=tool_survived,
+            state=state,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            cgroup_state=cgroup_state,
+        )
+
+    def snapshot_jobs(self) -> dict[str, Any]:
+        """Non-destructive view of the current + queued jobs for operator
+        listing. Await-free, so under single-threaded asyncio it is an atomic
+        snapshot w.r.t. the run loop (no job can be promoted to current or
+        enqueued mid-read). Reading ``self.queue._queue`` (the underlying
+        deque) is legitimate *inside* the kernel; the skin gets this shaped
+        dict instead of poking asyncio internals.
+
+        The ``current`` block exposes the same flags ``cancel_job`` branches on
+        (``turn_active``, ``interrupt_pending``) so an operator command can
+        classify a cancel outcome from a pre-call snapshot without changing
+        ``cancel_job``'s bool contract. Steer-lane entries are not id-addressable
+        jobs, so only the depth is reported."""
+
+        def _preview(job: "Job") -> str:
+            return (getattr(job, "prompt", "") or "").replace("\n", " ")[:120]
+
+        cur = self.current
+        return {
+            "current": None
+            if cur is None
+            else {
+                "id": cur.id,
+                "prompt_preview": _preview(cur),
+                "turn_active": self._turn_active,
+                "interrupt_pending": self._interrupted_job_id == cur.id,
+                # T3.1: the id an operator feeds to `reconstruct` for the
+                # in-flight turn (see salient_core.coord.reconstruct).
+                "correlation_id": cur.correlation_id,
+            },
+            "queued": [
+                {
+                    "id": item.id,
+                    "prompt_preview": _preview(item),
+                    "correlation_id": item.correlation_id,
+                }
+                for item in self.queue._queue
+                if isinstance(item, Job)
+            ],
+            "steer_lane_depth": len(self._steer_lane),
+        }
 
     async def cancel_job(self, job_id: int) -> bool:
         """Stop one specific job by id. Returns True if it was found.

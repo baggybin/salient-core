@@ -109,7 +109,7 @@ def get_tool_wire_names() -> dict[str, str | list[str]]:
 # tool builder there is a perfectly good kernel default (the local SQLite
 # store), so the unregistered state BUILDS rather than raises. A downstream
 # registers an alternative at startup — e.g. a network client with the same
-# method surface (e.g. a remote KnowledgeGraph client) — and every daemon
+# method surface (salient-mountain's RemoteKnowledgeGraph) — and every daemon
 # that constructs its KG through get_kg_builder() picks it up, with zero
 # changes to the bus tools that consume ``daemon.kg``.
 

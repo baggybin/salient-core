@@ -87,7 +87,7 @@ def _row_count(store: scope.ScopeStore) -> int:
 @pytest.mark.parametrize(
     ("spec", "args", "in_scope", "expected", "rows"),
     [
-        (scope.ExtractorSpec(none=True), {}, False, "allow", 0),
+        (scope.ExtractorSpec(none=True), {}, False, "allow", 1),
         (scope.ExtractorSpec(local_only=True), {}, False, "allow", 1),
         (
             scope.ExtractorSpec(fields={"target": "host"}),
@@ -163,7 +163,7 @@ async def test_internal_and_external_mcp_share_scope_classification_matrix(
 @pytest.mark.parametrize(
     ("spec", "enforce", "expected", "event", "rows"),
     [
-        (scope.ExtractorSpec(none=True), True, None, None, 0),
+        (scope.ExtractorSpec(none=True), True, None, None, 1),
         (scope.ExtractorSpec(local_only=True), True, None, None, 1),
         (scope.ExtractorSpec(fields={"target": "host"}), True, "deny", "builtin_policy_deny", 1),
         (None, False, None, "builtin_policy_shadow", 1),

@@ -77,7 +77,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     prompt       TEXT NOT NULL,
     result       TEXT NOT NULL DEFAULT '',
     error        TEXT,
-    prompt_sha   TEXT                 -- sha256 of the agent's prompt file at run time
+    prompt_sha   TEXT,                -- sha256 of the agent's prompt file at run time
+    correlation_id TEXT,              -- T3.1 spine: joins this job to its turn's chain
+    assembled_prompt_sha TEXT         -- T3.1 spine: sha of the ASSEMBLED prompt the model ran under
 );
 CREATE INDEX IF NOT EXISTS jobs_by_agent_time ON jobs(agent, submitted_at DESC);
 -- Prompt-drift provenance: each DISTINCT per-agent prompt-file body an
@@ -109,7 +111,8 @@ CREATE TABLE IF NOT EXISTS questions (
     answered_at   REAL,
     answer        TEXT,
     answer_job_id INTEGER,
-    answered_by   TEXT
+    answered_by   TEXT,
+    correlation_id TEXT               -- T3.1 spine: joins this question to its turn's chain
 );
 CREATE INDEX IF NOT EXISTS questions_pending
     ON questions(answered_at) WHERE answered_at IS NULL;
@@ -126,10 +129,87 @@ CREATE TABLE IF NOT EXISTS approval_bypass (
     gate          TEXT NOT NULL,          -- 'agent_start' | 'delegation'
     prompt        TEXT,                   -- truncated snippet
     trust_scope   TEXT,                   -- 'all' | 'list'
-    engagement_id TEXT
+    engagement_id TEXT,
+    correlation_id TEXT                    -- T3.1 spine: joins this bypass to its turn's chain
 );
 CREATE INDEX IF NOT EXISTS approval_bypass_by_ts
     ON approval_bypass(ts DESC);
+-- T3.1 spine: the joinable audit mirror. Holds the audit records that have NO
+-- native state.db home — scope denies (authoritative row lives in the separate,
+-- fail-closed scope.db; this is a best-effort MIRROR, cross-checked by
+-- correlation_id) and safeguard blocks (which have NO durable home but this,
+-- so a dropped row here is real loss — callers must surface, never swallow
+-- silently). operator answers (questions) and trust bypasses (approval_bypass)
+-- already carry correlation_id natively and are NOT mirrored here. `seq` is a
+-- per-correlation monotonic tiebreaker so a reconstructed chain has a total
+-- order despite same-ts collisions. `tool_use_id` is the idempotency key: one
+-- terminal deny per tool call → INSERT OR IGNORE can't double-count.
+CREATE TABLE IF NOT EXISTS audit_mirror (
+    rowid          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    seq            INTEGER NOT NULL,       -- per-correlation monotonic tiebreaker
+    op             TEXT NOT NULL,          -- 'scope_deny' | 'safeguard_block'
+    agent          TEXT NOT NULL,
+    correlation_id TEXT,
+    tool           TEXT,
+    target         TEXT,
+    reason         TEXT,
+    tool_use_id    TEXT,                   -- idempotency key (one deny per tool call)
+    engagement_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_mirror_by_correlation
+    ON audit_mirror(correlation_id, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS audit_mirror_by_tool_use
+    ON audit_mirror(tool_use_id) WHERE tool_use_id IS NOT NULL;
+-- T3.1 spine: remote tool calls forwarded to an enrolled worker over the
+-- reverse-WSS hub. The remote factory records one row per call (with its wire
+-- msg_id + session + outcome) so reconstruct can show which turn reached which
+-- host. Best-effort, like the audit mirror — a failed record must never break
+-- the tool call.
+CREATE TABLE IF NOT EXISTS remote_calls (
+    rowid          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    correlation_id TEXT,
+    agent          TEXT,
+    session_id     TEXT,
+    msg_id         TEXT,               -- the wire call id (joins to the worker's result)
+    tool           TEXT NOT NULL,      -- 'remote.read_file' | 'remote.run_command' | …
+    outcome        TEXT,               -- 'result' | 'denied' | 'error'
+    detail         TEXT,               -- denied code/reason or error text, truncated
+    engagement_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS remote_calls_by_correlation
+    ON remote_calls(correlation_id, ts);
+-- T3.1 spine: a REAL per-turn usage/cost ledger (distinct from BudgetLedger,
+-- which is a tokens-only idempotency-keyed enforcement accumulator). One row per
+-- completed turn: tokens + cost + model + correlation_id, so reconstruct can
+-- answer "what did turn N cost" and the operator can total spend by agent/turn.
+-- Append-only, best-effort.
+CREATE TABLE IF NOT EXISTS usage_ledger (
+    rowid          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    agent          TEXT NOT NULL,
+    model          TEXT,
+    correlation_id TEXT,
+    input_tokens         INTEGER NOT NULL DEFAULT 0,
+    output_tokens        INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens    INTEGER NOT NULL DEFAULT 0,
+    cache_create_tokens  INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens     INTEGER NOT NULL DEFAULT 0,
+    -- BACKEND-REPORTED, and NOT the sum of the columns above. Codex reports
+    -- context occupancy here; the Claude backend reports nothing, so the column
+    -- is NULL for most rows. Do not "fix" that by synthesising a per-turn sum —
+    -- one column would then mean two different things depending on the backend.
+    -- Consumers that want a per-turn total add the four charged categories
+    -- (see `usage_totals_by_agent`, and `usage_totals` in coord/reconstruct).
+    total_tokens   INTEGER,
+    cost_usd       REAL,
+    engagement_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS usage_ledger_by_correlation
+    ON usage_ledger(correlation_id, ts);
+CREATE INDEX IF NOT EXISTS usage_ledger_by_agent
+    ON usage_ledger(agent, ts);
 """
 
 
@@ -219,7 +299,98 @@ class ContextStore:
             self._migrate_events_engagement_id()
             self._migrate_jobs_prompt_sha()
             self._migrate_questions_answered_by()
+            self._migrate_correlation_id()
+            self._backfill_question_correlation_id()
+            self._migrate_jobs_assembled_prompt_sha()
             self._hydrate()
+
+    def _migrate_jobs_assembled_prompt_sha(self) -> None:
+        """Additive migration (T3.1 spine): pre-spine DBs have no
+        `assembled_prompt_sha` column on `jobs`. Old rows get NULL — they
+        predate the assembled-prompt provenance (correct)."""
+        assert self._conn is not None
+        try:
+            with self._lock, self._txn() as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+                if "assembled_prompt_sha" not in cols:
+                    conn.execute("ALTER TABLE jobs ADD COLUMN assembled_prompt_sha TEXT")
+        except sqlite3.Error as e:
+            self._mark_degraded("migration", e)
+
+    def _migrate_correlation_id(self) -> None:
+        """Additive migration (T3.1 spine): add the `correlation_id` column to
+        `jobs`, `questions`, and `approval_bypass` on pre-spine DBs. Old rows
+        get NULL (they predate the correlation id — correct, and reconstruct
+        treats NULL as 'no chain')."""
+        assert self._conn is not None
+        for table in ("jobs", "questions", "approval_bypass"):
+            try:
+                with self._lock, self._txn() as conn:
+                    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                    if "correlation_id" not in cols:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN correlation_id TEXT")
+                    conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS {table}_by_correlation "
+                        f"ON {table}(correlation_id)"
+                    )
+            except sqlite3.Error as e:
+                # A failed additive migration leaves the DB on the old shape;
+                # later writes may drop the column. Flip health so it's not
+                # silently invisible.
+                self._mark_degraded("migration", e)
+
+    def _backfill_question_correlation_id(self) -> None:
+        """One-shot forensic recovery (T3.1 spine): questions written before the
+        `add_question` correlation fix stored their `job_id` but a NULL
+        `correlation_id`, so they never joined into their turn's reconstruction.
+        The turn is not lost — the surviving `(agent, job_id)` anchor still
+        points at exactly one `jobs` row that carries the correlation. Back-fill
+        from it, but ONLY when the mapping is unambiguous:
+
+          - `job_id != 0` (job_id 0 = raised while idle → belongs to no turn),
+          - the source job carries a non-NULL correlation, and
+          - that `(agent, job_id)` maps to exactly ONE distinct correlation.
+
+        A `reset`/restart that restarts a runner's job counter is the only thing
+        that could make `(agent, job_id)` ambiguous; the correlation's epoch
+        segment keeps those distinct, so the `HAVING COUNT(DISTINCT ...) = 1`
+        guard leaves any such row NULL rather than guessing a false join. The
+        back-filled value is provably identical to what the fixed `add_question`
+        now writes (same job row → same turn). Idempotent: already-joined rows
+        are skipped by the WHERE clause, so re-running on boot is a no-op."""
+        assert self._conn is not None
+        try:
+            with self._lock, self._txn() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE questions SET correlation_id = (
+                        SELECT j.correlation_id FROM jobs j
+                        WHERE j.agent = questions.agent
+                          AND j.job_id = questions.job_id
+                          AND j.correlation_id IS NOT NULL
+                        GROUP BY j.agent, j.job_id
+                        HAVING COUNT(DISTINCT j.correlation_id) = 1
+                    )
+                    WHERE (correlation_id IS NULL OR correlation_id = '')
+                      AND job_id != 0
+                      AND EXISTS (
+                        SELECT 1 FROM jobs j2
+                        WHERE j2.agent = questions.agent
+                          AND j2.job_id = questions.job_id
+                          AND j2.correlation_id IS NOT NULL
+                        GROUP BY j2.agent, j2.job_id
+                        HAVING COUNT(DISTINCT j2.correlation_id) = 1
+                      )
+                    """
+                )
+                if cur.rowcount:
+                    _log.info(
+                        "reconstruct: recovered correlation_id for %d pre-fix "
+                        "question(s) from the jobs anchor",
+                        cur.rowcount,
+                    )
+        except sqlite3.Error as e:
+            self._mark_degraded("migration", e)
 
     def _migrate_questions_answered_by(self) -> None:
         """Additive migration: pre-multi-operator DBs have no `answered_by`
@@ -668,6 +839,8 @@ class ContextStore:
         result: str,
         error: str | None,
         prompt_sha: str | None = None,
+        correlation_id: str | None = None,
+        assembled_prompt_sha: str | None = None,
     ) -> None:
         """Persist a completed (or failed) job row. INSERT-only; we
         don't update in place because runner-local job_id resets across
@@ -675,7 +848,9 @@ class ContextStore:
 
         `prompt_sha` is the sha256 of the agent's prompt-file body at the
         time the runner was constructed — provenance for "what prompt did
-        this job run under?"."""
+        this job run under?". `correlation_id` (T3.1) joins the row to the
+        turn's causal chain. `assembled_prompt_sha` (T3.1) is the sha of the
+        full ASSEMBLED prompt the model ran under (file body + all addenda)."""
         if self._conn is None:
             return
         try:
@@ -686,8 +861,9 @@ class ContextStore:
                 with self._txn() as conn:
                     conn.execute(
                         "INSERT INTO jobs (agent, job_id, submitted_at, started_at, "
-                        "finished_at, prompt, result, error, prompt_sha) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "finished_at, prompt, result, error, prompt_sha, correlation_id, "
+                        "assembled_prompt_sha) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             agent,
                             job_id,
@@ -698,6 +874,8 @@ class ContextStore:
                             result or "",
                             error,
                             prompt_sha,
+                            correlation_id,
+                            assembled_prompt_sha,
                         ),
                     )
         except sqlite3.Error as e:
@@ -755,7 +933,8 @@ class ContextStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT job_id, prompt, submitted_at, started_at, finished_at, "
-                "result, error FROM jobs WHERE agent = ? "
+                "result, error, correlation_id, assembled_prompt_sha "
+                "FROM jobs WHERE agent = ? "
                 "ORDER BY submitted_at DESC LIMIT ?",
                 (agent, max(1, int(limit))),
             ).fetchall()
@@ -768,6 +947,8 @@ class ContextStore:
                 "finished_at": r[4],
                 "result": r[5] or "",
                 "error": r[6],
+                "correlation_id": r[7],
+                "assembled_prompt_sha": r[8],
             }
             for r in rows
         ]
@@ -780,6 +961,7 @@ class ContextStore:
         job_id: int,
         kind: str,
         asked_at: float,
+        correlation_id: str | None = None,
     ) -> None:
         if self._conn is None:
             return
@@ -788,9 +970,9 @@ class ContextStore:
                 with self._txn() as conn:
                     conn.execute(
                         "INSERT OR REPLACE INTO questions "
-                        "(id, agent, text, job_id, kind, asked_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (qid, agent, text, job_id, kind, asked_at),
+                        "(id, agent, text, job_id, kind, asked_at, correlation_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (qid, agent, text, job_id, kind, asked_at, correlation_id),
                     )
         except sqlite3.Error as e:
             self._mark_degraded("question", e)
@@ -828,8 +1010,8 @@ class ContextStore:
             return []
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, agent, text, job_id, kind, asked_at FROM questions "
-                "WHERE answered_at IS NULL ORDER BY id"
+                "SELECT id, agent, text, job_id, kind, asked_at, correlation_id "
+                "FROM questions WHERE answered_at IS NULL ORDER BY id"
             ).fetchall()
         return [
             {
@@ -839,6 +1021,7 @@ class ContextStore:
                 "job_id": r[3],
                 "kind": r[4],
                 "asked_at": r[5],
+                "correlation_id": r[6],
             }
             for r in rows
         ]
@@ -879,9 +1062,11 @@ class ContextStore:
         gate: str,
         prompt: str,
         trust_scope: str,
+        correlation_id: str | None = None,
     ) -> None:
         """Persist one bus_trusted approval-gate bypass (D-1). Best-effort,
-        like record_event — an audit write must never crash the delegation."""
+        like record_event — an audit write must never crash the delegation.
+        `correlation_id` (T3.1) joins the bypass to its turn's causal chain."""
         if self._conn is None:
             return
         try:
@@ -890,7 +1075,7 @@ class ContextStore:
                     conn.execute(
                         "INSERT INTO approval_bypass "
                         "(ts, caller, target, gate, prompt, trust_scope, "
-                        "engagement_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "engagement_id, correlation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             time.time(),
                             caller,
@@ -899,10 +1084,383 @@ class ContextStore:
                             prompt,
                             trust_scope,
                             self._engagement_id,
+                            correlation_id,
                         ),
                     )
         except sqlite3.Error as e:
             self._mark_degraded("approval_bypass", e)
+
+    def record_audit_mirror(
+        self,
+        *,
+        op: str,
+        agent: str,
+        correlation_id: str | None,
+        tool: str | None = None,
+        target: str | None = None,
+        reason: str | None = None,
+        tool_use_id: str | None = None,
+    ) -> bool:
+        """Persist one T3.1 audit-mirror row (op='scope_deny'|'safeguard_block').
+
+        Best-effort — like record_bypass, the write must NEVER raise into the
+        caller's control path. Idempotent on ``tool_use_id`` (INSERT OR IGNORE),
+        so a stray second call for the same tool call can't double-count. ``seq``
+        is a per-correlation monotonic tiebreaker computed under the lock.
+
+        Returns True when the row is persisted (or is an idempotent no-op, or no
+        DB is attached — a deliberate ephemeral config where reconstruct is
+        unavailable anyway), False ONLY when a DB is attached but the write
+        failed (sqlite3.Error). The caller surfaces a False for ``safeguard_block``
+        as a real gap. (safeguard_block also gets a non-joinable JSONL safeguard
+        audit at the hook, so this mirror is its JOINABLE copy, not sole record;
+        scope_deny's authoritative row lives in scope.db and the reconstruct
+        cross-check compares COUNTS per correlation_id — it does not need a
+        row-level twin key, so ``seq`` is only a within-correlation tiebreaker.)
+        """
+        if self._conn is None:
+            return True  # no durable store configured — nothing to persist
+        try:
+            with self._lock:
+                if self._conn is None:
+                    return True
+                with self._txn() as conn:
+                    # Per-correlation seq under the lock → race-free within the
+                    # single writer. MAX+1 (not COUNT) stays monotonic even if
+                    # audit_mirror ever gets retention pruning, so a reused seq
+                    # can't collide on (correlation_id, seq).
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) FROM audit_mirror WHERE correlation_id IS ?",
+                        (correlation_id,),
+                    ).fetchone()
+                    seq = int(row[0]) + 1
+                    conn.execute(
+                        "INSERT OR IGNORE INTO audit_mirror "
+                        "(ts, seq, op, agent, correlation_id, tool, target, reason, "
+                        "tool_use_id, engagement_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            time.time(),
+                            seq,
+                            op,
+                            agent,
+                            correlation_id,
+                            tool,
+                            target,
+                            reason,
+                            tool_use_id,
+                            self._engagement_id,
+                        ),
+                    )
+            return True
+        except sqlite3.Error as e:
+            self._mark_degraded("audit_mirror", e)
+            return False
+
+    def load_audit_mirror(self, correlation_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Return the audit-mirror rows for one correlation id, oldest→newest by
+        (seq, ts). Empty without a DB. Feeds the reconstruct chain (PR6)."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, seq, op, agent, correlation_id, tool, target, reason, "
+                "tool_use_id FROM audit_mirror WHERE correlation_id = ? "
+                "ORDER BY seq, ts LIMIT ?",
+                (correlation_id, max(1, min(int(limit), 5000))),
+            ).fetchall()
+        return [
+            {
+                "ts": r[0],
+                "seq": r[1],
+                "op": r[2],
+                "agent": r[3],
+                "correlation_id": r[4],
+                "tool": r[5],
+                "target": r[6],
+                "reason": r[7],
+                "tool_use_id": r[8],
+            }
+            for r in rows
+        ]
+
+    def record_remote_call(
+        self,
+        *,
+        correlation_id: str | None,
+        agent: str | None,
+        session_id: str | None,
+        msg_id: str | None,
+        tool: str,
+        outcome: str | None = None,
+        detail: str | None = None,
+    ) -> bool:
+        """Persist one T3.1 remote-call row (a remote.* tool forwarded to a
+        worker). Best-effort — the write must NEVER raise into the tool call.
+        Returns False only when a DB is attached but the write failed."""
+        if self._conn is None:
+            return True
+        try:
+            with self._lock:
+                if self._conn is None:
+                    return True
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO remote_calls "
+                        "(ts, correlation_id, agent, session_id, msg_id, tool, "
+                        "outcome, detail, engagement_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            time.time(),
+                            correlation_id,
+                            agent,
+                            session_id,
+                            msg_id,
+                            tool,
+                            outcome,
+                            detail[:500] if detail else None,
+                            self._engagement_id,
+                        ),
+                    )
+            return True
+        except sqlite3.Error as e:
+            self._mark_degraded("remote_call", e)
+            return False
+
+    def load_remote_calls(self, correlation_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Return the remote-call rows for one correlation id, oldest→newest.
+        Empty without a DB. Feeds the reconstruct chain (PR6)."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, correlation_id, agent, session_id, msg_id, tool, "
+                "outcome, detail FROM remote_calls WHERE correlation_id = ? "
+                "ORDER BY ts LIMIT ?",
+                (correlation_id, max(1, min(int(limit), 5000))),
+            ).fetchall()
+        return [
+            {
+                "ts": r[0],
+                "correlation_id": r[1],
+                "agent": r[2],
+                "session_id": r[3],
+                "msg_id": r[4],
+                "tool": r[5],
+                "outcome": r[6],
+                "detail": r[7],
+            }
+            for r in rows
+        ]
+
+    def audit_summary(self) -> dict[str, int]:
+        """T3.1: aggregate audit-surface counts for the sitrep audit panel —
+        safeguard blocks / scope denials / trust bypasses / remote calls, plus
+        ``audit_failures`` (audit-record writes swallowed by _mark_degraded — a
+        non-zero value means audit rows are silently vanishing). Cheap COUNTs;
+        all-zero without a DB or on any read error (never raises)."""
+        out = {
+            "safeguard_blocks": 0,
+            "scope_denies": 0,
+            "trust_bypasses": 0,
+            "remote_calls": 0,
+            "audit_failures": 0,
+        }
+        conn = self._conn
+        if conn is not None:
+            try:
+                with self._lock:
+
+                    def _c(sql: str) -> int:
+                        return int(conn.execute(sql).fetchone()[0])
+
+                    out["safeguard_blocks"] = _c(
+                        "SELECT COUNT(*) FROM audit_mirror WHERE op='safeguard_block'"
+                    )
+                    out["scope_denies"] = _c(
+                        "SELECT COUNT(*) FROM audit_mirror WHERE op='scope_deny'"
+                    )
+                    out["trust_bypasses"] = _c("SELECT COUNT(*) FROM approval_bypass")
+                    out["remote_calls"] = _c("SELECT COUNT(*) FROM remote_calls")
+            except sqlite3.Error:
+                pass
+        with self._health_lock:
+            out["audit_failures"] = sum(
+                self._degraded_sinks.get(op, 0)
+                for op in ("audit_mirror", "remote_call", "usage_ledger", "approval_bypass")
+            )
+        return out
+
+    def record_usage(
+        self,
+        *,
+        agent: str,
+        model: str | None,
+        correlation_id: str | None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_create_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        total_tokens: int | None = None,
+        cost_usd: float | None = None,
+    ) -> bool:
+        """Persist one per-turn usage/cost row (T3.1). Best-effort — the write
+        must NEVER raise into the turn loop. Distinct from BudgetLedger: this is
+        a durable audit ledger (cost/model/timestamp/correlation), NOT the
+        idempotency-keyed enforcement accumulator. Returns False only when a DB
+        is attached but the write failed."""
+        if self._conn is None:
+            return True
+        try:
+            with self._lock:
+                if self._conn is None:
+                    return True
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO usage_ledger "
+                        "(ts, agent, model, correlation_id, input_tokens, "
+                        "output_tokens, cache_read_tokens, cache_create_tokens, "
+                        "reasoning_tokens, total_tokens, cost_usd, engagement_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            time.time(),
+                            agent,
+                            model,
+                            correlation_id,
+                            int(input_tokens),
+                            int(output_tokens),
+                            int(cache_read_tokens),
+                            int(cache_create_tokens),
+                            int(reasoning_tokens),
+                            total_tokens,
+                            cost_usd,
+                            self._engagement_id,
+                        ),
+                    )
+            return True
+        except sqlite3.Error as e:
+            self._mark_degraded("usage_ledger", e)
+            return False
+
+    def load_usage(self, correlation_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Return per-turn usage rows for one correlation id, oldest→newest.
+        Empty without a DB. Feeds the reconstruct chain (PR6)."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, agent, model, correlation_id, input_tokens, "
+                "output_tokens, cache_read_tokens, cache_create_tokens, "
+                "reasoning_tokens, total_tokens, cost_usd "
+                "FROM usage_ledger WHERE correlation_id = ? ORDER BY ts LIMIT ?",
+                (correlation_id, max(1, min(int(limit), 5000))),
+            ).fetchall()
+        return [
+            {
+                "ts": r[0],
+                "agent": r[1],
+                "model": r[2],
+                "correlation_id": r[3],
+                "input_tokens": r[4],
+                "output_tokens": r[5],
+                "cache_read_tokens": r[6],
+                "cache_create_tokens": r[7],
+                "reasoning_tokens": r[8],
+                "total_tokens": r[9],
+                "cost_usd": r[10],
+            }
+            for r in rows
+        ]
+
+    def usage_totals_by_agent(self) -> dict[str, dict[str, int]]:
+        """Per-agent lifetime totals from the usage ledger: ``{agent: {"turns":
+        n, "tokens": t}}``. Empty without a DB.
+
+        ``tokens`` uses the same four categories the budget ledger charges
+        (input + output + cache-create + cache-read), so the two accountings are
+        directly comparable — that is the whole point. They record the same
+        turns by different routes (the budget ledger is a synchronous
+        enforcement accumulator, this is a best-effort audit ledger), and for
+        most of their life nothing checked that they agreed. See
+        ``_RunnerFactoryMixin.budget_reconcile``.
+        """
+        if self._conn is None:
+            return {}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT agent, COUNT(*), "
+                "SUM(input_tokens + output_tokens + cache_create_tokens + cache_read_tokens) "
+                "FROM usage_ledger GROUP BY agent"
+            ).fetchall()
+        return {r[0]: {"turns": int(r[1] or 0), "tokens": int(r[2] or 0)} for r in rows}
+
+    def load_jobs_for_correlation(self, correlation_id: str) -> list[dict[str, Any]]:
+        """T3.1: the job row(s) for one correlation id (normally one — the id is
+        minted per job). Feeds reconstruct."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT job_id, agent, prompt, submitted_at, started_at, finished_at, "
+                "result, error, prompt_sha, assembled_prompt_sha "
+                "FROM jobs WHERE correlation_id = ? ORDER BY submitted_at",
+                (correlation_id,),
+            ).fetchall()
+        return [
+            {
+                "job_id": r[0],
+                "agent": r[1],
+                "prompt": r[2],
+                "submitted_at": r[3],
+                "started_at": r[4],
+                "finished_at": r[5],
+                "result": r[6] or "",
+                "error": r[7],
+                "prompt_sha": r[8],
+                "assembled_prompt_sha": r[9],
+            }
+            for r in rows
+        ]
+
+    def load_questions_for_correlation(self, correlation_id: str) -> list[dict[str, Any]]:
+        """T3.1: operator questions (answered or not) for one correlation id."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, agent, text, kind, asked_at, answered_at, answer, answered_by "
+                "FROM questions WHERE correlation_id = ? ORDER BY asked_at",
+                (correlation_id,),
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "agent": r[1],
+                "text": r[2],
+                "kind": r[3],
+                "asked_at": r[4],
+                "answered_at": r[5],
+                "answer": r[6],
+                "answered_by": r[7],
+            }
+            for r in rows
+        ]
+
+    def load_bypasses_for_correlation(self, correlation_id: str) -> list[dict[str, Any]]:
+        """T3.1: trust-bypass rows for one correlation id."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, caller, target, gate, trust_scope "
+                "FROM approval_bypass WHERE correlation_id = ? ORDER BY ts",
+                (correlation_id,),
+            ).fetchall()
+        return [
+            {"ts": r[0], "caller": r[1], "target": r[2], "gate": r[3], "trust_scope": r[4]}
+            for r in rows
+        ]
 
     def load_bypasses(
         self,
@@ -929,7 +1487,7 @@ class ContextStore:
             where.append("ts >= ?")
             params.append(float(since_ts))
         sql = (
-            "SELECT ts, caller, target, gate, prompt, trust_scope "
+            "SELECT ts, caller, target, gate, prompt, trust_scope, correlation_id "
             "FROM approval_bypass"
             + (" WHERE " + " AND ".join(where) if where else "")
             + " ORDER BY ts DESC LIMIT ?"
@@ -945,6 +1503,7 @@ class ContextStore:
                 "gate": r[3],
                 "prompt": r[4],
                 "trust_scope": r[5],
+                "correlation_id": r[6],
             }
             for r in rows
         ]

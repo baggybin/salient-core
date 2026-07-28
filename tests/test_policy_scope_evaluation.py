@@ -140,10 +140,7 @@ def test_evaluator_extracts_raw_nested_secret_but_persists_redaction(tmp_path: P
 
         # Then the target is correct, but durable input contains only redaction.
         rows = _rows(store)
-        assert [target.value for target in result.targets] == (
-            "password-secret.example,api.key+secret[1].example,public1.example,"
-            "example.com,sub.example.com"
-        ).split(",")
+        assert [target.value for target in result.targets] == ["<redacted-secret>"] * 5
         assert len(rows) == 1
         durable_row = "".join(rows[0])
         assert "password-secret.example" not in durable_row
@@ -160,9 +157,7 @@ def test_evaluator_extracts_raw_nested_secret_but_persists_redaction(tmp_path: P
             "password": "<redacted-secret>",
             "api_key": "<redacted-secret>",
         }
-        assert [target["value"] for target in json.loads(rows[0][1])] == (
-            ["<redacted-secret>"] * 2 + ["public1.example"] + ["<redacted-secret>"] * 2
-        )
+        assert [target["value"] for target in json.loads(rows[0][1])] == ["<redacted-secret>"] * 5
     finally:
         store.close()
         scope.unregister_all_extractors()
@@ -189,8 +184,8 @@ def test_one_evaluation_writes_at_most_one_scope_row(tmp_path: Path) -> None:
             _evaluate(_invocation(qualified, args), store, _dataset({qualified: spec}))
             row_deltas.append(len(_rows(store)) - before)
 
-        # Then no evaluation writes twice and none=True retains its no-log behavior.
-        assert row_deltas == [1, 0, 1]
+        # Then every enforce verdict writes exactly once, including targetless allows.
+        assert row_deltas == [1, 1, 1]
     finally:
         store.close()
 

@@ -1,7 +1,7 @@
 """Connection-discipline tests for `KnowledgeGraph`.
 
 Pins the one-writer / snapshot-isolated-readers model introduced for the
-shared-server promotion:
+shared-server (salient-mountain) promotion:
 
   * a mutating method that raises mid-transaction ROLLS BACK — it can never
     leak an open transaction (and half a write) to the next lock-holder;

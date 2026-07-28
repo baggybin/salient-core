@@ -43,19 +43,42 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+from . import _scope_schema
+from . import resource_identity as _resource_identity
+from ._authorization_snapshot import (
+    DEFAULT_INTERNAL_TLDS,
+    AuthorizationSnapshot,
+    Direction,
+    Origin,
+    ResearchPolicy,
+    RuleKind,
+    ScopeRule,
+    ScopeSnapshotCompatibilityError,
+    ScopeSnapshotError,
+    ScopeSnapshotStaleError,
+    SnapshotDraft,
+    build_snapshot,
+    parse_credential_bindings,
+    parse_snapshot,
+    snapshot_payload,
+    stable_rule_id,
+)
+from ._scope_schema import ScopeRuleSchemaError
 from .decision import InvocationIdentity, InvocationTransport, ToolInvocation
 from .scope_evaluation import evaluate_scope
 from .scope_placeholders import unresolved_operator_infra_placeholder
+
+ResourceIdentityError = _resource_identity.ResourceIdentityError
+SCHEMA = _scope_schema.SCHEMA
 
 if TYPE_CHECKING:
     from .registry import PolicyDataset
 
 # ─── data model ─────────────────────────────────────────────────────────────
 
-TargetKind = Literal["ip", "network", "host", "url", "wifi_bssid", "wifi_ssid"]
-RuleKind = Literal["network", "host_glob", "host_exact", "wifi_bssid", "wifi_ssid"]
-Direction = Literal["in", "out"]
-Origin = Literal["engagement", "adhoc"]
+TargetKind = Literal[
+    "ip", "network", "host", "url", "wifi_bssid", "wifi_ssid", "repo", "cloud", "saas"
+]
 Verdict = Literal["allow", "deny"]
 
 
@@ -72,26 +95,208 @@ class Target:
     source_field: str  # which arg field this came from, for error messages
 
 
-@dataclass(frozen=True)
-class ScopeRule:
-    pattern: str
-    kind: RuleKind
-    direction: Direction
-    origin: Origin
-    added_by: str
-    added_at: float
-    expires_at: float | None = None
-    one_shot: bool = False
-    consumed_at: float | None = None
-    reason: str = ""
+@dataclass(frozen=True, slots=True)
+class TargetIdentity:
+    """Stable target identity without extractor-local source metadata."""
 
-    def is_active(self, now: float | None = None) -> bool:
-        now = now if now is not None else time.time()
-        if self.expires_at is not None and now >= self.expires_at:
-            return False
-        if self.one_shot and self.consumed_at is not None:
-            return False
-        return True
+    kind: TargetKind
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderTargetBinding:
+    """Policy-authorized target identity for one canonical provider."""
+
+    provider: str
+    target: TargetIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class CrossTenantGrant:
+    """One exact provider, principal, tenant, and resource authorization."""
+
+    provider: str
+    principal: TargetIdentity
+    principal_tenant: str
+    resource: TargetIdentity
+    resource_tenant: str
+
+
+@dataclass(frozen=True, slots=True)
+class PrincipalResourceRequirement:
+    """Target kinds that must be joined by a principal-resource fact."""
+
+    provider_kind: TargetKind
+    principal_kind: TargetKind
+    resource_kind: TargetKind
+
+
+@dataclass(frozen=True, slots=True)
+class PrincipalResourceRelationship:
+    """Extractor-observed provider, principal, tenant, and resource relationship."""
+
+    provider: Target
+    principal: Target
+    principal_provider: str
+    principal_tenant: str
+    resource: Target
+    resource_provider: str
+    resource_tenant: str
+    credential_binding_id: str | None = None
+    credential_configuration_id: str | None = None
+    principal_identity: str | None = None
+    source_field: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionResult:
+    """Compound extraction output consumed by the single scope evaluator."""
+
+    targets: tuple[Target, ...] = ()
+    relationships: tuple[PrincipalResourceRelationship, ...] = ()
+
+    def __post_init__(self) -> None:
+        binding_id_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+        for target in self.targets:
+            _validate_extracted_target(target)
+        for relationship in self.relationships:
+            _validate_extracted_target(relationship.provider)
+            _validate_extracted_target(relationship.principal)
+            _validate_extracted_target(relationship.resource)
+            binding_id = relationship.credential_binding_id
+            if binding_id is not None and (
+                type(binding_id) is not str or binding_id_pattern.fullmatch(binding_id) is None
+            ):
+                raise ExtractorError("credential binding selector is malformed")
+            for name, value in (
+                ("principal provider", relationship.principal_provider),
+                ("principal tenant", relationship.principal_tenant),
+                ("resource provider", relationship.resource_provider),
+                ("resource tenant", relationship.resource_tenant),
+                ("credential configuration", relationship.credential_configuration_id),
+                ("principal identity", relationship.principal_identity),
+            ):
+                if value is not None and (
+                    type(value) is not str
+                    or not value
+                    or value != value.strip()
+                    or len(value) > 512
+                    or any(unicodedata.category(character).startswith("C") for character in value)
+                ):
+                    raise ExtractorError(f"relationship {name} is malformed")
+
+
+def _validate_extracted_target(target: object) -> None:
+    target_kinds = frozenset(get_args(TargetKind))
+    if type(target) is not Target:
+        raise ExtractorError("registered extractor target is malformed")
+    if type(target.value) is str and not target.value.strip():
+        raise ExtractorError(f"empty target value emitted for kind {target.kind!r}")
+    if (
+        type(target.kind) is not str
+        or target.kind not in target_kinds
+        or type(target.value) is not str
+        or target.value != target.value.strip()
+        or len(target.value) > 4096
+        or any(unicodedata.category(character).startswith("C") for character in target.value)
+        or type(target.source_field) is not str
+        or not target.source_field
+        or target.source_field != target.source_field.strip()
+        or len(target.source_field) > 512
+        or any(unicodedata.category(character).startswith("C") for character in target.source_field)
+    ):
+        raise ExtractorError("registered extractor target is malformed")
+
+
+def _anchor_registered_extraction(
+    extracted: list[Target] | ExtractionResult,
+    field: str,
+) -> ExtractionResult:
+    match extracted:
+        case ExtractionResult(targets=targets, relationships=relationships):
+            anchored_targets = tuple(replace(target, source_field=field) for target in targets)
+            target_map = dict(zip(targets, anchored_targets, strict=True))
+            anchored_relationships = tuple(
+                replace(
+                    relationship,
+                    provider=target_map.get(
+                        relationship.provider,
+                        replace(relationship.provider, source_field=field),
+                    ),
+                    principal=target_map.get(
+                        relationship.principal,
+                        replace(relationship.principal, source_field=field),
+                    ),
+                    resource=target_map.get(
+                        relationship.resource,
+                        replace(relationship.resource, source_field=field),
+                    ),
+                    source_field=field,
+                )
+                for relationship in relationships
+            )
+            return ExtractionResult(anchored_targets, anchored_relationships)
+        case list() as targets:
+            for target in targets:
+                _validate_extracted_target(target)
+            return ExtractionResult(
+                tuple(replace(target, source_field=field) for target in targets)
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalModeContractError(ValueError):
+    """An external mode contract is ambiguous or cannot require authorization."""
+
+    reason: str
+
+    def __str__(self) -> str:
+        return self.reason
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalModeVariant:
+    """Exact output and relationship floor for one external execution mode."""
+
+    selector: str
+    required_target_kinds: frozenset[TargetKind]
+    required_relationships: tuple[PrincipalResourceRequirement, ...] = ()
+    cross_tenant_grants: tuple[CrossTenantGrant, ...] = ()
+    provider_bindings: tuple[ProviderTargetBinding, ...] = ()
+    credential_binding_required: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.selector:
+            raise ExternalModeContractError("external mode selector cannot be empty")
+        if not self.required_target_kinds:
+            raise ExternalModeContractError(
+                f"external mode {self.selector!r} requires at least one target kind"
+            )
+        providers = tuple(binding.provider for binding in self.provider_bindings)
+        if len(frozenset(providers)) != len(providers):
+            raise ExternalModeContractError(
+                f"external mode {self.selector!r} provider bindings must be unique"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalModeContract:
+    """Closed selector-to-contract mapping for externally reaching modes."""
+
+    selector_field: str
+    variants: tuple[ExternalModeVariant, ...]
+
+    def __post_init__(self) -> None:
+        if not self.selector_field:
+            raise ExternalModeContractError("external mode selector field cannot be empty")
+        selectors = tuple(variant.selector for variant in self.variants)
+        if not selectors:
+            raise ExternalModeContractError("external mode contract requires a variant")
+        if len(frozenset(selectors)) != len(selectors):
+            raise ExternalModeContractError("external mode selectors must be unique")
+
+    def resolve(self, selector: str) -> ExternalModeVariant | None:
+        return next((variant for variant in self.variants if variant.selector == selector), None)
 
 
 @dataclass(frozen=True)
@@ -107,6 +312,27 @@ class CheckResult:
     allowed: bool
     decisions: list[Decision]
     summary: str
+    snapshot_id: str = ""
+    snapshot_generation: int = 0
+    relationship_denied: bool = False
+
+    @property
+    def rule_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                stable_rule_id(decision.matched_rule)
+                for decision in self.decisions
+                if decision.matched_rule is not None
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeCheckpoint:
+    """Opaque exact-state checkpoint created by :meth:`ScopeStore.checkpoint`."""
+
+    _store_identity: int
+    _snapshot: AuthorizationSnapshot
 
 
 class ExtractorError(ValueError):
@@ -142,7 +368,8 @@ def parse_rule(
         return _parse_wifi_rule(pattern)
     if force_kind not in (None, "wifi"):
         raise ValueError(f"unsupported force_kind {force_kind!r}")
-    s = (pattern or "").strip().lower().rstrip(".")
+    authored = (pattern or "").strip()
+    s = authored.lower().rstrip(".")
     if not s:
         raise ValueError("empty pattern")
 
@@ -158,6 +385,12 @@ def parse_rule(
             return "network", str(net)
         except ValueError as e:
             raise ValueError(f"bad network pattern {pattern!r}: {e}") from e
+
+    # A valid IPv6 address may begin with an alphabetic hextet (for example,
+    # ``dead:beef::1``). Resource-family dispatch must therefore run only
+    # after the legacy IP/network grammar has had the first opportunity.
+    if _resource_identity.looks_tagged(authored):
+        return _resource_identity.parse_resource_identity(authored)
 
     # Host glob (must contain *)
     if "*" in s:
@@ -543,6 +776,8 @@ class ExtractorSpec:
     split-horizon resolver. Passive DB-lookup research tools
     (research=True, research_active=False) fail OPEN — they only ever query
     public databases, never the target itself."""
+    external_modes: ExternalModeContract | None = None
+    """Required outputs and relationships for each externally reaching mode."""
 
     def __post_init__(self) -> None:
         # Freeze `fields` so registered policy cannot change through a retained
@@ -566,7 +801,7 @@ class ExtractorSpec:
 # the same ExtractorError as before (`unknown extractor kind: …`) — the public
 # kernel's behavior for a kind no skin has installed.
 
-SCOPE_API_VERSION = 1
+SCOPE_API_VERSION = 3
 """Bumped when the extractor facade (ExtractorCtx + exported helpers) changes
 in a way a skin must adapt to. A skin asserts compatibility at startup."""
 
@@ -584,7 +819,7 @@ class ExtractorCtx:
     raw: Any
 
 
-Extractor = Callable[["ExtractorCtx"], list[Target]]
+Extractor = Callable[["ExtractorCtx"], list[Target] | ExtractionResult]
 
 # Kinds handled inline by `_extract_one` — reserved; a skin may not register
 # these. Derived from the ExtractorKind Literal so it narrows automatically as
@@ -1236,7 +1471,7 @@ def _extract_one(
     field: str,
     kind: str,
     optional: bool = False,
-) -> list[Target]:
+) -> list[Target] | ExtractionResult:
     """Extract Target(s) for a single arg-field according to its kind.
 
     `optional`: when True, missing/empty values return [] instead of raising.
@@ -1268,7 +1503,8 @@ def _extract_one(
     # refused). A miss falls through to the kernel's inline generic handling.
     fn = _EXTRACTORS.get(kind)
     if fn is not None:
-        return fn(ExtractorCtx(args=args, field=field, optional=optional, raw=raw))
+        extracted = fn(ExtractorCtx(args=args, field=field, optional=optional, raw=raw))
+        return _anchor_registered_extraction(extracted, field)
 
     if raw in (None, "", []):
         if optional:
@@ -1426,6 +1662,41 @@ def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     return False
 
 
+def extract_scope(spec: ExtractorSpec, args: dict[str, Any]) -> ExtractionResult:
+    """Extract targets and typed relationship facts from one invocation."""
+    if (spec.none or spec.local_only) and spec.external_modes is None:
+        return ExtractionResult()
+    targets: list[Target] = []
+    relationships: list[PrincipalResourceRelationship] = []
+    for field_name, kind in spec.fields.items():
+        extracted = _extract_one(
+            args,
+            field_name,
+            kind,
+            optional=spec.at_least_one,
+        )
+        match extracted:
+            case ExtractionResult(field_targets, field_relationships):
+                targets.extend(field_targets)
+                relationships.extend(field_relationships)
+            case list() as field_targets:
+                targets.extend(field_targets)
+    for target in targets:
+        placeholder = unresolved_operator_infra_placeholder(target.value)
+        if placeholder is not None:
+            raise ExtractorError(
+                "extracted target contains unresolved operator-infrastructure "
+                f"placeholder {placeholder!r} from field {target.source_field!r}; "
+                "substitute the engagement's real target value before calling the tool"
+            )
+    if spec.at_least_one and spec.fields and not targets:
+        raise ExtractorError(
+            f"none of {list(spec.fields)} were set — at least one target "
+            f"field is required; got args: {sorted(args)}"
+        )
+    return ExtractionResult(tuple(targets), tuple(relationships))
+
+
 def extract_targets(spec: ExtractorSpec, args: dict[str, Any]) -> list[Target]:
     """Top-level: given a spec and the tool's call args, return the targets.
 
@@ -1436,68 +1707,162 @@ def extract_targets(spec: ExtractorSpec, args: dict[str, Any]) -> list[Target]:
     skipped (instead of raising), but at the end we require at least one
     target overall — otherwise refuse with a clear error message.
     """
-    if spec.none or spec.local_only:
-        return []
-    out: list[Target] = []
-    for field_name, kind in spec.fields.items():
-        out.extend(
-            _extract_one(
-                args,
-                field_name,
-                kind,
-                optional=spec.at_least_one,
-            )
+    return list(extract_scope(spec, args).targets)
+
+
+def _validate_relationships(
+    variant: ExternalModeVariant,
+    extraction: ExtractionResult,
+) -> str | None:
+    required = variant.required_relationships
+    if extraction.relationships and not required:
+        return "unexpected relationship facts for mode without relationship requirements"
+    target_set = frozenset(extraction.targets)
+    grants = frozenset(variant.cross_tenant_grants)
+    for relationship in extraction.relationships:
+        if not {relationship.provider, relationship.principal, relationship.resource} <= target_set:
+            return "relationship references a target absent from compound extraction"
+        if not relationship.principal_provider or not relationship.resource_provider:
+            return "relationship provider is missing"
+        if relationship.principal_provider != relationship.resource_provider:
+            return "principal and resource providers are incompatible"
+        provider_binding = next(
+            (
+                binding
+                for binding in variant.provider_bindings
+                if binding.provider == relationship.principal_provider
+            ),
+            None,
         )
-    for target in out:
-        placeholder = unresolved_operator_infra_placeholder(target.value)
-        if placeholder is not None:
-            raise ExtractorError(
-                "extracted target contains unresolved operator-infrastructure "
-                f"placeholder {placeholder!r} from field {target.source_field!r}; "
-                "substitute the engagement's real target value before calling the tool"
-            )
-    if spec.at_least_one and spec.fields and not out:
-        raise ExtractorError(
-            f"none of {list(spec.fields)} were set — at least one target "
-            f"field is required; got args: {sorted(args)}"
+        if provider_binding is None:
+            return "relationship provider has no authorized provider target binding"
+        provider_identity = TargetIdentity(
+            kind=relationship.provider.kind,
+            value=relationship.provider.value,
         )
-    return out
+        if provider_identity != provider_binding.target:
+            return "provider target is incompatible with relationship provider"
+        if not relationship.principal_tenant or not relationship.resource_tenant:
+            return "relationship tenant is missing"
+        if relationship.principal_tenant != relationship.resource_tenant:
+            grant = CrossTenantGrant(
+                provider=relationship.principal_provider,
+                principal=TargetIdentity(
+                    kind=relationship.principal.kind,
+                    value=relationship.principal.value,
+                ),
+                principal_tenant=relationship.principal_tenant,
+                resource=TargetIdentity(
+                    kind=relationship.resource.kind,
+                    value=relationship.resource.value,
+                ),
+                resource_tenant=relationship.resource_tenant,
+            )
+            if grant not in grants:
+                return (
+                    "principal tenant does not own resource and has no explicit cross-tenant grant"
+                )
+    for requirement in required:
+        facts = tuple(
+            relationship
+            for relationship in extraction.relationships
+            if relationship.provider.kind == requirement.provider_kind
+            and relationship.principal.kind == requirement.principal_kind
+            and relationship.resource.kind == requirement.resource_kind
+        )
+        if not facts:
+            return "missing required principal-resource relationship"
+        for kind, label, covered in (
+            (
+                requirement.provider_kind,
+                "provider",
+                frozenset(relationship.provider for relationship in facts),
+            ),
+            (
+                requirement.principal_kind,
+                "principal",
+                frozenset(relationship.principal for relationship in facts),
+            ),
+            (
+                requirement.resource_kind,
+                "resource",
+                frozenset(relationship.resource for relationship in facts),
+            ),
+        ):
+            expected = frozenset(target for target in extraction.targets if target.kind == kind)
+            if expected - covered:
+                return f"required {label} target is not covered by a relationship"
+    return None
+
+
+def _credential_binding_error(
+    snapshot: AuthorizationSnapshot,
+    relationship: PrincipalResourceRelationship,
+    required: bool,
+) -> str | None:
+    if not required and relationship.credential_binding_id is None:
+        return None
+    binding_id = relationship.credential_binding_id
+    if not binding_id:
+        return "credential relationship is missing a binding selector"
+    binding = next(
+        (
+            candidate
+            for candidate in snapshot.credential_bindings
+            if candidate.binding_id == binding_id
+        ),
+        None,
+    )
+    if binding is None:
+        return "credential relationship references an unknown binding selector"
+    if relationship.credential_configuration_id != binding.configuration_id:
+        return "credential relationship references a stale configuration"
+    if relationship.principal_provider != binding.provider:
+        return "credential relationship provider does not match its binding"
+    if relationship.principal_identity != binding.principal:
+        return "credential relationship principal does not match its binding"
+    if relationship.principal_tenant != binding.tenant:
+        return "credential relationship tenant does not match its binding"
+    return None
 
 
 # ─── the store ─────────────────────────────────────────────────────────────
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS scope_rules (
-    pattern       TEXT    NOT NULL,
-    kind          TEXT    NOT NULL,
-    direction     TEXT    NOT NULL,
-    origin        TEXT    NOT NULL,
-    added_by      TEXT    NOT NULL,
-    added_at      REAL    NOT NULL,
-    expires_at    REAL,
-    one_shot      INTEGER NOT NULL DEFAULT 0,
-    consumed_at   REAL,
-    reason        TEXT    NOT NULL,
-    PRIMARY KEY (pattern, direction, origin)
-);
+_RULE_KINDS = frozenset(get_args(RuleKind))
+_DIRECTIONS = frozenset(get_args(Direction))
+_ORIGINS = frozenset(get_args(Origin))
 
-CREATE TABLE IF NOT EXISTS scope_decisions (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts            REAL    NOT NULL,
-    engagement_id TEXT    NOT NULL,
-    agent         TEXT    NOT NULL,
-    tool          TEXT    NOT NULL,
-    args_json     TEXT    NOT NULL,
-    targets_json  TEXT    NOT NULL,
-    verdict       TEXT    NOT NULL,
-    matched_rule  TEXT,
-    reason        TEXT    NOT NULL
-);
 
-CREATE INDEX IF NOT EXISTS scope_decisions_ts          ON scope_decisions(ts);
-CREATE INDEX IF NOT EXISTS scope_decisions_verdict     ON scope_decisions(verdict);
-CREATE INDEX IF NOT EXISTS scope_decisions_engagement  ON scope_decisions(engagement_id);
-"""
+def _validate_persisted_scope_rules(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT kind,pattern,direction,origin FROM scope_rules").fetchall()
+    for kind, pattern, direction, origin in rows:
+        if kind not in _RULE_KINDS:
+            raise ScopeRuleSchemaError(f"unknown persisted rule kind {kind!r}")
+        if direction not in _DIRECTIONS:
+            raise ScopeRuleSchemaError(f"unknown persisted rule direction {direction!r}")
+        if origin not in _ORIGINS:
+            raise ScopeRuleSchemaError(f"unknown persisted rule origin {origin!r}")
+        try:
+            if kind in {"repo", "cloud", "saas"}:
+                resource_kind, canonical = _resource_identity.parse_resource_identity(pattern)
+                if resource_kind != kind or canonical != pattern:
+                    raise ScopeRuleSchemaError(
+                        f"persisted {kind} identity is not canonical: {pattern!r}"
+                    )
+            elif kind in {"wifi_bssid", "wifi_ssid"}:
+                wifi_kind, canonical = parse_rule(pattern, force_kind="wifi")
+                if wifi_kind != kind or canonical != pattern:
+                    raise ScopeRuleSchemaError(
+                        f"persisted {kind} identity is not canonical: {pattern!r}"
+                    )
+            else:
+                legacy_kind, canonical = parse_rule(pattern)
+                if legacy_kind != kind or canonical != pattern:
+                    raise ScopeRuleSchemaError(
+                        f"persisted {kind} identity is not canonical: {pattern!r}"
+                    )
+        except ValueError as exc:
+            raise ScopeRuleSchemaError(f"uninterpretable persisted rule identity: {exc}") from exc
 
 
 # ─── operator-side IP detection ─────────────────────────────────────────────
@@ -1601,26 +1966,8 @@ def _operator_filter_note(op_targets: list[Target]) -> str:
 # is the load-bearing safety invariant — research tools can never reach
 # private/internal infra or `out_targets`.
 
-_DEFAULT_INTERNAL_TLDS: tuple[str, ...] = (
-    ".local",
-    ".internal",
-    ".lan",
-    ".corp",
-    ".intranet",
-    ".home.arpa",
-)
+_DEFAULT_INTERNAL_TLDS = DEFAULT_INTERNAL_TLDS
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")  # RFC 6598 shared space
-
-
-@dataclass(frozen=True)
-class ResearchPolicy:
-    """Per-engagement research-lane policy, parsed from
-    `profile["scope"]["research"]`. Default is `public` (on) — the lane is
-    on-by-default; set `mode: off` to revert research tools to strict scope."""
-
-    mode: str = "public"  # public | allowlist | off
-    in_rules: tuple[ScopeRule, ...] = ()  # allowlist-mode patterns
-    internal_tlds: tuple[str, ...] = _DEFAULT_INTERNAL_TLDS
 
 
 def _norm_tld(x: str) -> str:
@@ -1764,14 +2111,7 @@ class ScopeStore:
     ) -> None:
         self.engagement_id = engagement_id
         self.db_path = db_path
-        self._rules: list[ScopeRule] = []
-        # Research lane policy (default: public / on). Replaced by
-        # load_engagement_rules from the profile's scope.research block.
-        self._research: ResearchPolicy = ResearchPolicy()
-        # SC-1: per-call scope re-check of relayed session commands.
-        # Off by default (legacy established-session trust); set from the
-        # engagement profile's scope.session_strict by load_engagement_rules.
-        self._session_strict: bool = False
+        self._snapshot_fault: Literal["before_commit", "after_commit"] | None = None
         if db_path is not None:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn: sqlite3.Connection | None = sqlite3.connect(
@@ -1779,24 +2119,238 @@ class ScopeStore:
                 isolation_level=None,
             )
             self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.executescript(SCHEMA)
-            self._load_adhoc_from_db()
+            self._conn.execute("PRAGMA synchronous=FULL")
+            _scope_schema.initialize_scope_schema(self._conn, _validate_persisted_scope_rules)
+            self._snapshot = self._load_or_bootstrap_snapshot()
         else:
             self._conn = None
+            self._snapshot = self._build_snapshot(
+                0,
+                None,
+                SnapshotDraft((), ResearchPolicy(), False, "{}", ()),
+            )
+        self._publish_snapshot(self._snapshot)
+
+    @property
+    def snapshot(self) -> AuthorizationSnapshot:
+        return self._snapshot
+
+    def checkpoint(self) -> ScopeCheckpoint:
+        """Capture the exact live and durable authorization state for rollback."""
+        if self._conn is not None:
+            head = self._conn.execute(
+                "SELECT generation FROM scope_head WHERE singleton=1"
+            ).fetchone()
+            if head is None or head[0] != self._snapshot.generation:
+                raise ScopeSnapshotStaleError(
+                    "authorization snapshot differs from the durable head"
+                )
+        return ScopeCheckpoint(id(self), self._snapshot)
+
+    def restore_checkpoint(
+        self,
+        checkpoint: ScopeCheckpoint,
+        *,
+        expected_current: AuthorizationSnapshot,
+    ) -> AuthorizationSnapshot:
+        """Restore a checkpoint without creating a new authorization generation."""
+        if checkpoint._store_identity != id(self):
+            raise ScopeSnapshotCompatibilityError("scope checkpoint belongs to another store")
+        snapshot = checkpoint._snapshot
+        if self._conn is not None:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                head = self._conn.execute(
+                    "SELECT s.generation,s.snapshot_id FROM scope_head h "
+                    "JOIN scope_snapshots s ON s.generation=h.generation "
+                    "WHERE h.singleton=1"
+                ).fetchone()
+                checkpoint_head = (snapshot.generation, snapshot.snapshot_id)
+                expected_head = (
+                    expected_current.generation,
+                    expected_current.snapshot_id,
+                )
+                if head == checkpoint_head:
+                    self._conn.execute("COMMIT")
+                    self._publish_snapshot(snapshot)
+                    return snapshot
+                if head != expected_head:
+                    raise ScopeSnapshotStaleError(
+                        "authorization snapshot changed after owned publication"
+                    )
+                row = self._conn.execute(
+                    "SELECT snapshot_id FROM scope_snapshots WHERE generation=?",
+                    (snapshot.generation,),
+                ).fetchone()
+                if row is None or row[0] != snapshot.snapshot_id:
+                    raise ScopeSnapshotCompatibilityError(
+                        "scope checkpoint is absent from durable history"
+                    )
+                self._conn.execute(
+                    "DELETE FROM scope_snapshots WHERE generation > ?",
+                    (snapshot.generation,),
+                )
+                self._conn.execute("DELETE FROM scope_rules")
+                for rule in snapshot.rules:
+                    self._insert_rule_row(rule)
+                changed = self._conn.execute(
+                    "UPDATE scope_head SET generation=? WHERE singleton=1",
+                    (snapshot.generation,),
+                )
+                if changed.rowcount != 1:
+                    raise ScopeSnapshotCompatibilityError("scope head is missing")
+                self._conn.execute("COMMIT")
+            except BaseException:  # noqa: BLE001 — roll back, then re-raise unchanged
+                # Interrupt-safe: a KeyboardInterrupt / CancelledError landing
+                # between statements must not leave a dangling transaction that
+                # wedges every later BEGIN IMMEDIATE. Roll back if still open.
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+        elif self._snapshot is snapshot:
+            return snapshot
+        elif self._snapshot is not expected_current:
+            raise ScopeSnapshotStaleError("authorization snapshot changed after owned publication")
+        self._publish_snapshot(snapshot)
+        return snapshot
+
+    def _publish_snapshot(self, snapshot: AuthorizationSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def _build_snapshot(
+        self,
+        generation: int,
+        predecessor_id: str | None,
+        draft: SnapshotDraft,
+    ) -> AuthorizationSnapshot:
+        return build_snapshot(generation, predecessor_id, draft)
 
     # ─── rule loading ────────────────────────────────────────────────────
 
-    def load_engagement_rules(self, profile: dict[str, Any]) -> None:
-        """Replace engagement-origin rules from the YAML profile.
+    def _load_or_bootstrap_snapshot(self) -> AuthorizationSnapshot:
+        assert self._conn is not None
+        head = self._conn.execute("SELECT generation FROM scope_head WHERE singleton=1").fetchone()
+        if head is None:
+            rules = self._rules_from_current_table()
+            snapshot = self._build_snapshot(
+                0,
+                None,
+                SnapshotDraft(rules, ResearchPolicy(), False, "{}", ()),
+            )
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._insert_snapshot_row(snapshot)
+                self._conn.execute("INSERT INTO scope_head(singleton,generation) VALUES(1,0)")
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._conn.execute("ROLLBACK")
+                raise
+            return snapshot
+        row = self._conn.execute(
+            "SELECT snapshot_id,payload_json FROM scope_snapshots WHERE generation=?",
+            (head[0],),
+        ).fetchone()
+        if row is None:
+            raise ScopeSnapshotCompatibilityError("scope head references a missing snapshot")
+        return self._parse_snapshot(row[1], row[0])
 
-        Atomic: removes old engagement rules, inserts the new ones.
-        Adhoc rules are not touched.
+    def _rules_from_current_table(self) -> tuple[ScopeRule, ...]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT pattern,kind,direction,origin,added_by,added_at,"
+            "expires_at,one_shot,consumed_at,reason FROM scope_rules"
+        ).fetchall()
+        return tuple(
+            ScopeRule(
+                pattern=row[0],
+                kind=row[1],
+                direction=row[2],
+                origin=row[3],
+                added_by=row[4],
+                added_at=row[5],
+                expires_at=row[6],
+                one_shot=bool(row[7]),
+                consumed_at=row[8],
+                reason=row[9],
+            )
+            for row in rows
+        )
+
+    def _parse_snapshot(self, payload_json: str, stored_id: str) -> AuthorizationSnapshot:
+        return parse_snapshot(payload_json, stored_id)
+
+    def _insert_snapshot_row(self, snapshot: AuthorizationSnapshot) -> None:
+        assert self._conn is not None
+        payload = snapshot_payload(snapshot)
+        self._conn.execute(
+            "INSERT INTO scope_snapshots "
+            "(generation,snapshot_id,predecessor_id,payload_json,committed_at) "
+            "VALUES(?,?,?,?,?)",
+            (
+                snapshot.generation,
+                snapshot.snapshot_id,
+                snapshot.predecessor_id,
+                payload,
+                time.time(),
+            ),
+        )
+
+    def _commit_snapshot(
+        self,
+        snapshot: AuthorizationSnapshot,
+        expected_generation: int,
+    ) -> AuthorizationSnapshot:
+        if self._conn is None:
+            if expected_generation != self._snapshot.generation:
+                raise ScopeSnapshotStaleError("authorization snapshot generation is stale")
+            self._publish_snapshot(snapshot)
+            return snapshot
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            head = self._conn.execute(
+                "SELECT generation FROM scope_head WHERE singleton=1"
+            ).fetchone()
+            if head is None or head[0] != expected_generation:
+                raise ScopeSnapshotStaleError("authorization snapshot generation is stale")
+            self._insert_snapshot_row(snapshot)
+            self._conn.execute("DELETE FROM scope_rules")
+            for rule in snapshot.rules:
+                self._insert_rule_row(rule)
+            changed = self._conn.execute(
+                "UPDATE scope_head SET generation=? WHERE singleton=1 AND generation=?",
+                (snapshot.generation, expected_generation),
+            )
+            if changed.rowcount != 1:
+                raise ScopeSnapshotStaleError("authorization snapshot generation is stale")
+            if self._snapshot_fault == "before_commit":
+                raise RuntimeError("snapshot fault before_commit")
+            self._conn.execute("COMMIT")
+        except BaseException:  # noqa: BLE001 — roll back, then re-raise unchanged
+            # Interrupt-safe (see restore_checkpoint): never leak an open
+            # transaction, even on KeyboardInterrupt / CancelledError.
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        if self._snapshot_fault == "after_commit":
+            raise RuntimeError("snapshot fault after_commit")
+        self._publish_snapshot(snapshot)
+        return snapshot
+
+    def prepare_engagement_rules(
+        self,
+        profile: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> AuthorizationSnapshot:
+        """Build an engagement-rule publication without committing it.
+
+        The returned snapshot is an ownership token for compare-and-swap rollback.
         """
         scope_block = (profile or {}).get("scope") or {}
         # Research lane policy travels with the engagement scope block.
-        self._research = research_config_from_profile(profile)
+        research = research_config_from_profile(profile)
         # SC-1: opt-in per-call re-check of relayed session commands.
-        self._session_strict = bool(
+        session_strict = bool(
             _coalesce(
                 scope_block,
                 "session_strict",
@@ -1834,47 +2388,46 @@ class ScopeStore:
                     reason="",
                 )
             )
-        # Swap atomically.
-        self._rules = [r for r in self._rules if r.origin != "engagement"] + new_rules
-        if self._conn is not None:
-            self._conn.execute("DELETE FROM scope_rules WHERE origin='engagement'")
-            for r in new_rules:
-                self._insert_rule_row(r)
-
-    def _load_adhoc_from_db(self) -> None:
-        assert self._conn is not None
-        cur = self._conn.execute(
-            "SELECT pattern,kind,direction,origin,added_by,added_at,"
-            "expires_at,one_shot,consumed_at,reason "
-            "FROM scope_rules WHERE origin='adhoc'"
+        current = self._snapshot
+        generation = current.generation if expected_generation is None else expected_generation
+        scope_resource_context = scope_block.get("resource_context") or {}
+        scope_credential_bindings = scope_block.get("credential_bindings") or {}
+        if not isinstance(scope_credential_bindings, Mapping):
+            raise ScopeSnapshotCompatibilityError("credential bindings must be an object")
+        snapshot = self._build_snapshot(
+            current.generation + 1,
+            current.snapshot_id,
+            SnapshotDraft(
+                tuple(rule for rule in current.rules if rule.origin != "engagement")
+                + tuple(new_rules),
+                research,
+                session_strict,
+                json.dumps(scope_resource_context, sort_keys=True, separators=(",", ":")),
+                parse_credential_bindings(scope_credential_bindings),
+            ),
         )
-        for row in cur.fetchall():
-            (
-                pat,
-                kind,
-                direction,
-                origin,
-                added_by,
-                added_at,
-                expires_at,
-                one_shot,
-                consumed_at,
-                reason,
-            ) = row
-            self._rules.append(
-                ScopeRule(
-                    pattern=pat,
-                    kind=kind,
-                    direction=direction,
-                    origin=origin,
-                    added_by=added_by,
-                    added_at=added_at,
-                    expires_at=expires_at,
-                    one_shot=bool(one_shot),
-                    consumed_at=consumed_at,
-                    reason=reason,
-                )
-            )
+        if generation != current.generation:
+            raise ScopeSnapshotStaleError("authorization snapshot generation is stale")
+        return snapshot
+
+    def publish_snapshot(self, publication: AuthorizationSnapshot) -> AuthorizationSnapshot:
+        """Atomically publish a snapshot prepared against the current head."""
+        if publication.predecessor_id != self._snapshot.snapshot_id:
+            raise ScopeSnapshotStaleError("authorization snapshot predecessor is stale")
+        return self._commit_snapshot(publication, self._snapshot.generation)
+
+    def load_engagement_rules(
+        self,
+        profile: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> AuthorizationSnapshot:
+        """Atomically replace engagement-origin rules from the YAML profile."""
+        publication = self.prepare_engagement_rules(
+            profile,
+            expected_generation=expected_generation,
+        )
+        return self.publish_snapshot(publication)
 
     def _insert_rule_row(self, r: ScopeRule) -> None:
         assert self._conn is not None
@@ -1896,6 +2449,35 @@ class ScopeStore:
                 r.reason,
             ),
         )
+
+    def restore_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> AuthorizationSnapshot:
+        if self._conn is None:
+            raise ScopeSnapshotCompatibilityError("restore requires persistent scope state")
+        row = self._conn.execute(
+            "SELECT payload_json FROM scope_snapshots WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchone()
+        if row is None:
+            raise ScopeSnapshotCompatibilityError("snapshot to restore does not exist")
+        source = self._parse_snapshot(row[0], snapshot_id)
+        current = self._snapshot
+        generation = current.generation if expected_generation is None else expected_generation
+        restored = self._build_snapshot(
+            current.generation + 1,
+            current.snapshot_id,
+            SnapshotDraft(
+                source.rules,
+                source.research,
+                source.session_strict,
+                source.resource_context_json,
+                source.credential_bindings,
+            ),
+        )
+        return self._commit_snapshot(restored, generation)
 
     # ─── adhoc rule management ───────────────────────────────────────────
 
@@ -1924,15 +2506,30 @@ class ScopeStore:
             one_shot=one_shot,
             reason=reason,
         )
-        # Replace any prior rule with same key (pattern, direction, origin).
-        self._rules = [
+        current = self._snapshot
+        rules = [
             r
-            for r in self._rules
-            if not (r.pattern == norm and r.direction == direction and r.origin == "adhoc")
+            for r in current.rules
+            if not (
+                r.kind == kind
+                and r.pattern == norm
+                and r.direction == direction
+                and r.origin == "adhoc"
+            )
         ]
-        self._rules.append(rule)
-        if self._conn is not None:
-            self._insert_rule_row(rule)
+        rules.append(rule)
+        snapshot = self._build_snapshot(
+            current.generation + 1,
+            current.snapshot_id,
+            SnapshotDraft(
+                tuple(rules),
+                current.research,
+                current.session_strict,
+                current.resource_context_json,
+                current.credential_bindings,
+            ),
+        )
+        self._commit_snapshot(snapshot, current.generation)
         return rule
 
     def remove(
@@ -1942,31 +2539,46 @@ class ScopeStore:
         force_kind: str | None = None,
     ) -> bool:
         try:
-            _, norm = parse_rule(pattern, force_kind=force_kind)
+            kind, norm = parse_rule(pattern, force_kind=force_kind)
         except ValueError:
-            norm = pattern  # let exact-string match fall through
-        before = len(self._rules)
-        self._rules = [
+            return False
+        current = self._snapshot
+        rules = [
             r
-            for r in self._rules
-            if not (r.pattern == norm and r.direction == direction and r.origin == "adhoc")
-        ]
-        removed = before - len(self._rules)
-        if removed and self._conn is not None:
-            self._conn.execute(
-                "DELETE FROM scope_rules WHERE pattern=? AND direction=? AND origin='adhoc'",
-                (norm, direction),
+            for r in current.rules
+            if not (
+                r.kind == kind
+                and r.pattern == norm
+                and r.direction == direction
+                and r.origin == "adhoc"
             )
+        ]
+        removed = len(current.rules) - len(rules)
+        if removed:
+            snapshot = self._build_snapshot(
+                current.generation + 1,
+                current.snapshot_id,
+                SnapshotDraft(
+                    tuple(rules),
+                    current.research,
+                    current.session_strict,
+                    current.resource_context_json,
+                    current.credential_bindings,
+                ),
+            )
+            self._commit_snapshot(snapshot, current.generation)
         return bool(removed)
 
     def rules(self, include_inactive: bool = False) -> list[ScopeRule]:
         now = time.time()
+        snapshot = self._snapshot
+        rules = snapshot.rules
         if include_inactive:
-            return list(self._rules)
-        return [r for r in self._rules if r.is_active(now)]
+            return list(rules)
+        return [r for r in rules if r.is_active(now)]
 
     def has_any_in_rule(self) -> bool:
-        return any(r.direction == "in" and r.is_active() for r in self._rules)
+        return any(r.direction == "in" and r.is_active() for r in self._snapshot.rules)
 
     def in_scope_origins(self, *, sentinel: str = "https://scope.invalid") -> str:
         """Render the active in-scope rules as a Playwright-style
@@ -2016,13 +2628,103 @@ class ScopeStore:
 
     # ─── the check ───────────────────────────────────────────────────────
 
-    def check(self, targets: list[Target]) -> CheckResult:
+    def check(
+        self,
+        targets: list[Target],
+        relationships: tuple[PrincipalResourceRelationship, ...] = (),
+        *,
+        relationship_variant: ExternalModeVariant | None = None,
+    ) -> CheckResult:
         """Allow IFF every target is in some active 'in' rule AND no
         target is in any active 'out' rule.
 
         Returns a CheckResult with per-target decisions. The summary
         string is human-readable for the agent's refusal message.
         """
+        snapshot = self._snapshot
+        result = self._check_snapshot(
+            snapshot,
+            targets,
+            relationships,
+            relationship_variant=relationship_variant,
+        )
+        consumed_oneshots = [
+            decision.matched_rule
+            for decision in result.decisions
+            if decision.matched_rule is not None and decision.matched_rule.one_shot
+        ]
+        if result.allowed and consumed_oneshots:
+            self._consume(snapshot, consumed_oneshots)
+        return result
+
+    def _check_snapshot(
+        self,
+        snapshot: AuthorizationSnapshot,
+        targets: list[Target],
+        relationships: tuple[PrincipalResourceRelationship, ...] = (),
+        *,
+        relationship_variant: ExternalModeVariant | None = None,
+    ) -> CheckResult:
+        rules = snapshot.rules
+        binding_errors = tuple(
+            (relationship, error)
+            for relationship in relationships
+            if (
+                error := _credential_binding_error(
+                    snapshot,
+                    relationship,
+                    (
+                        relationship_variant.credential_binding_required
+                        if relationship_variant is not None
+                        else False
+                    ),
+                )
+            )
+            is not None
+        )
+        if binding_errors:
+            binding_decisions = [
+                Decision(
+                    target=relationship.principal,
+                    verdict="deny",
+                    matched_rule=None,
+                    reason=error,
+                )
+                for relationship, error in binding_errors
+            ]
+            return CheckResult(
+                allowed=False,
+                decisions=binding_decisions,
+                summary="; ".join(error for _, error in binding_errors),
+                snapshot_id=snapshot.snapshot_id,
+                snapshot_generation=snapshot.generation,
+                relationship_denied=True,
+            )
+        if relationship_variant is not None:
+            relationship_error = _validate_relationships(
+                relationship_variant,
+                ExtractionResult(tuple(targets), relationships),
+            )
+            if relationship_error is not None:
+                denied_targets = tuple(
+                    relationship.resource for relationship in relationships
+                ) or tuple(targets[:1])
+                return CheckResult(
+                    allowed=False,
+                    decisions=[
+                        Decision(
+                            target=target,
+                            verdict="deny",
+                            matched_rule=None,
+                            reason=relationship_error,
+                        )
+                        for target in denied_targets
+                    ],
+                    summary=relationship_error,
+                    snapshot_id=snapshot.snapshot_id,
+                    snapshot_generation=snapshot.generation,
+                    relationship_denied=True,
+                )
         targets, op_filtered = _split_operator_targets(targets)
         op_note = _operator_filter_note(op_filtered)
         if not targets:
@@ -2031,13 +2733,17 @@ class ScopeStore:
                     allowed=True,
                     decisions=[],
                     summary=f"all targets are operator-side ({op_note}) — scope check skipped",
+                    snapshot_id=snapshot.snapshot_id,
+                    snapshot_generation=snapshot.generation,
                 )
             return CheckResult(
                 allowed=False,
                 decisions=[],
                 summary="no targets to check (target extraction returned empty)",
+                snapshot_id=snapshot.snapshot_id,
+                snapshot_generation=snapshot.generation,
             )
-        if not self.has_any_in_rule():
+        if not any(rule.direction == "in" and rule.is_active() for rule in rules):
             return CheckResult(
                 allowed=False,
                 decisions=[],
@@ -2047,50 +2753,17 @@ class ScopeStore:
                     "or `salientctl scope add <pattern> --reason '…'` "
                     "before any target-bearing tool can run."
                 ),
+                snapshot_id=snapshot.snapshot_id,
+                snapshot_generation=snapshot.generation,
             )
         decisions: list[Decision] = []
         all_allowed = True
-        consumed_oneshots: list[ScopeRule] = []
         for t in targets:
-            d = self._check_one(t)
+            d = self._check_one(t, rules)
             decisions.append(d)
             if d.verdict == "deny":
                 all_allowed = False
-            elif d.matched_rule is not None and d.matched_rule.one_shot:
-                consumed_oneshots.append(d.matched_rule)
 
-        if all_allowed and consumed_oneshots:
-            self._consume(consumed_oneshots)
-
-        summary = self._summarize(decisions, allowed=all_allowed)
-        if op_filtered:
-            summary = f"{summary} (operator-side filtered: {op_note})"
-        return CheckResult(allowed=all_allowed, decisions=decisions, summary=summary)
-
-    def dry_check(self, targets: list[Target]) -> CheckResult:
-        """Identical verdict to check() but never mutates state — used
-        by read-only callers (e.g. `hosts_suggest`) that need to know
-        whether a target would be allowed without consuming one-shot
-        rules along the way.
-        """
-        targets, op_filtered = _split_operator_targets(targets)
-        op_note = _operator_filter_note(op_filtered)
-        if not targets:
-            if op_filtered:
-                return CheckResult(
-                    allowed=True,
-                    decisions=[],
-                    summary=f"all operator-side ({op_note})",
-                )
-            return CheckResult(allowed=False, decisions=[], summary="no targets")
-        if not self.has_any_in_rule():
-            return CheckResult(
-                allowed=False,
-                decisions=[],
-                summary="no in-scope rules",
-            )
-        decisions = [self._check_one(t) for t in targets]
-        all_allowed = all(d.verdict == "allow" for d in decisions)
         summary = self._summarize(decisions, allowed=all_allowed)
         if op_filtered:
             summary = f"{summary} (operator-side filtered: {op_note})"
@@ -2098,12 +2771,54 @@ class ScopeStore:
             allowed=all_allowed,
             decisions=decisions,
             summary=summary,
+            snapshot_id=snapshot.snapshot_id,
+            snapshot_generation=snapshot.generation,
         )
 
-    def _check_one(self, t: Target) -> Decision:
+    def dry_check(
+        self,
+        targets: list[Target],
+        relationships: tuple[PrincipalResourceRelationship, ...] = (),
+        *,
+        relationship_variant: ExternalModeVariant | None = None,
+    ) -> CheckResult:
+        """Identical verdict to check() but never mutates state — used
+        by read-only callers (e.g. `hosts_suggest`) that need to know
+        whether a target would be allowed without consuming one-shot
+        rules along the way.
+        """
+        snapshot = self._current_persisted_snapshot()
+        return self._check_snapshot(
+            snapshot,
+            targets,
+            relationships,
+            relationship_variant=relationship_variant,
+        )
+
+    def pin_snapshot(self) -> AuthorizationSnapshot:
+        """Return the latest complete committed authorization snapshot."""
+        return self._current_persisted_snapshot()
+
+    def _current_persisted_snapshot(self) -> AuthorizationSnapshot:
+        if self._conn is None:
+            return self._snapshot
+        head = self._conn.execute("SELECT generation FROM scope_head WHERE singleton=1").fetchone()
+        if head is None:
+            raise ScopeSnapshotCompatibilityError("scope head is missing")
+        if head[0] == self._snapshot.generation:
+            return self._snapshot
+        row = self._conn.execute(
+            "SELECT snapshot_id,payload_json FROM scope_snapshots WHERE generation=?",
+            (head[0],),
+        ).fetchone()
+        if row is None:
+            raise ScopeSnapshotCompatibilityError("scope head references a missing snapshot")
+        return self._parse_snapshot(row[1], row[0])
+
+    def _check_one(self, t: Target, rules: Iterable[ScopeRule]) -> Decision:
         now = time.time()
         # 1) Out rules win.
-        for r in self._rules:
+        for r in rules:
             if r.direction != "out" or not r.is_active(now):
                 continue
             if _rule_matches(r, t):
@@ -2114,7 +2829,7 @@ class ScopeStore:
                     reason=f"{t.kind} {t.value} matches out-of-scope rule {r.pattern}",
                 )
         # 2) In rules.
-        for r in self._rules:
+        for r in rules:
             if r.direction != "in" or not r.is_active(now):
                 continue
             if _rule_matches(r, t):
@@ -2136,22 +2851,23 @@ class ScopeStore:
 
     def research_active(self) -> bool:
         """True iff the research lane is enabled (mode != off)."""
-        return self._research.mode != "off"
+        return self._snapshot.research.mode != "off"
 
     def session_strict(self) -> bool:
         """True iff the engagement opted into per-call scope re-checking of
         relayed session commands (scope.session_strict). When False
         (default), session_scoped tools keep their legacy established-session
         trust bypass. See SC-1 / docs/SCOPE.md."""
-        return self._session_strict
+        return self._snapshot.session_strict
 
     def research_summary(self) -> dict[str, Any]:
         """Operator-facing snapshot of the research lane policy (for
         `scope list`)."""
+        research = self._snapshot.research
         return {
-            "mode": self._research.mode,
-            "allowlist": [r.pattern for r in self._research.in_rules],
-            "internal_tlds": list(self._research.internal_tlds),
+            "mode": research.mode,
+            "allowlist": [r.pattern for r in research.in_rules],
+            "internal_tlds": list(research.internal_tlds),
         }
 
     def check_research(
@@ -2180,8 +2896,9 @@ class ScopeStore:
         # lookup doesn't stall the daemon), and the loop thread can mutate
         # _rules concurrently (operator scope add). Iterating a snapshot
         # avoids the "list changed size during iteration" race.
-        rules = list(self._rules)
-        decisions = [self._check_research_one(t, rules, active) for t in targets]
+        snapshot = self._snapshot
+        rules = snapshot.rules
+        decisions = [self._check_research_one(t, rules, snapshot.research, active) for t in targets]
         all_allowed = all(d.verdict == "allow" for d in decisions)
         return CheckResult(
             allowed=all_allowed,
@@ -2192,7 +2909,8 @@ class ScopeStore:
     def _check_research_one(
         self,
         t: Target,
-        rules: list[ScopeRule],
+        rules: Iterable[ScopeRule],
+        research: ResearchPolicy,
         active: bool = False,
     ) -> Decision:
         now = time.time()
@@ -2216,15 +2934,15 @@ class ScopeStore:
                     reason=f"{t.kind} {t.value} in engagement scope ({r.pattern})",
                 )
         # 3) Research public branch.
-        if self._research.mode == "off":
+        if research.mode == "off":
             return Decision(
                 target=t,
                 verdict="deny",
                 matched_rule=None,
                 reason=f"{t.kind} {t.value} not in engagement scope (research lane off)",
             )
-        if self._research.mode == "allowlist":
-            matched = next((r for r in self._research.in_rules if _rule_matches(r, t)), None)
+        if research.mode == "allowlist":
+            matched = next((r for r in research.in_rules if _rule_matches(r, t)), None)
             if matched is None:
                 return Decision(
                     target=t,
@@ -2232,7 +2950,7 @@ class ScopeStore:
                     matched_rule=None,
                     reason=f"{t.kind} {t.value} not in the research allowlist",
                 )
-        ok, reason = self._research_public_floor(t, active)
+        ok, reason = self._research_public_floor(t, research, active)
         if not ok:
             return Decision(
                 target=t,
@@ -2250,6 +2968,7 @@ class ScopeStore:
     def _research_public_floor(
         self,
         t: Target,
+        research: ResearchPolicy,
         active: bool = False,
     ) -> tuple[bool, str]:
         """The load-bearing safety floor: a research target may only be a
@@ -2273,7 +2992,7 @@ class ScopeStore:
             return True, ""
         if t.kind in ("host", "url"):
             host = t.value.lower().rstrip(".")
-            for tld in self._research.internal_tlds:
+            for tld in research.internal_tlds:
                 if host == tld.lstrip(".") or host.endswith(tld):
                     return False, (
                         f"{host} is in an internal namespace ({tld}) — the "
@@ -2300,26 +3019,33 @@ class ScopeStore:
             return True, ""
         return False, (f"{t.kind} {t.value} is not eligible for the research lane")
 
-    def _consume(self, rules: Iterable[ScopeRule]) -> None:
+    def _consume(
+        self,
+        pinned: AuthorizationSnapshot,
+        rules: Iterable[ScopeRule],
+    ) -> None:
         now = time.time()
-        for r in list(rules):
-            new = replace(r, consumed_at=now)
-            # Swap in-place in self._rules
-            for i, existing in enumerate(self._rules):
-                if (
-                    existing.pattern == r.pattern
-                    and existing.direction == r.direction
-                    and existing.origin == r.origin
-                    and existing.added_at == r.added_at
-                ):
-                    self._rules[i] = new
-                    break
-            if self._conn is not None:
-                self._conn.execute(
-                    "UPDATE scope_rules SET consumed_at=? "
-                    "WHERE pattern=? AND direction=? AND origin=? AND added_at=?",
-                    (now, r.pattern, r.direction, r.origin, r.added_at),
-                )
+        identities = {
+            (rule.kind, rule.pattern, rule.direction, rule.origin, rule.added_at) for rule in rules
+        }
+        updated = tuple(
+            replace(rule, consumed_at=now)
+            if (rule.kind, rule.pattern, rule.direction, rule.origin, rule.added_at) in identities
+            else rule
+            for rule in pinned.rules
+        )
+        snapshot = self._build_snapshot(
+            pinned.generation + 1,
+            pinned.snapshot_id,
+            SnapshotDraft(
+                updated,
+                pinned.research,
+                pinned.session_strict,
+                pinned.resource_context_json,
+                pinned.credential_bindings,
+            ),
+        )
+        self._commit_snapshot(snapshot, pinned.generation)
 
     def _summarize(self, decisions: list[Decision], allowed: bool) -> str:
         if allowed:
@@ -2331,33 +3057,209 @@ class ScopeStore:
 
     # ─── decision logging ────────────────────────────────────────────────
 
-    def log_decision(
+    def authorize_and_log(
+        self,
+        invocation: ToolInvocation,
+        audit_args: dict[str, Any],
+        targets: tuple[Target, ...],
+        relationships: tuple[PrincipalResourceRelationship, ...] = (),
+        *,
+        relationship_variant: ExternalModeVariant | None = None,
+        correlation_id: str | None = None,
+    ) -> CheckResult:
+        if self._conn is None:
+            return self.check(
+                list(targets),
+                relationships,
+                relationship_variant=relationship_variant,
+            )
+        self._conn.execute("BEGIN IMMEDIATE")
+        pinned = self._snapshot
+        try:
+            head = self._conn.execute(
+                "SELECT generation FROM scope_head WHERE singleton=1"
+            ).fetchone()
+            if head is None:
+                raise ScopeSnapshotCompatibilityError("scope head is missing")
+            row = self._conn.execute(
+                "SELECT snapshot_id,payload_json FROM scope_snapshots WHERE generation=?",
+                (head[0],),
+            ).fetchone()
+            if row is None:
+                raise ScopeSnapshotCompatibilityError("scope head references a missing snapshot")
+            pinned = self._parse_snapshot(row[1], row[0])
+            result = self._check_snapshot(
+                pinned,
+                list(targets),
+                relationships,
+                relationship_variant=relationship_variant,
+            )
+            from .scope_audit import scope_audit
+
+            audit = scope_audit(invocation, targets, result, relationships)
+            self._insert_decision(
+                agent=invocation.agent_id,
+                tool=invocation.wire_name,
+                args=audit_args,
+                targets=list(audit.targets),
+                relationships=list(audit.relationships),
+                result=audit.result,
+                correlation_id=correlation_id,
+            )
+            consumed = [
+                decision.matched_rule
+                for decision in result.decisions
+                if decision.matched_rule is not None and decision.matched_rule.one_shot
+            ]
+            published = pinned
+            if result.allowed and consumed:
+                now = time.time()
+                identities = {
+                    (rule.kind, rule.pattern, rule.direction, rule.origin, rule.added_at)
+                    for rule in consumed
+                }
+                updated = tuple(
+                    replace(rule, consumed_at=now)
+                    if (rule.kind, rule.pattern, rule.direction, rule.origin, rule.added_at)
+                    in identities
+                    else rule
+                    for rule in pinned.rules
+                )
+                published = self._build_snapshot(
+                    pinned.generation + 1,
+                    pinned.snapshot_id,
+                    SnapshotDraft(
+                        updated,
+                        pinned.research,
+                        pinned.session_strict,
+                        pinned.resource_context_json,
+                        pinned.credential_bindings,
+                    ),
+                )
+                self._insert_snapshot_row(published)
+                self._conn.execute("DELETE FROM scope_rules")
+                for rule in published.rules:
+                    self._insert_rule_row(rule)
+                changed = self._conn.execute(
+                    "UPDATE scope_head SET generation=? WHERE singleton=1 AND generation=?",
+                    (published.generation, pinned.generation),
+                )
+                if changed.rowcount != 1:
+                    raise ScopeSnapshotStaleError("authorization snapshot generation is stale")
+            self._conn.execute("COMMIT")
+        except sqlite3.Error:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            return CheckResult(
+                allowed=False,
+                decisions=[],
+                summary="audit persistence failed; authorization denied",
+                snapshot_id=pinned.snapshot_id,
+                snapshot_generation=pinned.generation,
+            )
+        except ScopeSnapshotError:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        except BaseException:  # noqa: BLE001 — roll back, then re-raise unchanged
+            # Interrupt-safe: a KeyboardInterrupt / CancelledError rolls back and
+            # propagates — it must NOT be swallowed into a deny CheckResult.
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        self._publish_snapshot(published)
+        return result
+
+    def _insert_decision(
         self,
         agent: str,
         tool: str,
         args: dict[str, Any],
         targets: list[Target],
+        relationships: list[PrincipalResourceRelationship],
         result: CheckResult,
+        correlation_id: str | None = None,
     ) -> None:
-        if self._conn is None:
-            return
+        assert self._conn is not None
+        decisions = [
+            {
+                "reason": decision.reason,
+                "rule_id": (
+                    stable_rule_id(decision.matched_rule)
+                    if decision.matched_rule is not None
+                    else None
+                ),
+                "target": dataclasses.asdict(decision.target),
+                "verdict": decision.verdict,
+            }
+            for decision in result.decisions
+        ]
         self._conn.execute(
             "INSERT INTO scope_decisions "
-            "(ts,engagement_id,agent,tool,args_json,targets_json,"
-            " verdict,matched_rule,reason) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "(ts,engagement_id,agent,tool,args_json,targets_json,verdict,matched_rule,reason,"
+            " decisions_json,relationships_json,rule_ids_json,snapshot_id,generation,correlation_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 time.time(),
                 self.engagement_id,
                 agent,
                 tool,
                 _json_dumps(args),
-                _json_dumps([dataclasses.asdict(t) for t in targets]),
+                _json_dumps([dataclasses.asdict(target) for target in targets]),
                 "allow" if result.allowed else "deny",
                 _matched_pattern(result),
                 result.summary,
+                _json_dumps(decisions),
+                _json_dumps([dataclasses.asdict(item) for item in relationships]),
+                _json_dumps(list(result.rule_ids)),
+                result.snapshot_id,
+                result.snapshot_generation,
+                correlation_id,
             ),
         )
+
+    def log_decision(
+        self,
+        agent: str,
+        tool: str,
+        args: dict[str, Any],
+        targets: list[Target],
+        relationships: list[PrincipalResourceRelationship],
+        result: CheckResult,
+        correlation_id: str | None = None,
+    ) -> CheckResult:
+        if self._conn is None:
+            return replace(
+                result,
+                snapshot_id=self._snapshot.snapshot_id,
+                snapshot_generation=self._snapshot.generation,
+            )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            pinned = self._current_persisted_snapshot()
+            pinned_result = replace(
+                result,
+                snapshot_id=pinned.snapshot_id,
+                snapshot_generation=pinned.generation,
+            )
+            self._insert_decision(
+                agent,
+                tool,
+                args,
+                targets,
+                relationships,
+                pinned_result,
+                correlation_id=correlation_id,
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:  # noqa: BLE001 — roll back, then re-raise unchanged
+            # Interrupt-safe (see restore_checkpoint): never leak an open
+            # transaction, even on KeyboardInterrupt / CancelledError.
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        self._publish_snapshot(pinned)
+        return pinned_result
 
     def deny_log(
         self,
@@ -2401,6 +3303,26 @@ class ScopeStore:
                 }
             )
         return out
+
+    def scope_denies_for_correlation(
+        self, correlation_id: str, *, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """T3.1 spine: the authoritative scope DENY rows for one correlation id —
+        the side of the audit_mirror cross-check reconstruct trusts. A deny here
+        that is missing from the mirror means the chain is INCOMPLETE (the mirror
+        is best-effort; scope.db is fail-closed authoritative). Empty without a
+        DB."""
+        if self._conn is None:
+            return []
+        cur = self._conn.execute(
+            "SELECT ts,agent,tool,targets_json,reason FROM scope_decisions "
+            "WHERE verdict='deny' AND correlation_id=? ORDER BY ts LIMIT ?",
+            (correlation_id, max(1, min(int(limit), 5000))),
+        )
+        return [
+            {"ts": r[0], "agent": r[1], "tool": r[2], "targets": _json_loads(r[3]), "reason": r[4]}
+            for r in cur.fetchall()
+        ]
 
     def counts(self) -> dict[str, int]:
         """Aggregate (allow, deny) counts for sitrep / salient-report."""
@@ -2518,6 +3440,9 @@ def _rule_matches(rule: ScopeRule, target: Target) -> bool:
                                      target.host endswith ".suffix"
       host_glob rule, ip target    → False
     """
+    if rule.kind in {"repo", "cloud", "saas"}:
+        return target.kind == rule.kind and target.value == rule.pattern
+
     if rule.kind == "network":
         try:
             net = ipaddress.ip_network(rule.pattern, strict=False)

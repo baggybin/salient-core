@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .runtime import AgentBackend as AgentBackend
 from .runtime import AgentTool, JsonValue, ToolBundle
+from .runtime import ReapableBackend as ReapableBackend
 
 if TYPE_CHECKING:
     from .policy.scope import ScopeStore
@@ -126,6 +127,15 @@ class DaemonServices(Protocol):
     def _redispatch_increment(self, caller: str, target: str) -> None: ...
     def _redispatch_spend_one(self, caller: str, target: str) -> None: ...
     def _redispatch_grant_credit(self, caller: str, target: str, n: int) -> None: ...
+
+    # ── token-budget enforcement (control-ladder BUDGET rung) ─────────
+    # Charge one completed turn's usage against the agent's (or engagement
+    # pool's) token ceiling and return a verdict the runner acts on. The
+    # daemon owns the append-only spend ledger (so a runner reset cannot
+    # launder spend); the runner owns the enforcement action (park vs
+    # interrupt), because only it can interrupt the live SDK turn. Returns
+    # a ``salient_core.daemon._budget.BudgetVerdict``.
+    def budget_charge(self, agent: str, usage: Any, *, epoch: int, turn_seq: int) -> Any: ...
 
     # ── agent lifecycle ───────────────────────────────────────────────
     def expand_prompt(self, text: str) -> tuple[str, list[tuple[str, str]]]: ...

@@ -41,6 +41,10 @@ class Question:
     # Target operator for a `kind="note"` operator-to-operator note (None =
     # broadcast to everyone). Unused for agent questions.
     to_operator: str | None = None
+    # T3.1 spine. Correlation id of the asking agent's active job, so the
+    # operator answer joins to the turn that raised the question. None when the
+    # caller didn't supply it (e.g. a note, or a pre-spine call site).
+    correlation_id: str | None = None
 
 
 class QuestionInbox:
@@ -87,6 +91,7 @@ class QuestionInbox:
                     text=r["text"],
                     ts=float(r["asked_at"]),
                     kind=r["kind"],
+                    correlation_id=r.get("correlation_id"),
                 )
             )
         # Continue numbering past the highest id ever assigned (including
@@ -96,9 +101,19 @@ class QuestionInbox:
         self._next_id = max(self._next_id, self._store.max_question_id() + 1)
         return len(rows)
 
-    def add(self, agent: str, text: str, job_id: int = 0, kind: str = "operator") -> Question:
+    def add(
+        self,
+        agent: str,
+        text: str,
+        job_id: int = 0,
+        kind: str = "operator",
+        correlation_id: str | None = None,
+    ) -> Question:
         """File a question. Returns the new record. Does not announce — the
-        caller routes the banner / runner-stream / sub-fanout itself."""
+        caller routes the banner / runner-stream / sub-fanout itself.
+
+        `correlation_id` (T3.1) joins the question to the asking agent's active
+        turn; callers that have the runner's current job should pass it."""
         q = Question(
             id=self._next_id,
             agent=agent,
@@ -106,6 +121,7 @@ class QuestionInbox:
             text=text.strip(),
             ts=time.time(),
             kind=kind,
+            correlation_id=correlation_id,
         )
         self._next_id += 1
         self.questions.append(q)
@@ -117,6 +133,7 @@ class QuestionInbox:
                 job_id=q.job_id,
                 kind=q.kind,
                 asked_at=q.ts,
+                correlation_id=q.correlation_id,
             )
         return q
 

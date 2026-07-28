@@ -12,6 +12,7 @@ import copy
 import hashlib
 import logging
 import os
+from contextlib import suppress
 from functools import partial
 
 log = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ _LOOP_WARNED: set[str] = set()
 # a provider that imposes its own per-call deadline (the codex MCP gateway bounds
 # every tool at 120s) cannot silently cut the operator's answer window short.
 _APPROVAL_TIMEOUT_SEC: int = 600
+
 from collections import deque
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -61,7 +63,11 @@ def render_profile_block(*args: Any, **kwargs: Any) -> str:
 
 from ..protocols import ToolBuildContext
 from ..providers import ProviderName, get_provider_registry
-from ..runtime import AgentBackend, ToolBundle, gate_tool_bundle
+from ..runtime import (
+    AgentBackend,
+    ToolBundle,
+    gate_tool_bundle,
+)
 from ._backend import LocalClaudeBackend, _json_value
 from ._helpers import (
     Job,
@@ -134,7 +140,192 @@ def set_spawn_observer(observer: Any) -> None:
     _spawn_observer = observer
 
 
+def _budget_severity(verdict: Any) -> int:
+    """Rank a BudgetVerdict for the most-restrictive-wins combine.
+    ok < warn < over(warn) < over(pause) < over(stop)."""
+    from ._budget import BudgetAction
+
+    if verdict.action is BudgetAction.OK:
+        return 0
+    if verdict.action is BudgetAction.WARN:
+        return 1
+    # OVER: rank by the configured action
+    return {"warn": 2, "pause": 3, "stop": 4}.get(verdict.on_exhaustion, 3)
+
+
+async def _mirror_deny_to_audit(
+    context: Any,
+    *,
+    outcome: Any,
+    source: str,
+    agent: str,
+    tool: str,
+    tool_use_id: Any,
+    correlation_id: str | None,
+    runner: Any,
+    reason: str | None = None,
+    shadowed: bool = False,
+) -> Any:
+    """T3.1 spine. Best-effort mirror of a first-decision DENY into state.db's
+    ``audit_mirror`` so the reconstruct RPC can join it by correlation_id.
+
+    The single choke point shared by every PreToolUse deny path. Rules (from the
+    Fable+Grok design pass): it NEVER raises into the caller's control path (a
+    failed audit can't change allow/deny); the write is idempotent on
+    ``tool_use_id`` so replay/double-calls can't double-count; and it is called
+    only on FIRST decisions, never on a replay cache-hit. ``scope_deny``'s
+    authoritative row lives in scope.db; ``safeguard_block`` also has the
+    (non-joinable) JSONL safeguard audit emitted at the hook — so this table is
+    the JOINABLE copy for reconstruct, and a dropped safeguard_block row (write
+    failed with a DB present) is surfaced loudly rather than swallowed. Only
+    denies that RETURN through the hook are covered (killswitch / budget-park /
+    authz-latch block tools elsewhere) — reconstruct scopes its claim to
+    "scope + safeguard" accordingly. Returns ``outcome`` unchanged so it can wrap
+    a ``return``.
+
+    ``shadowed=True`` marks the one case where scope EVALUATED a deny but the
+    hook let the call through: an unclassified built-in under shadow mode
+    (``enforce_builtin_policy`` off). scope.db still records ``verdict='deny'``
+    there, so mirroring nothing made reconstruct report "deny in scope.db but
+    MISSING from the mirror — INCOMPLETE" for a tool that actually RAN. That
+    reads as "we lost a denial record" when the truth is "we permitted the
+    call" — control looking stricter than it was, plus a false alarm on every
+    such call. These are recorded as ``scope_deny_shadowed`` so the chain shows
+    the permissive outcome instead of hiding it behind a phantom gap.
+    """
+    hso = outcome.get("hookSpecificOutput") if isinstance(outcome, dict) else None
+    is_deny = isinstance(hso, dict) and hso.get("permissionDecision") == "deny"
+    if context is None or not (is_deny or shadowed):
+        return outcome
+    if shadowed and not is_deny:
+        op = "scope_deny_shadowed"
+    else:
+        op = {"scope": "scope_deny", "safeguard": "safeguard_block"}.get(source, "deny")
+    detail = reason or (hso.get("permissionDecisionReason") if hso else None)
+    ok = False
+    try:
+        ok = context.record_audit_mirror(
+            op=op,
+            agent=agent,
+            correlation_id=correlation_id,
+            tool=tool,
+            reason=detail,
+            tool_use_id=tool_use_id,
+        )
+    except Exception:  # noqa: BLE001 — audit must never perturb the deny
+        ok = False
+    if ok is False and op == "safeguard_block" and runner is not None:
+        with suppress(Exception):
+            await runner._record_jsonl(
+                "audit_mirror_drop",
+                {
+                    "agent": agent,
+                    "op": op,
+                    "tool": tool,
+                    "correlation_id": correlation_id,
+                    "tool_use_id": tool_use_id,
+                },
+            )
+    return outcome
+
+
 class _RunnerFactoryMixin:
+    # Meta-key prefix for the durable per-agent runner epoch. One row per agent
+    # in the context store's `meta` singleton table.
+    _RUNNER_EPOCH_META_PREFIX = "runner_epoch:"
+
+    def _allocate_runner_epoch(self, agent: str) -> int:
+        """Allocate the next **durable, per-agent** incarnation epoch.
+
+        The epoch fences one runner incarnation from the next. It is a fencing
+        token for durable records — the correlation id and the budget ledger key
+        `(agent, epoch, turn_seq)` — so it MUST be monotonic across daemon
+        restarts, not merely across one process lifetime. It previously was a
+        process-global counter, which meant a restart re-issued epoch 1, 2, 3…
+        in agent-start order: correlation ids collided (unrelated turns merged
+        into one reconstructed chain) and the ledger's idempotency key collided
+        (`charge()` no-opped, so the turn's tokens were never counted — spend
+        laundered by restart).
+
+        Persisted per agent under ``meta['runner_epoch:<agent>']``. Keying by
+        agent rather than globally is what lets two agents both hold epoch 1
+        without ambiguity: every consumer's key already carries the agent.
+
+        Degradation is monotonic-in-process and loud, never silently reused:
+        the in-process high-water mark floors the persisted value, so a failed
+        READ cannot hand back an epoch this process already issued, and a failed
+        WRITE is logged as a durability warning (the next boot may reuse the
+        epoch, which the operator deserves to know about).
+        """
+        key = f"{self._RUNNER_EPOCH_META_PREFIX}{agent}"
+        ctx = getattr(self, "context", None)
+
+        persisted = 0
+        seeded = False
+        if ctx is not None:
+            try:
+                raw = ctx.meta_get(key)
+                persisted = int(raw) if raw is not None else 0
+            except (AttributeError, TypeError, ValueError):
+                # Missing/garbled row: fall back to the in-process high-water
+                # mark below rather than restarting the sequence at 1.
+                persisted = 0
+        if persisted == 0:
+            # First allocation for this agent under the durable scheme. Epochs
+            # minted by the OLD process-local counter are already on disk in the
+            # budget ledger, and they start at 1 — so beginning afresh at 1 here
+            # would collide with them and the ledger would drop the very first
+            # charge after upgrading (the same bug, at the migration seam).
+            # Seed above the highest epoch that agent already carries.
+            persisted = max(persisted, self._prior_ledger_epoch(agent))
+            seeded = persisted > 0
+
+        # Lazily held on the daemon so the concrete (out-of-repo) daemon need
+        # not declare the field.
+        issued: dict[str, int] = getattr(self, "_runner_epochs", None) or {}
+        self._runner_epochs = issued
+
+        epoch = max(persisted, issued.get(agent, 0)) + 1
+        issued[agent] = epoch
+        if seeded:
+            log.info(
+                "seeded durable runner epoch for %s at %d from prior ledger entries "
+                "(pre-upgrade epochs were process-local)",
+                agent,
+                epoch,
+            )
+
+        if ctx is not None:
+            try:
+                ctx.meta_set(key, str(epoch))
+            except Exception:  # noqa: BLE001 — never block an agent starting
+                log.warning(
+                    "runner epoch for %s could not be persisted (epoch=%d); "
+                    "correlation ids and budget-ledger keys are only unique "
+                    "within this daemon process until the store recovers",
+                    agent,
+                    epoch,
+                )
+        return epoch
+
+    def _prior_ledger_epoch(self, agent: str) -> int:
+        """Highest epoch already recorded for ``agent`` in the persisted budget
+        ledger, or 0.
+
+        Only consulted once per agent, to seed the durable counter above epochs
+        minted by the pre-2026-07-25 process-local scheme. Best-effort: if the
+        ledger can't be read we fall back to starting at 1, which is no worse
+        than the behaviour being replaced.
+        """
+        try:
+            snapshot = self._budget_ledger_get().snapshot()
+        except Exception:  # noqa: BLE001 — never block an agent starting
+            return 0
+        return max(
+            (int(row.get("epoch") or 0) for row in snapshot if row.get("agent") == agent),
+            default=0,
+        )
+
     def _notify_agent_spawn(self, name: str, cfg: dict[str, Any], runner: Any) -> None:
         """Fire the registered spawn observer, if any. Never raises into the
         spawn path — a broken skin observer must not stop an agent starting."""
@@ -418,6 +609,39 @@ class _RunnerFactoryMixin:
 
         return hook
 
+    def _make_budget_gate_hook(self, agent_name: str):
+        """PreToolUse deny gate for the token-budget floor (hook B).
+
+        Once a runner crosses its token ceiling the enforcement path arms
+        ``runner._budget_gate_armed``; from then on this hook DENIES every
+        tool call. It is the structural floor that blocks new tool spend
+        *without ever cancelling an in-flight tool subprocess* — a
+        PreToolUse hook fires only *between* tool calls, so by construction
+        it cannot touch work already running (the sacred invariant). The
+        per-turn interrupt (hook A, in the runner loop) is the companion
+        that stops a tool-less token burn; this stops the tool loop.
+
+        Always registered; a no-op until the gate is armed. Cleared only by
+        an explicit operator resume (``runner.budget_resume()``)."""
+
+        async def hook(input_data, tool_use_id, context):  # noqa: ARG001
+            runner = self.runners.get(agent_name)
+            if runner is None or not getattr(runner, "_budget_gate_armed", False):
+                return {}
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "token budget exhausted — this agent is budget-parked. "
+                        "No further tool calls until the operator raises the "
+                        "ceiling or credits tokens. Finalize with what you have."
+                    ),
+                }
+            }
+
+        return hook
+
     def _make_safeguard_hook(self, agent_name: str):
         """Apply universal safeguards and SDK-native authorization once."""
 
@@ -463,6 +687,32 @@ class _RunnerFactoryMixin:
                 if runner is not None
                 else resolve_config(agent_cfg, self.profile)
             )
+
+            # T3.1 spine. Correlation id of the caller's active turn, so a deny
+            # joins to the job that triggered it. `_finalize` is the SINGLE choke
+            # point that mirrors a deny into state.db's audit_mirror: every
+            # first-decision deny return routes through it, the replay cache-hit
+            # does NOT (already mirrored on the owner pass), and the write is
+            # idempotent on tool_use_id so it can never double-count. It is
+            # strictly best-effort — a failed mirror can never change the deny.
+            corr = getattr(getattr(runner, "current", None), "correlation_id", None)
+
+            async def _finalize(
+                outcome, *, source: str, reason: str | None = None, shadowed: bool = False
+            ):
+                return await _mirror_deny_to_audit(
+                    getattr(self, "context", None),
+                    outcome=outcome,
+                    source=source,
+                    agent=agent_name,
+                    tool=tool_name,
+                    tool_use_id=tool_use_id,
+                    correlation_id=corr,
+                    runner=runner,
+                    reason=reason,
+                    shadowed=shadowed,
+                )
+
             if tool_name.startswith("mcp__"):
                 rest = tool_name.removeprefix("mcp__")
                 if "__" not in rest:
@@ -478,7 +728,7 @@ class _RunnerFactoryMixin:
                 case ReplayOutcome(outcome=outcome):
                     return outcome
                 case ReplayRejected(reason=reason):
-                    return deny(reason)
+                    return await _finalize(deny(reason), source="replay_rejected", reason=reason)
                 case ReplayOwner() as owner:
                     pass
                 case unreachable:
@@ -501,14 +751,17 @@ class _RunnerFactoryMixin:
                             safeguard_payload(safeguards.audit),
                         )
                 if not safeguards.allowed:
-                    return replay_cache.complete(
-                        owner,
-                        deny(safeguards.model_reason),
+                    return await _finalize(
+                        replay_cache.complete(owner, deny(safeguards.model_reason)),
+                        source="safeguard",
+                        reason=safeguards.model_reason,
                     )
                 if tool_name.startswith("mcp__"):
                     return replay_cache.complete(owner, {})
 
-                evaluation = await evaluate_scope(invocation, self.scope, dataset)
+                evaluation = await evaluate_scope(
+                    invocation, self.scope, dataset, correlation_id=corr
+                )
                 if evaluation.allowed:
                     return replay_cache.complete(owner, {})
                 enforce = runner._enforce_builtin_policy if runner is not None else False
@@ -554,7 +807,16 @@ class _RunnerFactoryMixin:
                         },
                     )
                 outcome = deny(evaluation.reason) if enforce else {}
-                return replay_cache.complete(owner, outcome)
+                # `shadowed` when scope evaluated a deny but we are letting the
+                # call through anyway (shadow mode). Unambiguous here: the
+                # `evaluation.allowed` branch above already returned, so
+                # reaching this line means the evaluation was NOT an allow.
+                return await _finalize(
+                    replay_cache.complete(owner, outcome),
+                    source="scope",
+                    reason=evaluation.reason,
+                    shadowed=not enforce,
+                )
             finally:
                 replay_cache.fail(owner)
 
@@ -694,12 +956,33 @@ class _RunnerFactoryMixin:
                 else get_active()
             )
             invocation = normalize_mcp(tool_name, tool_input, agent_name)
+            # T3.1: same single-choke-point mirror as the safeguard hook —
+            # external-MCP scope denies route through HERE, not _make_safeguard_hook,
+            # so they must be mirrored too or the chain silently omits them.
+            corr = getattr(getattr(runner, "current", None), "correlation_id", None)
+
+            async def _finalize(
+                outcome, *, source: str, reason: str | None = None, shadowed: bool = False
+            ):
+                return await _mirror_deny_to_audit(
+                    getattr(self, "context", None),
+                    outcome=outcome,
+                    source=source,
+                    agent=agent_name,
+                    tool=tool_name,
+                    tool_use_id=tool_use_id,
+                    correlation_id=corr,
+                    runner=runner,
+                    reason=reason,
+                    shadowed=shadowed,
+                )
+
             reservation = await replay_cache.reserve(tool_use_id, invocation)
             match reservation:
                 case ReplayOutcome(outcome=outcome):
                     return outcome
                 case ReplayRejected(reason=reason):
-                    return deny(reason)
+                    return await _finalize(deny(reason), source="replay_rejected", reason=reason)
                 case ReplayOwner() as owner:
                     pass
                 case unreachable:
@@ -709,9 +992,14 @@ class _RunnerFactoryMixin:
                     invocation,
                     self.scope,
                     ScopeEvaluationRequest(dataset=dataset, allow_research=False),
+                    correlation_id=corr,
                 )
                 if not evaluation.allowed:
-                    return replay_cache.complete(owner, deny(evaluation.reason))
+                    return await _finalize(
+                        replay_cache.complete(owner, deny(evaluation.reason)),
+                        source="scope",
+                        reason=evaluation.reason,
+                    )
                 return replay_cache.complete(owner, allow())
             finally:
                 replay_cache.fail(owner)
@@ -1188,6 +1476,25 @@ class _RunnerFactoryMixin:
             # shared object (None when the hub isn't running). Leading underscore
             # signals daemon-injected; factories that don't need it ignore it.
             factory_config.setdefault("_worker_hub", getattr(self, "worker_hub", None))
+            # T3.1 spine. Let the remote-worker factory join each forwarded
+            # remote.* call to the caller's active turn: a provider that reads
+            # the live runner's current-job correlation id at CALL time (config
+            # is bound once at construction, but correlation changes per turn),
+            # and the best-effort state.db recorder. Factories that don't forward
+            # remote calls ignore both keys.
+            _corr_agent = cfg.get("name")
+
+            def _corr_provider(_name: str | None = _corr_agent) -> str | None:
+                cur = getattr(self.runners.get(_name), "current", None)
+                return getattr(cur, "correlation_id", None)
+
+            factory_config.setdefault("_correlation_provider", _corr_provider)
+            _ctx = getattr(self, "context", None)
+            if _ctx is not None:
+                factory_config.setdefault(
+                    "_record_remote_call",
+                    partial(_ctx.record_remote_call, agent=_corr_agent),
+                )
             # Engagement posture (stealth/normal/loud), daemon-injected so
             # rate-bearing factories can pick a
             # conservative default. The safeguard hook's loud-technique
@@ -1411,6 +1718,11 @@ class _RunnerFactoryMixin:
         #      turn count visible without relying on prose teaching.
         pre_tool_hooks: list[HookMatcher] = [
             HookMatcher(hooks=[self._make_safeguard_hook(cfg["name"])]),
+            # Token-budget deny gate (hook B). Always on, no-op until the
+            # runner crosses its ceiling; then denies every tool call
+            # without cancelling any in-flight tool. Early in the chain so
+            # a parked agent's calls are refused before other hooks work.
+            HookMatcher(hooks=[self._make_budget_gate_hook(cfg["name"])]),
         ]
         if external_server_names:
             pre_tool_hooks.append(
@@ -1793,6 +2105,14 @@ class _RunnerFactoryMixin:
                 config["instructions"] = self._augment_system_prompt(cfg)
 
                 def _make_polybrain_backend() -> AgentBackend:
+                    # Deliberately NO `safeguard_hook=`: the bundle every
+                    # provider receives is already gated by
+                    # `_gate_provider_bundle`, which runs the real hook stack
+                    # (budget + full safeguard evaluation + approve_before with
+                    # edit verdicts) rather than polybrain's simplified mirror.
+                    # Passing both would evaluate policy twice and prompt the
+                    # operator TWICE for a single approve_before call. The
+                    # backend parameter stays functional for external callers.
                     return provider.create_backend(
                         config,
                         tool_bundle=tool_bundle,
@@ -1827,6 +2147,14 @@ class _RunnerFactoryMixin:
         r._prompt_sha = hashlib.sha256(
             (cfg.get("system_prompt") or "").encode("utf-8", "replace")
         ).hexdigest()
+        # T3.1: sha of the ASSEMBLED prompt the model runs under — the same
+        # `_augment_system_prompt(cfg)` all providers consume (default via
+        # _build_options, codex/polybrain via config["instructions"]). It's
+        # deterministic, so recomputing it here at bake yields the identical
+        # string; the disk re-read it triggers is idempotent at construction.
+        r._assembled_prompt_sha = hashlib.sha256(
+            self._augment_system_prompt(cfg).encode("utf-8", "replace")
+        ).hexdigest()
         if self.context is not None:
             self.context.record_prompt_version(
                 cfg["name"],
@@ -1848,17 +2176,23 @@ class _RunnerFactoryMixin:
         # Inject the daemon-wide event hub so _publish mirrors every event to
         # the global /ws/events/all stream (not just the per-agent tail).
         r._event_hub = self.event_hub
-        # Stamp a per-incarnation epoch — a monotonic daemon-lifetime int — so
-        # every event this runner publishes carries `(agent, epoch, seq)`. The
-        # per-runner `seq` resets when a same-name runner is rebuilt; without
-        # the epoch a hub-ring replay of the old incarnation would suppress a
-        # live event with a colliding `(agent, seq)` from the new one. Lazily
-        # counted on the daemon so the concrete (out-of-repo) daemon need not
-        # declare the field; in-memory rings don't survive a daemon restart, so
-        # a lifetime-monotonic int never collides.
-        epoch = getattr(self, "_runner_epoch_counter", 0) + 1
-        self._runner_epoch_counter = epoch
-        r._epoch = epoch
+        # Stamp a per-incarnation epoch so every event this runner publishes
+        # carries `(agent, epoch, seq)`. The per-runner `seq` resets when a
+        # same-name runner is rebuilt; without the epoch a hub-ring replay of
+        # the old incarnation would suppress a live event with a colliding
+        # `(agent, seq)` from the new one.
+        #
+        # The epoch is DURABLE (per-agent, persisted) — not a process-lifetime
+        # counter. It began life scoped to the in-memory event ring, where "the
+        # ring dies with the process" made a process-local int safe. It is now
+        # ALSO the fencing token for two durable records — the correlation id
+        # (`Job.correlation_id`) and the budget ledger key
+        # `(agent, epoch, turn_seq)` — and for those the assumption is false: a
+        # process-local counter re-issued the same epochs after every restart,
+        # which merged unrelated turns into one reconstructed chain and made the
+        # ledger silently drop repeat-keyed charges. See
+        # `_allocate_runner_epoch`.
+        r._epoch = self._allocate_runner_epoch(cfg["name"])
         # Inject engagement path so the runner can write evidence files.
         r._engagement_path = self.engagement_path
         # Inject scope store so each task message gets a live "Active scope"
@@ -2024,13 +2358,14 @@ class _RunnerFactoryMixin:
         demonstrates why: it drifted from the thing it mirrored, running a bare
         `check_intent` instead of the full `evaluate_safeguards` (so no posture
         / loud patterns, no strike counter, no audit mirror), carrying a
-        simplified `approve_before` with no edit verdicts, and — worst —
-        keying `check_intent` on the BARE tool name while every dataset key is
-        qualified, so it matched nothing at all. A mirror of a policy matcher
-        rots; the matcher itself cannot.
+        simplified `approve_before` with no edit verdicts, and omitting the
+        token-budget gate outright. A mirror of a policy matcher rots; the
+        matcher itself cannot.
 
-        `approve_before` is LAST because it is the only check that can block on
-        a human, so a call that will be refused anyway never reaches a prompt.
+        Order mirrors `_build_options`: the budget gate is FIRST because it is
+        the cheapest deny and a budget-parked agent must never reach an
+        interactive prompt; `approve_before` is LAST because it is the only
+        check that can block on a human.
 
         The SDK-only hooks are absent by design, not by omission:
         read-containment and subagent-approval gate built-in SDK tools
@@ -2039,7 +2374,10 @@ class _RunnerFactoryMixin:
         analogue.
         """
         name = cfg["name"]
-        checks: list[Any] = [self._make_safeguard_hook(name)]
+        checks: list[Any] = [
+            self._make_budget_gate_hook(name),
+            self._make_safeguard_hook(name),
+        ]
         if (cfg.get("policy") or {}).get("approve_before"):
             checks.append(self._make_approve_before_hook(name))
         return checks
@@ -2047,20 +2385,25 @@ class _RunnerFactoryMixin:
     def _gate_provider_bundle(self, cfg: dict[str, Any], bundle: ToolBundle) -> ToolBundle:
         """Install the PreToolUse gate on every tool a provider runtime can call.
 
-        `_build_options` — where the SDK path registers safeguards and
-        `approve_before` — runs ONLY under `runtime is None`. Provider runtimes
-        (codex, polybrain, and whatever is registered next) never reached it, so
-        their tool calls hit handlers with no safeguard evaluation and no
-        operator consent gate. Scope was the lone survivor, and only because it
-        lives INSIDE the built handler rather than in a hook.
+        `_build_options` — where the SDK path registers safeguards,
+        `approve_before` and the token-budget floor — runs ONLY under
+        `runtime is None`. Provider runtimes (codex, polybrain, and whatever is
+        registered next) never reached it, so their tool calls hit handlers with
+        no safeguard evaluation, no operator consent gate and no budget floor.
+        Scope was the lone survivor, and only because it lives INSIDE the built
+        handler rather than in a hook.
 
         Wrapping here — the one seam every provider bundle passes through —
         means a newly registered provider inherits the gate by construction
-        instead of by remembering to.
+        instead of by remembering to. `tests/test_provider_gate_parity.py`
+        holds that property against the live provider registry by driving a
+        real tool call through each one and asserting the handler never ran.
 
         The WRAPPING itself lives in `runtime.gate_tool_bundle`, not here, so a
-        host that does not compose this mixin can still apply it. This method's
-        job is only to decide WHICH checks apply and what the operator budget is.
+        host that does not compose this mixin can still apply it — `TutorDaemon`
+        runs its own `_make_runner` and would otherwise reimplement this seam
+        (and its bugs) a third time. This method's job is only to decide WHICH
+        checks apply to this agent and what the operator budget is.
         """
         if not bundle.tools:
             return bundle
@@ -2199,7 +2542,9 @@ class _RunnerFactoryMixin:
         except Exception as e:
             log.exception("agent %s start failed: %r", name, e)
             raise
-        log.info("agent %s started", name)
+        # No start line here — `AgentRunner._run` logs it once the runner is
+        # actually ready, which covers this path AND the boot/resume/fork/
+        # doppelganger/reset paths that never call start_agent.
 
     @staticmethod
     def _auto_checkpoint_config() -> tuple[int, bool]:
@@ -2266,6 +2611,154 @@ class _RunnerFactoryMixin:
                 )
             except Exception:  # noqa: BLE001
                 pass
+
+    # ── token-budget enforcement (control-ladder BUDGET rung) ─────────
+    def _budget_ledger_get(self):
+        """Lazily materialise the daemon's append-only spend ledger,
+        loading any persisted snapshot on first touch so spend survives a
+        daemon restart. Held on the daemon (not the runner) so a runner
+        ``reset`` cannot zero it."""
+        from ._budget import BudgetLedger
+
+        led = getattr(self, "_budget_ledger", None)
+        if led is None:
+            led = BudgetLedger.from_snapshot(self._budget_load())
+            self._budget_ledger = led
+        return led
+
+    def budget_reconcile(self) -> list[dict[str, Any]]:
+        """Cross-check the enforcement ledger against the usage ledger.
+
+        The two accountings record the same turns by different routes — the
+        budget ledger is a synchronous, idempotency-keyed accumulator that gates
+        spend; ``usage_ledger`` is a best-effort durable audit row written
+        off-loop. They share no key (the ledger is keyed
+        ``(agent, epoch, turn_seq)``, the audit row by correlation id), so for
+        most of their life NOTHING checked that they agreed, and a divergence
+        was invisible. That is how 662,254 uncharged tokens sat undetected on a
+        live engagement until someone summed both by hand.
+
+        Returns one row per agent whose totals disagree, ledger-relative:
+        ``delta < 0`` means the ledger charged LESS than was actually spent
+        (the dangerous direction — spend that no ceiling ever saw).
+
+        Advisory, never enforcing: a divergence is a signal to investigate, and
+        silently "repairing" the ledger from a best-effort source would make the
+        enforcement number unauditable.
+        """
+        ctx = getattr(self, "context", None)
+        if ctx is None:
+            return []
+        try:
+            actual = ctx.usage_totals_by_agent()
+        except Exception:  # noqa: BLE001 — a reporting read must never break boot
+            return []
+        if not actual:
+            return []
+
+        led = self._budget_ledger_get()
+        out: list[dict[str, Any]] = []
+        for agent, totals in sorted(actual.items()):
+            charged = led.spent_for_agent(agent)
+            spent = int(totals.get("tokens") or 0)
+            if charged != spent:
+                out.append(
+                    {
+                        "agent": agent,
+                        "charged_tokens": charged,
+                        "usage_tokens": spent,
+                        "delta_tokens": charged - spent,
+                        "usage_turns": int(totals.get("turns") or 0),
+                    }
+                )
+        return out
+
+    def _budget_load(self) -> list[dict] | None:
+        """Persistence read hook. Core default: in-memory only (no prior
+        rows). The skin overrides this to read the engagement dir so spend
+        survives a daemon restart."""
+        return None
+
+    def _budget_persist(self, snapshot: list[dict]) -> None:  # noqa: ARG002
+        """Persistence write hook. Core default: no-op. The skin overrides
+        to write the snapshot to the engagement dir."""
+        return None
+
+    def _budget_cfg(self, agent: str) -> dict[str, Any]:
+        """Effective per-agent budget config from the engagement profile
+        (``token_budgets.<agent>``). The skin's config RPC writes here."""
+        table = (self.profile or {}).get("token_budgets") or {}
+        raw = table.get(agent) or {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _budget_pool_cfg(self) -> dict[str, Any]:
+        """Reserved engagement-pool ceiling (``token_budgets.__pool__``),
+        stored separately from agent assignments so several agents can't
+        each hold a conflicting copy of the shared ceiling."""
+        table = (self.profile or {}).get("token_budgets") or {}
+        raw = table.get("__pool__") or {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _budget_pool_members(self) -> frozenset[str]:
+        table = (self.profile or {}).get("token_budgets") or {}
+        return frozenset(
+            name
+            for name, cfg in table.items()
+            if name != "__pool__" and isinstance(cfg, dict) and cfg.get("engagement_pool")
+        )
+
+    def budget_charge(self, agent: str, usage: Any, *, epoch: int, turn_seq: int):
+        """Charge one completed turn against the token budget and return a
+        :class:`BudgetVerdict`. Idempotent per ``(agent, epoch, turn_seq)``.
+
+        The daemon does the accounting + verdict *level*; the runner maps an
+        enforced verdict to soft-stop (park) or hard-stop (interrupt), since
+        only it can interrupt the live turn.
+        """
+        from ._budget import BudgetAction, BudgetVerdict, evaluate_budget, turn_tokens
+
+        led = self._budget_ledger_get()
+        charged = led.charge(agent, epoch, turn_seq, turn_tokens(usage))
+        if charged:
+            # Persist only when the ledger actually changed. Best-effort:
+            # never let a persistence hiccup break the runner loop.
+            try:
+                self._budget_persist(led.snapshot())
+            except Exception:  # noqa: BLE001
+                pass
+
+        verdicts = []
+        acfg = self._budget_cfg(agent)
+        agent_ceiling = acfg.get("ceiling_tokens")
+        if isinstance(agent_ceiling, int) and agent_ceiling > 0:
+            verdicts.append(
+                evaluate_budget(
+                    spent=led.spent_for_agent(agent),
+                    ceiling=agent_ceiling,
+                    warn_frac=float(acfg.get("warn_frac", 0.8) or 0.8),
+                    on_exhaustion=str(acfg.get("on_exhaustion", "pause") or "pause"),
+                    scope="agent",
+                )
+            )
+
+        if acfg.get("engagement_pool"):
+            pcfg = self._budget_pool_cfg()
+            pool_ceiling = pcfg.get("ceiling_tokens")
+            if isinstance(pool_ceiling, int) and pool_ceiling > 0:
+                verdicts.append(
+                    evaluate_budget(
+                        spent=led.spent_for_agents(self._budget_pool_members()),
+                        ceiling=pool_ceiling,
+                        warn_frac=float(pcfg.get("warn_frac", 0.8) or 0.8),
+                        on_exhaustion=str(pcfg.get("on_exhaustion", "pause") or "pause"),
+                        scope="engagement",
+                    )
+                )
+
+        if not verdicts:
+            return BudgetVerdict(BudgetAction.OK)
+        # Most-restrictive rule wins: stop > pause > over-warn > warn > ok.
+        return max(verdicts, key=_budget_severity)
 
     def _swarm_should_defer_teardown(
         self,

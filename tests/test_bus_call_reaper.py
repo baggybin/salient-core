@@ -39,22 +39,24 @@ class _ReaperDaemon(_QuestionsMixin):
         # them without dragging the full QuestionInbox + SQL setup.
         self.inbox = types.SimpleNamespace(
             added=[],
-            add=lambda agent, text, job_id=0, kind=None: self._mock_add(
+            add=lambda agent, text, job_id=0, kind=None, correlation_id=None: self._mock_add(
                 agent,
                 text,
                 job_id,
                 kind,
+                correlation_id,
             ),
             publish=lambda event, q: None,
         )
 
-    def _mock_add(self, agent, text, job_id, kind):
+    def _mock_add(self, agent, text, job_id, kind, correlation_id=None):
         q = types.SimpleNamespace(
             id=len(self.inbox.added) + 1,
             agent=agent,
             text=text,
             job_id=job_id,
             kind=kind,
+            correlation_id=correlation_id,
         )
         self.inbox.added.append(q)
         return q

@@ -182,13 +182,24 @@ def _pick_substitute(
     insertion order when more than one substitute for the same primary
     is up at once (rare, but the order-dependence was a real fragility).
 
+    Candidates are the UNION of the static roster (``all_cfgs``) and the live
+    ``runners`` — a runtime-materialized shadow (doppelganger / the per-primary
+    shadow selector) lives ONLY in ``runners`` (its cfg on ``runner.cfg``), so a
+    ``substitute_for`` read that only looked at ``all_cfgs`` would never see it.
+    We read the candidate's cfg from ``all_cfgs`` when present, else from the
+    runner. This is what makes a runners-only substitute actually route.
+
     A candidate the skin's agent-disabled checker rejects (operator-disabled,
     or availability-toggled off in the provider selector) is SKIPPED here so
     routing falls through to the primary — rather than picking it and having the
     dispatch guard refuse the whole call.
     """
-    for sub_name in sorted(all_cfgs or {}):
-        if (all_cfgs.get(sub_name) or {}).get("substitute_for") != name:
+    runners = runners or {}
+    for sub_name in sorted(set(all_cfgs or {}) | set(runners)):
+        cfg = (all_cfgs or {}).get(sub_name)
+        if cfg is None:
+            cfg = getattr(runners.get(sub_name), "cfg", None)
+        if (cfg or {}).get("substitute_for") != name:
             continue
         if _agent_disabled_checker is not None and _agent_disabled_checker(profile, sub_name):
             continue
@@ -236,7 +247,10 @@ async def _record_approval_bypass(
         scope,
     )
     with suppress(Exception):
-        daemon.context.record_bypass(caller, target, gate, snippet, scope)
+        # T3.1: join the bypass to the caller's active turn.
+        caller_runner = daemon.runners.get(caller)
+        corr = getattr(getattr(caller_runner, "current", None), "correlation_id", None)
+        daemon.context.record_bypass(caller, target, gate, snippet, scope, correlation_id=corr)
 
 
 async def _echo_child_stream(

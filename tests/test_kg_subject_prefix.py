@@ -1,6 +1,6 @@
 """KnowledgeGraph subject_prefix scoping on query / neighbors / embedding_counts.
 
-A downstream namespace read-fence used to over-fetch a saturating
+The namespace read-fence (salient-mountain) used to over-fetch a saturating
 window then post-filter in Python; these tests pin the kernel-tier prefix
 filter that makes fenced reads EXACT and bounded by the namespace size rather
 than the graph's. Backward-compatible (None/"" prefix == today's behavior).
