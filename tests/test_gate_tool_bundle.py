@@ -263,3 +263,56 @@ def test_the_public_symbol_is_importable_from_the_runtime_module() -> None:
     assert callable(runtime.PolicyDenied)
     sig = inspect.signature(runtime.gate_tool_bundle)
     assert set(sig.parameters) >= {"bundle", "agent_name", "server", "checks"}
+
+
+# ---------------------------------------------------------------------------
+# bus tools canonicalize differently — the regression this file missed once
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_bus_tools_are_qualified_under_the_bus_namespace() -> None:
+    """`bus.ask_agents`, NOT `<agent>.ask_agents`.
+
+    `mcp_identity` special-cases a `bus__` server segment, and the policy table
+    is keyed on `bus.ask_agent` / `bus.ask_agents`. Synthesizing the per-agent
+    form for a bus tool produces `<agent>.ask_agents`, which matches no entry —
+    the delegation denylist would look armed and catch nothing.
+
+    The first cut of this gate did exactly that. It slipped because the
+    end-to-end pin used a FACTORY tool (`ssh.ssh_exec`), where the per-agent
+    form happens to be correct.
+    """
+    seen: list[dict[str, Any]] = []
+    bundle = gate_tool_bundle(
+        ToolBundle((_tool("ask_agents", []), _tool("scan", []))),
+        agent_name="manager",
+        server="manager",
+        checks=[_record(seen)],
+        bus_tool_names=frozenset({"ask_agents"}),
+    )
+    by_name = {t.name: t for t in bundle.tools}
+
+    await by_name["ask_agents"].handler({"prompt": "x"})
+    await by_name["scan"].handler({"target": "10.0.0.1"})
+
+    assert seen[0]["tool_name"] == "mcp__bus__manager__ask_agents"
+    # ...and a factory tool on the SAME agent keeps the per-agent form.
+    assert seen[1]["tool_name"] == "mcp__manager__scan"
+
+
+@pytest.mark.anyio
+async def test_a_bus_tool_left_out_of_the_set_keeps_the_agent_form() -> None:
+    """Documents the failure mode, so the cost of omitting a name is visible."""
+    seen: list[dict[str, Any]] = []
+    bundle = gate_tool_bundle(
+        ToolBundle((_tool("ask_agents", []),)),
+        agent_name="manager",
+        server="manager",
+        checks=[_record(seen)],
+        bus_tool_names=frozenset(),
+    )
+
+    await bundle.tools[0].handler({"prompt": "x"})
+
+    assert seen[0]["tool_name"] == "mcp__manager__ask_agents"

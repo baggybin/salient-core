@@ -2382,7 +2382,12 @@ class _RunnerFactoryMixin:
             checks.append(self._make_approve_before_hook(name))
         return checks
 
-    def _gate_provider_bundle(self, cfg: dict[str, Any], bundle: ToolBundle) -> ToolBundle:
+    def _gate_provider_bundle(
+        self,
+        cfg: dict[str, Any],
+        bundle: ToolBundle,
+        bus_tool_names: frozenset[str] = frozenset(),
+    ) -> ToolBundle:
         """Install the PreToolUse gate on every tool a provider runtime can call.
 
         `_build_options` — where the SDK path registers safeguards,
@@ -2420,6 +2425,10 @@ class _RunnerFactoryMixin:
             gate_budget_sec=(
                 _APPROVAL_TIMEOUT_SEC if (cfg.get("policy") or {}).get("approve_before") else 0
             ),
+            # Bus tools canonicalize to `bus.<name>`, not `<agent>.<name>`.
+            # Without this they miss every pattern keyed on `bus.*` — including
+            # the delegation denylist.
+            bus_tool_names=bus_tool_names,
         )
 
     def _build_provider_tool_bundle(self, cfg: dict[str, Any]) -> ToolBundle:
@@ -2429,7 +2438,9 @@ class _RunnerFactoryMixin:
             # Bus-only agent (no tool surface) — gated all the same: `ask_agent`
             # / `ask_agents` are bus tools, and a delegation fan-out is exactly
             # the call that must not slip past the prohibited-intent denylist.
-            return self._gate_provider_bundle(cfg, bus_bundle)
+            return self._gate_provider_bundle(
+                cfg, bus_bundle, frozenset(t.name for t in bus_bundle.tools)
+            )
         factory_config = dict(tool_cfg.get("config") or {})
         if self.engagement_path is not None:
             factory_config.setdefault("_engagement_path", str(self.engagement_path))
@@ -2470,6 +2481,9 @@ class _RunnerFactoryMixin:
                 factory_config,
                 context=context,
             ),
+            # The built bundle merges the factory's tools with the bus tools
+            # (`extra_tools=bus_bundle.tools`), so name the bus half explicitly.
+            frozenset(t.name for t in bus_bundle.tools),
         )
 
     def _on_loop_detected(

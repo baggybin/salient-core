@@ -118,6 +118,7 @@ def gate_tool_bundle(
     server: str,
     checks: Sequence[PolicyCheck],
     gate_budget_sec: int = 0,
+    bus_tool_names: frozenset[str] = frozenset(),
 ) -> ToolBundle:
     """Return `bundle` with every handler wrapped so `checks` run BEFORE it.
 
@@ -145,6 +146,10 @@ def gate_tool_bundle(
         gate_budget_sec: seconds of the eventual per-call deadline that belong
             to a human rather than the tool. Published as an annotation for a
             provider that imposes its own timeout; 0 to omit.
+        bus_tool_names: names in `bundle` that are BUS tools. They canonicalize
+            to `bus.<name>`, not `<server>.<name>` — see `_gated_handler`. Get
+            this from `make_bus_tool_bundle`'s returned bundle; omitting a bus
+            tool silently costs it every policy pattern keyed on `bus.*`.
 
     Raises:
         PolicyDenied: from the wrapped handler, when a check denies. Raised
@@ -162,7 +167,13 @@ def gate_tool_bundle(
         gated.append(
             _dataclass_replace(
                 tool,
-                handler=_gated_handler(tool, agent_name, server, checks),
+                handler=_gated_handler(
+                    tool,
+                    agent_name,
+                    server,
+                    checks,
+                    is_bus_tool=tool.name in bus_tool_names,
+                ),
                 annotations=annotations,
             )
         )
@@ -174,6 +185,8 @@ def _gated_handler(
     agent_name: str,
     server: str,
     checks: Sequence[PolicyCheck],
+    *,
+    is_bus_tool: bool = False,
 ) -> ToolHandler:
     """Wrap one handler so policy runs before it — or instead of it."""
     original = tool.handler
@@ -185,7 +198,17 @@ def _gated_handler(
     # the SDK path — same qualified_name, same dataset lookups. Passing bare
     # names would quietly take the builtin branch and double-evaluate scope: a
     # gate that looks armed and classifies wrong.
-    qualified = f"mcp__{server}__{tool.name}"
+    #
+    # BUS tools canonicalize differently: `mcp_identity` special-cases a
+    # `bus__` server segment and yields `bus.<name>`, which is what the policy
+    # table is keyed on (`bus.ask_agent`, `bus.ask_agents`). Synthesizing the
+    # per-agent form for them would produce `<agent>.ask_agents`, matching no
+    # entry — the delegation denylist would look armed and catch nothing, which
+    # is the exact failure mode of the mirror this gate replaced.
+    if is_bus_tool:
+        qualified = f"mcp__bus__{agent_name}__{tool.name}"
+    else:
+        qualified = f"mcp__{server}__{tool.name}"
 
     async def handler(arguments: Mapping[str, JsonValue]) -> JsonValue:
         tool_input: dict[str, Any] = dict(arguments or {})
