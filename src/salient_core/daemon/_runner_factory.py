@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import json
 import logging
 import os
 from functools import partial
@@ -19,6 +18,13 @@ log = logging.getLogger(__name__)
 
 # Warn-once set for the loop-detection question-filing path.
 _LOOP_WARNED: set[str] = set()
+
+# Ceiling on the interactive `approve_before` wait for an operator answer.
+# Module-level because TWO places need to agree on it: the hook itself, and the
+# provider-runtime gate, which republishes it as a per-tool budget annotation so
+# a provider that imposes its own per-call deadline (the codex MCP gateway bounds
+# every tool at 120s) cannot silently cut the operator's answer window short.
+_APPROVAL_TIMEOUT_SEC: int = 600
 from collections import deque
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -55,7 +61,7 @@ def render_profile_block(*args: Any, **kwargs: Any) -> str:
 
 from ..protocols import ToolBuildContext
 from ..providers import ProviderName, get_provider_registry
-from ..runtime import AgentBackend, ToolBundle
+from ..runtime import AgentBackend, ToolBundle, gate_tool_bundle
 from ._backend import LocalClaudeBackend, _json_value
 from ._helpers import (
     Job,
@@ -927,7 +933,7 @@ class _RunnerFactoryMixin:
                 sorted(hit),
             )
             try:
-                answer = await asyncio.wait_for(fut_q, timeout=600)
+                answer = await asyncio.wait_for(fut_q, timeout=_APPROVAL_TIMEOUT_SEC)
             except TimeoutError:
                 self.inbox.expire(qid, "[timed out]")
                 return {
@@ -935,7 +941,8 @@ class _RunnerFactoryMixin:
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
-                            f"operator approval Q{qid} timed out after 10 min — "
+                            f"operator approval Q{qid} timed out after "
+                            f"{_APPROVAL_TIMEOUT_SEC // 60} min — "
                             f"action refused (this call needs operator approval: "
                             f"{', '.join(sorted(hit))}). Surface it to the "
                             f"operator and retry when they're available."
@@ -1789,7 +1796,6 @@ class _RunnerFactoryMixin:
                     return provider.create_backend(
                         config,
                         tool_bundle=tool_bundle,
-                        safeguard_hook=self._make_polybrain_safeguard_hook(cfg["name"]),
                     )
 
                 backend_factory = _make_polybrain_backend
@@ -2009,78 +2015,78 @@ class _RunnerFactoryMixin:
 
         return codex_command_is_read_only(params)
 
-    def _make_polybrain_safeguard_hook(self, agent_name: str):
-        """Per-tool-call safeguard gate for polybrain backends.
+    def _provider_gate_checks(self, cfg: dict[str, Any]) -> list[Any]:
+        """The ordered PreToolUse checks a provider-runtime tool call must pass.
 
-        The polybrain backend executes `ToolBundle` handlers directly, so the
-        **scope** gate fires inside the handler wrapper (scope.gate) — but the
-        Claude-side **safeguards** (prohibited-intent patterns) and
-        **approve_before** wire enforcement are Claude-SDK PreToolUse hooks
-        that never run on this path. This hook closes that floor: it runs
-        before EVERY handler invocation, and a denial means the handler is
-        never called (the model gets an error tool result instead).
+        Built from the SAME hook factories `_build_options` registers for the
+        Claude-SDK path — reused deliberately, never re-implemented. The
+        previous per-provider approach (`_make_polybrain_safeguard_hook`)
+        demonstrates why: it drifted from the thing it mirrored, running a bare
+        `check_intent` instead of the full `evaluate_safeguards` (so no posture
+        / loud patterns, no strike counter, no audit mirror), carrying a
+        simplified `approve_before` with no edit verdicts, and — worst —
+        keying `check_intent` on the BARE tool name while every dataset key is
+        qualified, so it matched nothing at all. A mirror of a policy matcher
+        rots; the matcher itself cannot.
 
-        Layer 1 mirrors `_make_safeguard_hook`'s intent check; layer 2 mirrors
-        `_make_approve_before_hook`'s classification + operator question
-        (simplified: approve/deny only — no edit verdicts in v1). Unlike the
-        codex resolver, no `evaluate_scope` here: the bundle handlers already
-        carry scope.gate.
+        `approve_before` is LAST because it is the only check that can block on
+        a human, so a call that will be refused anyway never reaches a prompt.
+
+        The SDK-only hooks are absent by design, not by omission:
+        read-containment and subagent-approval gate built-in SDK tools
+        (`Read` / `Agent`), which never appear in a provider `ToolBundle`, and
+        the budget *chip* is an additionalContext annotation with no bundle
+        analogue.
         """
+        name = cfg["name"]
+        checks: list[Any] = [self._make_safeguard_hook(name)]
+        if (cfg.get("policy") or {}).get("approve_before"):
+            checks.append(self._make_approve_before_hook(name))
+        return checks
 
-        async def guard(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
-            from ..policy.safeguards import check_intent, resolve_config
+    def _gate_provider_bundle(self, cfg: dict[str, Any], bundle: ToolBundle) -> ToolBundle:
+        """Install the PreToolUse gate on every tool a provider runtime can call.
 
-            runner = self.runners.get(agent_name)
-            agent_cfg = (runner.cfg if runner else None) or {}
-            allowed, reason = check_intent(
-                tool_name,
-                dict(arguments),
-                config=resolve_config(agent_cfg, self.profile),
-            )
-            if not allowed:
-                return reason or "prohibited by safeguards"
+        `_build_options` — where the SDK path registers safeguards and
+        `approve_before` — runs ONLY under `runtime is None`. Provider runtimes
+        (codex, polybrain, and whatever is registered next) never reached it, so
+        their tool calls hit handlers with no safeguard evaluation and no
+        operator consent gate. Scope was the lone survivor, and only because it
+        lives INSIDE the built handler rather than in a hook.
 
-            gated = set((agent_cfg.get("policy") or {}).get("approve_before") or [])
-            if gated:
-                classify = get_daemon_skin_module("action_class").classify_tool_action
-                tool_type = (agent_cfg.get("tool") or {}).get("type")
-                hit = gated & classify(tool_type, tool_name, dict(arguments))
-                if hit:
-                    from ..bus import _parse_delegation_answer
+        Wrapping here — the one seam every provider bundle passes through —
+        means a newly registered provider inherits the gate by construction
+        instead of by remembering to.
 
-                    args_summary = json.dumps(dict(arguments), default=str)[:200]
-                    summary = f"{tool_name}({args_summary}) — classes: {', '.join(sorted(hit))}"[
-                        :300
-                    ]
-                    qid, answer_future = self.add_tool_approval_question(
-                        agent_name,
-                        "polybrain_tool",
-                        summary,
-                        sorted(hit),
-                    )
-                    try:
-                        answer = await asyncio.wait_for(answer_future, timeout=600)
-                    except TimeoutError:
-                        self.inbox.expire(qid, "[timed out]")
-                        return "operator approval timed out (deny-by-default)"
-                    except BaseException:
-                        # Interrupt/cancel (killswitch) or any error while waiting:
-                        # don't leave a phantom approval question dangling in the
-                        # operator inbox for a call that will never run.
-                        self.inbox.expire(qid, "[interrupted]")
-                        raise
-                    verdict, _payload = _parse_delegation_answer(answer)
-                    if verdict != "approve":
-                        return f"operator denied ({verdict or 'no'})"
-            return None
+        The WRAPPING itself lives in `runtime.gate_tool_bundle`, not here, so a
+        host that does not compose this mixin can still apply it. This method's
+        job is only to decide WHICH checks apply and what the operator budget is.
+        """
+        if not bundle.tools:
+            return bundle
+        from ..alias import to_wire
 
-        return guard
+        agent_name = cfg["name"]
+        return gate_tool_bundle(
+            bundle,
+            agent_name=agent_name,
+            server=to_wire(agent_name),
+            checks=self._provider_gate_checks(cfg),
+            # Only agents that actually declare `approve_before` can block on a
+            # human, so only they need the extra budget published.
+            gate_budget_sec=(
+                _APPROVAL_TIMEOUT_SEC if (cfg.get("policy") or {}).get("approve_before") else 0
+            ),
+        )
 
     def _build_provider_tool_bundle(self, cfg: dict[str, Any]) -> ToolBundle:
         bus_bundle, bus_wires = make_bus_tool_bundle(cast("DaemonServices", self), cfg["name"])
         tool_cfg = cfg.get("tool")
         if not isinstance(tool_cfg, dict):
-            return bus_bundle
+            # Bus-only agent (no tool surface) — gated all the same: `ask_agent`
+            # / `ask_agents` are bus tools, and a delegation fan-out is exactly
+            # the call that must not slip past the prohibited-intent denylist.
+            return self._gate_provider_bundle(cfg, bus_bundle)
         factory_config = dict(tool_cfg.get("config") or {})
         if self.engagement_path is not None:
             factory_config.setdefault("_engagement_path", str(self.engagement_path))
@@ -2114,10 +2120,13 @@ class _RunnerFactoryMixin:
             extra_tools=bus_bundle.tools,
             extra_bare_wires=bus_wires,
         )
-        return get_tool_bundle_builder()(
-            tool_cfg["type"],
-            factory_config,
-            context=context,
+        return self._gate_provider_bundle(
+            cfg,
+            get_tool_bundle_builder()(
+                tool_cfg["type"],
+                factory_config,
+                context=context,
+            ),
         )
 
     def _on_loop_detected(

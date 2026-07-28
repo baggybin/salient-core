@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Final
 
-from .runtime import AgentTool, JsonValue, ToolBundle
+from .runtime import POLICY_GATE_BUDGET_ANNOTATION, AgentTool, JsonValue, ToolBundle
 
 _log = logging.getLogger("salient.daemon.codex_mcp")
 
@@ -65,6 +65,10 @@ _BLOCKING_TOOL_TIMEOUT_SEC: Final = 4 * 3600 + 300  # 4h + slop
 # reaper + a concurrency cap on long-ceiling handlers, both out of scope here).
 _HARD_MAX_TOOL_TIMEOUT_SEC: Final = 7800  # 2h10m — covers keyspace 7200 + margin
 _TOOL_TIMEOUT_SLOP_SEC: Final = 60
+# Upper bound on the operator-approval budget a gated tool may add to its
+# ceiling. The daemon publishes 600s (the approve_before wait); this clamp keeps
+# a malformed annotation from pinning a handler open.
+_MAX_GATE_BUDGET_SEC: Final = 900
 
 
 def _positive_timeout(raw: object) -> float | None:
@@ -105,10 +109,31 @@ def _schema_declares_timeout(schema: object) -> bool:
     return isinstance(props, Mapping) and "timeout_s" in props
 
 
+def _gate_budget(annotations: Mapping[str, object] | None) -> int:
+    """Seconds of a gated tool's ceiling that belong to a HUMAN, not the tool.
+
+    The provider-runtime policy gate runs INSIDE the handler on this path, and
+    its `approve_before` rung can block waiting for an operator answer. That
+    wait is not tool work, so it must not be charged against the tool's budget:
+    without this the 120s default would cancel the call while the operator was
+    still reading the question — failing closed (good) but reporting a bare
+    timeout instead of an honest refusal, and orphaning the question in the
+    inbox because the hook's own expiry never runs (good outcome, dishonest
+    story). Clamped: the value is ours, not model-supplied, but a bad
+    annotation must not pin a handler open."""
+    raw = (annotations or {}).get(POLICY_GATE_BUDGET_ANNOTATION)
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return 0
+    if raw <= 0:
+        return 0
+    return int(min(raw, _MAX_GATE_BUDGET_SEC))
+
+
 def _tool_timeout(
     bare_name: str,
     args: Mapping[str, object] | None = None,
     schema: object | None = None,
+    annotations: Mapping[str, object] | None = None,
 ) -> int:
     """Per-call gateway ceiling.
 
@@ -118,19 +143,25 @@ def _tool_timeout(
     - Else, if the tool's schema DECLARES `timeout_s` (author says long-capable),
       give it the hard-max backstop — its OWN internal timeout fires first.
     - Else the tight 120s bound.
+    - A policy-gated tool then adds its operator-approval budget ON TOP of the
+      computed ceiling (see `_gate_budget`). Added after the clamp on purpose:
+      the clamp bounds MODEL-controlled `timeout_s`, while the gate budget is
+      the daemon's own constant.
 
-    `args`/`schema` default to None so the pure-name call form stays valid."""
+    `args`/`schema`/`annotations` default to None so the pure-name call form
+    stays valid."""
+    budget = _gate_budget(annotations)
     if bare_name.startswith("ask_"):
         return _BLOCKING_TOOL_TIMEOUT_SEC
     declared = _positive_timeout((args or {}).get("timeout_s"))
     if declared is not None:
-        return min(
+        return budget + min(
             max(int(declared) + _TOOL_TIMEOUT_SLOP_SEC, _TOOL_TIMEOUT_SEC),
             _HARD_MAX_TOOL_TIMEOUT_SEC,
         )
     if _schema_declares_timeout(schema):
-        return _HARD_MAX_TOOL_TIMEOUT_SEC
-    return _TOOL_TIMEOUT_SEC
+        return budget + _HARD_MAX_TOOL_TIMEOUT_SEC
+    return budget + _TOOL_TIMEOUT_SEC
 
 
 _SHARED_GATEWAY: CodexMcpGateway | None = None
@@ -447,7 +478,7 @@ class CodexMcpGateway:
         # declares `timeout_s` (or whose caller passes one) earns a longer, clamped
         # ceiling; everything else stays on the tight 120s bound. Both deadlines
         # below derive from this single value, so they can't skew.
-        tool_timeout = _tool_timeout(tool.name, arguments, tool.input_schema)
+        tool_timeout = _tool_timeout(tool.name, arguments, tool.input_schema, tool.annotations)
 
         async def invoke() -> JsonValue:
             # Loop-side deadline: bounds the coroutine even if the HTTP thread

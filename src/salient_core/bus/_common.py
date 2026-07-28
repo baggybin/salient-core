@@ -355,6 +355,29 @@ def _trust_covers(bus_trusted: Any, target: str) -> bool:
     return False
 
 
+# A target no agent can be named: agent names are validated identifiers, so a
+# NUL-wrapped string can never be one. Used only as a probe below.
+_BLANKET_TRUST_PROBE = "\x00__not-an-agent__\x00"
+
+
+def trusts_every_target(bus_trusted: Any) -> bool:
+    """True when `bus_trusted` grants blanket trust — i.e. EVERY delegation
+    target bypasses the approval gate.
+
+    Exists for the boot schema floor, which refuses blanket trust. That floor
+    used to test `bus_trusted is True`, which the matcher above does not agree
+    with: `["*"]` is wire-identical blanket trust and walked straight past it.
+
+    The fix is deliberately NOT another list of spellings — that is the mirror
+    that rotted in the first place. Instead ask the real matcher whether it
+    would trust a target that cannot exist. If an arbitrary stranger is
+    trusted, the value is blanket by construction, whatever it is spelled like
+    (`True`, `"*"`, `["*"]`, `[" * "]`, `{"*"}`, …). A future spelling added to
+    `_trust_covers` is covered the moment it is added.
+    """
+    return _trust_covers(bus_trusted, _BLANKET_TRUST_PROBE)
+
+
 # Per-turn estimate for caller-side timeout sizing. Empirical upper
 # bound for tool-bearing reasoning agents (disasm, multi-step web
 # probes, staging): each turn ≈ 30-60s of wall time. Use 60 for
@@ -883,6 +906,7 @@ __all__ = [
     "_unwrap",
     "_delegation_gated",
     "_trust_covers",
+    "trusts_every_target",
     "_compute_ask_agent_timeout",
     "_parse_delegation_answer",
     "_parse_yes_n",

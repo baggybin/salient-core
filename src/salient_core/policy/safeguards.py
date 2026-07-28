@@ -163,6 +163,28 @@ def check_intent(
     _ds = dataset or get_active()
     prohibited = _ds.prohibited_patterns
     patterns = list(prohibited.get(qualified, []))
+    # Delegation entry points share ONE denylist. The dataset declares its
+    # natural-language prohibitions under `bus.ask_agent`; the swarm fan-out
+    # `bus.ask_agents` — which carries the same operator prose to MORE agents —
+    # keyed on nothing and sailed straight through, so the bypass cost exactly
+    # one letter and had wider reach than the call it evaded. Union the dataset
+    # patterns across every delegation-qualified name so a refusal holds
+    # whichever entry point the model reaches for, and so a future sibling (a
+    # streaming or batched fan-out) inherits it by construction instead of by
+    # someone remembering to copy a table entry.
+    #
+    # Per-child prose needs no separate sweep: swarm children are composed from
+    # this same `tool_input`, and `_string_haystack` walks nested dicts/lists at
+    # any depth — so a child prompt is already in the haystack of the parent
+    # call. A second scan at `.trusted` dispatch would only double-count strikes.
+    if qualified in _DELEGATION_QUALIFIED:
+        seen = {tuple(entry) for entry in patterns}
+        for sibling in sorted(_DELEGATION_QUALIFIED - {qualified}):
+            for entry in prohibited.get(sibling, []):
+                key = tuple(entry)
+                if key not in seen:
+                    seen.add(key)
+                    patterns.append(entry)
     if config is not None:
         patterns.extend(config.extra_patterns.get(qualified, []))
         # Operator-configured delegation-prose patterns ride the friendly
