@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.17] - 2026-07-28
+
+Fourth public snapshot. Consolidates the `0.8.x` line and **realigns the public
+version with the private kernel's** — the snapshot's content *is* the kernel's,
+so its version now says so. (Public had been carrying its own `0.7.x`
+numbering; `0.8.0`–`0.8.16` have no separate public entries. Releases here are
+paused and there are no external consumers, so the jump is free.)
+
+### Added
+- **Token-budget floor** (`daemon/_budget.py`) — operator-set token ceilings
+  enforced below the model. `BudgetLedger` is append-only and keyed by
+  `(agent, epoch, turn_seq)`, with `spent` always derived by summing entries;
+  because it is keyed on the runner's per-incarnation epoch and lives on the
+  daemon, a runner `reset` cannot zero it. Per-agent ceilings under
+  `token_budgets.<agent>`, an optional shared pool at `token_budgets.__pool__`,
+  most-restrictive-verdict-wins, and warn / park / interrupt actions. The
+  daemon does the accounting and returns a verdict *level*; the runner owns the
+  enforcement action. Enforcement lands at a turn boundary, so up to one
+  completed turn of overshoot is possible — deliberately not hidden behind a
+  grace buffer.
+- **Provable STOP** (`daemon/proc_registry.py`, `daemon/cgroups.py`,
+  `ReapableBackend`) — `runner.quiesce()` drives a bounded grace → cancel →
+  reap ladder and returns a `QuiescenceReport` carrying the evidence: task
+  state, backend child pid state, tool pids reaped vs survived, cgroup state.
+  Tier 1 is a per-runner subprocess registry owned by a `ContextVar`; Tier 2
+  reaps a cgroup v2 subtree with one `cgroup.kill` write, which survives
+  `fork` + `setsid` + reparenting. When neither tier can prove emptiness the
+  report says `unverified` rather than claiming quiescence.
+- **Cloud / SaaS / repo resource scope** (`policy/resource_identity.py`,
+  `policy/_authorization_snapshot.py`, `policy/_scope_schema.py`) — canonical
+  `repo:` / `cloud:` / `saas:` identities parsed to a single representation, and
+  one content-addressed `AuthorizationSnapshot` over rules, research policy,
+  session posture, resource context, and credential bindings. Snapshots pin API
+  / canonicalization / extractor / policy / schema versions and chain by
+  `predecessor_id`, giving credential-bound evaluation and checkpoint rollback.
+- **Reconstruct / compare spine** (`coord/reconstruct.py`) — one
+  `correlation_id` per turn joining job ↔ assembled-prompt SHA ↔ questions ↔
+  trust bypasses ↔ scope/safeguard denies ↔ remote calls ↔ usage/cost into one
+  time-ordered chain, with a content-based `mirror ⊆ scope.db` cross-check
+  (multiset difference over `(agent, tool)`, not a count comparison). Reports
+  what it actually checked, flags legacy ambiguous ids, and counts shadow-mode
+  denies separately.
+- **Polybrain provider** (`salient_core.polybrain`) — an `AgentProvider` for
+  OpenAI-compatible API sub-brains (minimax / deepseek / glm) over `httpx` with
+  no extra SDK dependency, registered as a builtin alongside Claude and Codex.
+  `PolybrainBackend` owns its own multi-turn tool loop and executes every call
+  through the kernel `ToolBundle`.
+- **`ToolBundleBuilder` / `ToolBuildContext`** — the provider-neutral sibling of
+  `ToolBuilder`, plus the `set_tool_bundle_builder` seam, so a provider runtime
+  with no SDK MCP server still gets real tools.
+- **Hard operator-prompt refusal** — `safeguards.operator_prompt_mode`
+  (`log` / `soft_refuse` / `hard_refuse`). In `hard_refuse` the runner screens
+  each operator prompt through `check_prompt_intent` *before* dispatch and
+  refuses a prohibited one, setting `job.error`, publishing
+  `safeguard_prompt_block`, and honoring `halt_threshold`. A refused job still
+  finalizes so its error is recorded. `refuse_operator_prompts` is deprecated in
+  favour of the mode.
+- **`policy/scope_api.py`** — a versioned (`SCOPE_API_VERSION`) public facade for
+  downstream extractors, plus `require_scope_api_version()` so a skin fails at
+  startup instead of drifting against kernel internals.
+- Public surface additions: `providers` (`AgentProvider`,
+  `ProviderRegistry`, `ProviderCapabilities`, `ProviderProbe`, `ProviderName`,
+  `get_/set_/reset_provider_registry`, `builtin_provider_registry`), `runtime`
+  (`AgentEvent`, `AgentTool`, `ToolBundle`, `TurnUsage`), and
+  `ToolBuildContext` / `ToolBundleBuilder`.
+
+### Changed
+- **The PreToolUse gate is enforced on provider runtimes.** `_build_options` —
+  where the Claude-SDK path registers safeguards, `approve_before`, and the
+  budget floor — runs only when an agent has no provider runtime, so codex,
+  polybrain, and any entry-point provider previously reached tool handlers with
+  no safeguard evaluation and no operator consent gate. Scope survived only
+  because it lives inside the built handler. Now every provider bundle passes
+  through `runtime.gate_tool_bundle(...)`, which reuses the *real* hook
+  callables rather than a per-provider mirror. This deletes
+  `_make_polybrain_safeguard_hook`, whose drift is the argument for the change:
+  it ran a bare `check_intent` instead of the full `evaluate_safeguards`,
+  carried a simplified `approve_before` with no edit verdicts, and keyed on bare
+  tool names while every dataset key is qualified — matching zero entries of the
+  real policy table.
+- **Provider-gate denials raise.** `PolicyDenied` subclasses `PermissionError`
+  (hence `OSError`), so a backend that discards handler results still fails
+  closed and the codex MCP gateway renders a denial as `isError: True` rather
+  than a successful result whose text says "denied". `updatedInput` is threaded
+  through so an operator's edited command runs instead of the original, and
+  `gate_budget_sec` publishes the human's share of the deadline so a provider's
+  own timeout can't cancel a call while the operator is still reading.
+- **Bus tools are qualified under `bus.` in the provider gate.** They
+  canonicalize to `bus.<name>`, not `<agent>.<name>`; without this the
+  delegation denylist looked armed and caught nothing — on the very tools the
+  gate was written for. `gate_tool_bundle` now takes `bus_tool_names`.
+- **Delegation denylist union** — `bus.ask_agents` inherits `bus.ask_agent`'s
+  prohibited patterns. The plural was keyed on nothing and matched nothing.
+- Accounting repairs on top of the above: durable runner epoch, correlation
+  identity (ids now carry the agent, so a daemon restart can't re-issue an id
+  that already names a different turn), agent start logged at the chokepoint,
+  and a refused submit reported on the job.
+- `register_secret_fields` / `register_cred_tool_markers` now live in
+  `policy/redaction.py` (still re-exported from `bus/_common.py`).
+
+### Fixed
+- **Placeholder scanner hardening** — `unresolved_operator_infra_placeholder`
+  accepts `object` and total-covers every runtime type: scans `str`/`bytes`,
+  recurses into mappings and sequences under a depth cap that fails **closed**
+  past the limit (which also turns a cyclic-container `RecursionError` into a
+  clean deny), and returns `None` for an unscannable scalar instead of hitting
+  `assert_never` — the prior crash.
+- **Unresolved remote target placeholders are rejected** — the
+  operator-infrastructure placeholder regex now covers `<rhost>` / `<rport>` as
+  well as `<lhost>` / `<lport>`, with a post-extraction scan so a registered
+  extractor cannot emit a placeholder sourced from a sibling arg.
+
 ## [0.7.17] - 2026-07-18
 
 Third public snapshot, consolidating public sync work since `0.7.6`

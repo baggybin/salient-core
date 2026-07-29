@@ -3,8 +3,15 @@
 `@bus_tool` derives a tool's wire schema from a Pydantic model and validates
 model-supplied args against it before the handler runs (see
 `salient_core.bus._common.bus_tool`). This is the rubric the step-B migration
-(PRs #14–#24) converged on for deciding how to type each field. Reproduce the
-*reasoning*, not just the shape, when adding or changing a bus tool.
+converged on for deciding how to type each field. Reproduce the *reasoning*,
+not just the shape, when adding or changing a bus tool — including one you add
+through `make_bus(..., extra_tools=…)`.
+
+> A few examples below (`cred_record`, `get_credential`) name credential tools
+> that a **downstream skin** provides rather than kernel built-ins. The kernel
+> knows their markers for redaction purposes; the tools themselves aren't in
+> this package. The reasoning still applies verbatim to any tool with a secret
+> field.
 
 ## Required vs. optional (the de-require litmus)
 
@@ -86,6 +93,8 @@ the schema). Guard unbounded floats that feed persisted decisions with
 ## Golden discipline
 
 Every migrated tool gains `+additionalProperties: false` (root). The
-golden-master test (`tests/test_bus_schema_golden.py`) pins each wire schema
-byte-for-byte; regenerate with `UPDATE_BUS_GOLDENS=1 pytest` and review the diff
-— a schema change should be exactly the reviewable delta you intended.
+golden-master test (`tests/test_bus_schema_golden.py`) pins each of the 31 bus
+tool schemas byte-for-byte in `tests/golden/bus_schemas/<tool>.json`; a new tool
+with no golden fails loudly rather than passing unpinned. Regenerate with
+`UPDATE_BUS_GOLDENS=1 pytest tests/test_bus_schema_golden.py` and review the
+diff — a schema change should be exactly the reviewable delta you intended.

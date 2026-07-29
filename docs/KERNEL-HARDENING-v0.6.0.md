@@ -1,5 +1,12 @@
 # Kernel Hardening — v0.6.0 (engineering log)
 
+> **Historical.** This is the log of one release, kept for the reasoning and the
+> review methodology — not a description of the current kernel. The
+> authorization boundary described here has since been extended to provider
+> runtimes, and the control ladder gained budget and provable-stop rungs. For
+> current state see [`ARCHITECTURE.md`](ARCHITECTURE.md) and
+> [`../CHANGELOG.md`](../CHANGELOG.md).
+
 A record of the hardening arc that produced **v0.6.0**: how it started, the
 7-finding review it closed, the review methodology, what the external reviewers
 caught, the release, and the downstream fallout. The source review and the

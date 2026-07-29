@@ -33,5 +33,8 @@ events from `AgentRunner` output and route the judge to `ask_consensus`'s
 ## Tests
 
 ```sh
-python -m pytest        # runner event contract + Starlette endpoints (12 tests)
+python -m pytest        # runner event contract + model catalog + Starlette
+                        # endpoints (17 tests)
 ```
+
+Needs `starlette` and `httpx` on the path (`pip install starlette uvicorn`).
