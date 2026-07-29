@@ -45,7 +45,7 @@ lands in a typed **operator inbox** and waits. Every gate decision and tool
 I/O is persisted — secrets redacted — so you can reconstruct what happened.
 
 <p align="center">
-  <img src="imgs/control-surfaces.png" alt="Five control surfaces: capability, action, delegation, accountability, and staged trust — levers that live under the model." width="900">
+  <img src="imgs/control-surfaces.png" alt="The control ladder: capability, action, delegation, budget, and stop — five rungs under the model, none of them a prompt instruction." width="900">
 </p>
 
 ---
@@ -66,7 +66,7 @@ I/O is persisted — secrets redacted — so you can reconstruct what happened.
 | **Per-agent isolation** | One tool surface per agent; optional OS privilege separation via `_launch_profile`. |
 
 <p align="center">
-  <img src="imgs/kernel-components.png" alt="Kernel components: policy gates, audit trail, operator inbox, bus-as-MCP, noisy-OR knowledge graph, SM-2 scheduler, and runner." width="900">
+  <img src="imgs/kernel-components.png" alt="Kernel components: policy gates, audit trail, operator inbox, bus-as-MCP, noisy-OR knowledge graph, token budgets, runner, and SM-2 scheduler." width="900">
 </p>
 
 ---
