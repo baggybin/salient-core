@@ -44,10 +44,6 @@ Delegation is bus-mediated and operator-visible. Anything that needs a human
 lands in a typed **operator inbox** and waits. Every gate decision and tool
 I/O is persisted — secrets redacted — so you can reconstruct what happened.
 
-<p align="center">
-  <img src="imgs/control-surfaces.png" alt="The control ladder: capability, action, delegation, budget, and stop — five rungs under the model, none of them a prompt instruction." width="900">
-</p>
-
 ---
 
 ## Core features
@@ -64,10 +60,6 @@ I/O is persisted — secrets redacted — so you can reconstruct what happened.
 | **Noisy-OR knowledge graph** | Cross-session memory with corroboration, embeddings, subject namespaces, provenance, and archive-first compaction. |
 | **Pluggable runtimes** | Claude Agent SDK by default; OpenAI Codex via `salient-core[codex]`; OpenAI-compatible API sub-brains via `polybrain`. Third-party providers register through an entry point — and inherit the gates by construction. |
 | **Per-agent isolation** | One tool surface per agent; optional OS privilege separation via `_launch_profile`. |
-
-<p align="center">
-  <img src="imgs/kernel-components.png" alt="Kernel components: policy gates, audit trail, operator inbox, bus-as-MCP, noisy-OR knowledge graph, token budgets, runner, and SM-2 scheduler." width="900">
-</p>
 
 ---
 
@@ -91,22 +83,6 @@ LLM / agent loop
  Tools      Other agents   Operator
 (scoped)   (bus-mediated)  (typed Q/A)
 ```
-
-<p align="center">
-  <img src="imgs/kernel-position.png" alt="Where the kernel sits: LLM above, salient-core in the middle, tools / agents / operator below." width="900">
-</p>
-
-<p align="center">
-  <img src="imgs/policy-gate-flow.png" alt="Policy gates default-deny flow across transports, with shadow then enforce staged trust." width="900">
-</p>
-
-<p align="center">
-  <img src="imgs/delegation-flow.png" alt="Delegation topology: agents on a typed MCP bus with an operator inbox above." width="900">
-</p>
-
-<p align="center">
-  <img src="imgs/without-kernel-comparison.png" alt="Without the kernel: chaotic cycles. With salient-core: typed bus, cycle detection, and gates." width="900">
-</p>
 
 ### The control ladder
 
