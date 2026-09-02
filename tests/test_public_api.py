@@ -29,8 +29,8 @@ SUBJ = "learner:op"
 
 
 class PublicSurfaceTests(unittest.TestCase):
-    def test_release_version_is_0_8_17(self):
-        self.assertEqual(salient_core.__version__, "0.8.17")
+    def test_release_version_is_0_8_21(self):
+        self.assertEqual(salient_core.__version__, "0.8.21")
 
     def test_runtime_version_matches_installed_distribution(self):
         self.assertEqual(

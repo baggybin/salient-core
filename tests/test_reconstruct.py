@@ -12,13 +12,20 @@ from salient_core.coord.reconstruct import build_reconstruction
 from salient_core.policy.scope import ScopeStore
 
 
-def _seed_scope_deny(scope: ScopeStore, cid: str, *, tool: str = "curl") -> None:
+def _seed_scope_deny(
+    scope: ScopeStore,
+    cid: str,
+    *,
+    tool: str = "curl",
+    agent: str = "scout",
+    decision_id: str | None = None,
+) -> None:
     assert scope._conn is not None
     scope._conn.execute(
         "INSERT INTO scope_decisions "
         "(ts, engagement_id, agent, tool, args_json, targets_json, verdict, reason, "
-        "correlation_id) VALUES (?, ?, ?, ?, ?, ?, 'deny', ?, ?)",
-        (1.0, "op", "scout", tool, "{}", "[]", "out of scope", cid),
+        "correlation_id, decision_id) VALUES (?, ?, ?, ?, ?, ?, 'deny', ?, ?, ?)",
+        (1.0, "op", agent, tool, "{}", "[]", "out of scope", cid, decision_id),
     )
     scope._conn.commit()
 
@@ -164,6 +171,232 @@ class ReconstructTests(unittest.TestCase):
                 ctx.close()
                 scope.close()
 
+    def test_strong_id_join_catches_same_key_drop_and_orphan(self) -> None:
+        """T3.1 H1 — the structural check. Two denies on the SAME (agent, tool)
+        in one turn: call t1's mirror write was dropped (authoritative only), and
+        call t2 was a fail-closed audit-persist deny (mirror only, no scope.db
+        row). Under the weak (agent, tool) multiset this cancels — 1 == 1 — and
+        reads COMPLETE (the blind spot). With decision_id on both sides it matches
+        row-for-row, so t1 is `missing` and t2 is `orphan` ⇒ INCOMPLETE.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            ctx, scope = self._stores(td)
+            cid = "op:scout:1:7"
+            try:
+                # t1: authoritative deny WITH a decision_id; its mirror was dropped.
+                _seed_scope_deny(scope, cid, tool="curl", decision_id="t1")
+                # t2: mirror-only deny (fail-closed → no authoritative row).
+                ctx.record_audit_mirror(
+                    op="scope_deny",
+                    agent="scout",
+                    correlation_id=cid,
+                    tool="curl",
+                    reason="oos",
+                    tool_use_id="t2",
+                )
+
+                r = build_reconstruction(ctx, scope, cid)
+
+                self.assertEqual(r["cross_check"], "decision_id")
+                self.assertFalse(r["complete"], f"same-key masking must not read complete: {r}")
+                self.assertEqual(r["orphan_mirror_denies"], 1)
+                self.assertEqual(len(r["scope_gaps"]), 1)
+                self.assertEqual(r["scope_gaps"][0]["tool"], "curl")
+                self.assertEqual(r["scope_gaps"][0]["decision_id"], "t1")
+            finally:
+                ctx.close()
+                scope.close()
+
+    def test_strong_id_join_clean_chain_is_complete_and_discloses_tier(self) -> None:
+        """An id-matched deny (decision_id == the mirror's tool_use_id) is a clean
+        structural chain: COMPLETE, disclosed as cross_check 'decision_id'."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx, scope = self._stores(td)
+            cid = "op:scout:1:8"
+            try:
+                _seed_scope_deny(scope, cid, tool="curl", decision_id="tu1")
+                ctx.record_audit_mirror(
+                    op="scope_deny",
+                    agent="scout",
+                    correlation_id=cid,
+                    tool="curl",
+                    reason="oos",
+                    tool_use_id="tu1",
+                )
+
+                r = build_reconstruction(ctx, scope, cid)
+
+                self.assertTrue(r["found"])
+                self.assertTrue(r["complete"], f"id-matched deny should be complete: {r}")
+                self.assertEqual(r["cross_check"], "decision_id")
+                self.assertEqual(r["scope_gaps"], [])
+                self.assertEqual(r["orphan_mirror_denies"], 0)
+            finally:
+                ctx.close()
+                scope.close()
+
+    def test_legacy_null_decision_id_falls_back_to_weak_tier(self) -> None:
+        """A pre-migration deny (NULL decision_id) cannot be id-joined, so the
+        chain uses the (agent, tool) multiset and DISCLOSES the weaker tier —
+        never silently presenting the weak check as the strong one."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx, scope = self._stores(td)
+            cid = "op:scout:1:9"
+            try:
+                _seed_scope_deny(scope, cid, tool="curl")  # no decision_id
+                ctx.record_audit_mirror(
+                    op="scope_deny",
+                    agent="scout",
+                    correlation_id=cid,
+                    tool="curl",
+                    reason="oos",
+                    tool_use_id="tu9",
+                )
+
+                r = build_reconstruction(ctx, scope, cid)
+
+                self.assertEqual(r["cross_check"], "agent+tool multiset")
+                self.assertTrue(r["complete"])  # matched under the weak key
+            finally:
+                ctx.close()
+                scope.close()
+
+    def test_budget_park_block_surfaces_in_chain_not_as_a_deny_gap(self) -> None:
+        """T3.1 H2. A budget-park block is recorded on the same PreToolUse path
+        as a deny, but it is NOT a scope deny: it must appear in the chain and
+        the structured `blocks` list, and must NOT create a scope_gap / orphan or
+        flip `complete` — a block is a real recorded event, not a dropped deny.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            ctx, scope = self._stores(td)
+            cid = "op:scout:1:11"
+            try:
+                ctx.record_job(
+                    agent="scout",
+                    job_id=1,
+                    prompt="work",
+                    submitted_at=1.0,
+                    started_at=1.0,
+                    finished_at=2.0,
+                    result="",
+                    error=None,
+                    correlation_id=cid,
+                )
+                ok = ctx.record_block(
+                    kind="budget_park",
+                    agent="scout",
+                    correlation_id=cid,
+                    tool="curl",
+                    reason="token budget exhausted",
+                    tool_use_id="b1",
+                )
+                self.assertTrue(ok)
+
+                r = build_reconstruction(ctx, scope, cid)
+
+                self.assertTrue(r["found"])
+                self.assertTrue(r["complete"], f"a block must not flip complete: {r}")
+                self.assertEqual(r["scope_gaps"], [])
+                self.assertEqual(r["orphan_mirror_denies"], 0)
+                self.assertEqual(len(r["blocks"]), 1)
+                self.assertEqual(r["blocks"][0]["op"], "budget_park")
+                self.assertEqual(r["block_kinds"], ["budget_park"])
+                entry = next(e for e in r["chain"] if e["kind"] == "budget_park")
+                self.assertEqual(entry["agent"], "scout")
+                self.assertIn("curl", entry["summary"])
+            finally:
+                ctx.close()
+                scope.close()
+
+    def test_record_block_rejects_unknown_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            ctx, scope = self._stores(td)
+            try:
+                with self.assertRaises(ValueError):
+                    ctx.record_block(
+                        kind="not_a_block", agent="scout", correlation_id="op:scout:1:12"
+                    )
+            finally:
+                ctx.close()
+                scope.close()
+
+    def test_killswitch_stop_within_turn_span_joins_into_chain(self) -> None:
+        """T3.1 H2. A killswitch STOP is proc-level (agent + time, no request
+        id). A STOP dispatched within the turn's [start, end] span, for the
+        turn's agent, is time-joined into the chain — so a STOPped turn does not
+        reconstruct as a clean chain that just ends. STOPs outside the span, or
+        for another agent, are not joined."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx, scope = self._stores(td)
+            cid = "op:scout:1:20"
+            try:
+                ctx.record_job(
+                    agent="scout",
+                    job_id=1,
+                    prompt="work",
+                    submitted_at=1.0,
+                    started_at=1.0,
+                    finished_at=10.0,
+                    result="",
+                    error=None,
+                    correlation_id=cid,
+                )
+                # within span, right agent → joined
+                self.assertTrue(
+                    ctx.record_stop_event(
+                        agent="scout",
+                        dispatched_at=5.0,
+                        proven_at=5.2,
+                        state="proven_quiescent",
+                        reason="operator killswitch",
+                    )
+                )
+                # outside the span → not joined
+                ctx.record_stop_event(agent="scout", dispatched_at=99.0, state="force_reaped")
+                # right time, wrong agent → not joined
+                ctx.record_stop_event(agent="other", dispatched_at=5.0, state="proven_quiescent")
+
+                r = build_reconstruction(ctx, scope, cid)
+
+                self.assertEqual(len(r["stop_events"]), 1)
+                self.assertEqual(r["stop_events"][0]["dispatched_at"], 5.0)
+                self.assertEqual(r["stop_events"][0]["state"], "proven_quiescent")
+                stop = next(e for e in r["chain"] if e["kind"] == "killswitch")
+                self.assertEqual(stop["agent"], "scout")
+                self.assertIn("STOP", stop["summary"])
+                # the STOP slots into the time-ordered chain at ts=5.0
+                self.assertEqual(
+                    [e["ts"] for e in r["chain"]],
+                    sorted(e["ts"] for e in r["chain"]),
+                )
+            finally:
+                ctx.close()
+                scope.close()
+
+    def test_stop_join_needs_an_agent_from_a_job(self) -> None:
+        """No job ⇒ no agent to key the STOP join on ⇒ no killswitch row, even
+        when a STOP exists for that time."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx, scope = self._stores(td)
+            cid = "op:scout:1:21"
+            try:
+                ctx.record_stop_event(agent="scout", dispatched_at=5.0, state="proven_quiescent")
+                _seed_scope_deny(scope, cid, tool="curl", decision_id="d1")
+                ctx.record_audit_mirror(
+                    op="scope_deny",
+                    agent="scout",
+                    correlation_id=cid,
+                    tool="curl",
+                    reason="oos",
+                    tool_use_id="d1",
+                )
+                r = build_reconstruction(ctx, scope, cid)
+                self.assertEqual(r["stop_events"], [])
+                self.assertFalse(any(e["kind"] == "killswitch" for e in r["chain"]))
+            finally:
+                ctx.close()
+                scope.close()
+
     def test_gap_names_the_unmirrored_deny_not_the_first_row(self) -> None:
         """The surfaced gap must be the deny the mirror actually dropped.
         Slicing `authoritative[:missing]` named whichever row sorted first, so
@@ -248,13 +481,22 @@ class ReconstructTests(unittest.TestCase):
                 ctx.close()
                 scope.close()
 
-    def test_unknown_correlation_is_empty_not_error(self) -> None:
+    def test_unknown_correlation_is_empty_and_not_complete(self) -> None:
+        """An id with no records is ``found=False`` AND ``complete=False``.
+
+        ``complete`` over empty inputs is vacuously "nothing missing, nothing
+        orphaned" — but you cannot assert a chain is whole when there is no
+        chain. Both renderers gate on ``found`` first, yet the raw dict is the
+        contract: a consumer reading ``complete`` directly (a scorer, an RPC
+        caller, the mirror cross-check job) must not get a green for a request
+        that does not exist.
+        """
         with tempfile.TemporaryDirectory() as td:
             ctx, scope = self._stores(td)
             try:
                 r = build_reconstruction(ctx, scope, "op:scout:9:9")
                 self.assertFalse(r["found"])
-                self.assertTrue(r["complete"])
+                self.assertFalse(r["complete"], "no chain ⇒ not complete")
                 self.assertEqual(r["chain"], [])
             finally:
                 ctx.close()
@@ -370,8 +612,23 @@ class ReconstructTests(unittest.TestCase):
     def test_current_id_is_not_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             ctx, scope = self._stores(td)
+            cid = "20260724T190327:red_lead:3:1"
             try:
-                r = build_reconstruction(ctx, scope, "20260724T190327:red_lead:3:1")
+                # A current 4-part id (engagement:agent:epoch:seq) with a clean
+                # chain: not ambiguous, and complete once a record exists.
+                ctx.record_job(
+                    agent="red_lead",
+                    job_id=1,
+                    prompt="recon",
+                    submitted_at=1.0,
+                    started_at=1.0,
+                    finished_at=2.0,
+                    result="",
+                    error=None,
+                    correlation_id=cid,
+                )
+                r = build_reconstruction(ctx, scope, cid)
+                self.assertTrue(r["found"])
                 self.assertFalse(r["ambiguous"])
                 self.assertTrue(r["complete"])
             finally:

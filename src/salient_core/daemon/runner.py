@@ -1855,6 +1855,10 @@ class AgentRunner:
             # brain — the same identity `record_usage` writes per turn.
             _log.info("agent %s started model=%s", self.name, (self.cfg or {}).get("model"))
             await self._log("start", "ready")
+            # Re-arm the token-budget brake from PERSISTED spend before the
+            # first job can be dequeued. Same placement logic as the start line
+            # above, and for the same reason: every start path reaches here.
+            await self._arm_budget_from_ledger()
             while not self._stop_requested:
                 # Priority lane FIRST: an operator steer jumps ahead of any
                 # FIFO-queued prompts and runs at this (next) turn boundary.
@@ -2545,6 +2549,60 @@ class AgentRunner:
             f"{'stopped' if self._budget_terminal else 'parked'} — raise the "
             f"ceiling or credit tokens to resume.]"
         )
+
+    async def _arm_budget_from_ledger(self) -> None:
+        """Re-arm the token-budget brake from PERSISTED spend, before this
+        runner's loop can dequeue its first job.
+
+        The brake is DERIVED state. An agent whose recorded spend already
+        exceeds its ceiling must be parked regardless of which daemon
+        incarnation happened to witness the turn that crossed the line.
+
+        Before this existed, ``_budget_gate_armed`` / ``_budget_parked`` were
+        set ONLY from the post-turn charge path, so they died with the process
+        while the ledger (correctly) survived it. A restart therefore handed an
+        over-ceiling agent one full turn with its PreToolUse deny gate DISARMED,
+        and reported it as ``idle`` — "ready for prompts" — rather than
+        ``budget_parked``. Unbounded tool calls for a turn, past a ceiling set
+        to prevent exactly that, repeatable because restart is an operator
+        lever. The accounting was never the leak; the enforcement was, and the
+        two halves had only ever been pinned in isolation.
+
+        Deliberately does NOT re-file the budget question: the original park
+        already filed one and questions persist across restarts, so re-notifying
+        every boot would train the operator to ignore the notice. The park is
+        still visible as ``budget_parked`` status, the log line below, and
+        ``budget list``. ``budget_resume()`` remains the only way out, exactly
+        as when the park was set live.
+        """
+        daemon = getattr(self, "_daemon", None)
+        verdict_for = getattr(daemon, "budget_verdict", None)
+        if verdict_for is None:
+            return
+        try:
+            verdict = verdict_for(self.name)
+        except Exception:  # noqa: BLE001
+            # An unreadable ledger / malformed budget config is an ACCOUNTING
+            # fault. Refusing to bring the roster up over it would be a worse
+            # failure than the gap it leaves, and the live charge path will arm
+            # the brake at the next turn boundary regardless.
+            return
+        if not verdict.enforced:
+            return
+        self._budget_gate_armed = True
+        self._budget_terminal = verdict.on_exhaustion == "stop"
+        self._last_interrupt_reason = (
+            f"TOKEN BUDGET floor: {verdict.reason}. Restored from the persisted "
+            f"ledger at start — the ceiling was already crossed before this "
+            f"daemon incarnation began."
+        )
+        if self._budget_terminal:
+            self._stop_requested = True
+            await self._log("budget-stop", f"restored from ledger — {verdict.reason}")
+            return
+        self._budget_parked = True
+        self.status = "budget_parked"
+        await self._log("budget-park", f"restored from ledger — {verdict.reason}")
 
     async def budget_resume(self) -> None:
         """Explicit operator resume: clear the budget gate + park and wake a

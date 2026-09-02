@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.8.17"
+__version__ = "0.8.21"
 
 # The supported public surface, resolved lazily (PEP 562) so that
 # `import salient_core` — and any submodule import, which runs this file

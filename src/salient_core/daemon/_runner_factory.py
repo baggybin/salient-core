@@ -628,6 +628,24 @@ class _RunnerFactoryMixin:
             runner = self.runners.get(agent_name)
             if runner is None or not getattr(runner, "_budget_gate_armed", False):
                 return {}
+            # T3.1 H2: record the block so a budget-parked turn does not
+            # reconstruct as a clean chain that just ends. Best-effort and
+            # idempotent on tool_use_id — a failed audit write can never change
+            # the deny, and it rides the same PreToolUse path so the turn's
+            # correlation id is in hand.
+            ctx = getattr(self, "context", None)
+            if ctx is not None:
+                corr = getattr(getattr(runner, "current", None), "correlation_id", None)
+                tool_name = input_data.get("tool_name") if isinstance(input_data, dict) else None
+                with suppress(Exception):
+                    ctx.record_block(
+                        kind="budget_park",
+                        agent=agent_name,
+                        correlation_id=corr,
+                        tool=tool_name if isinstance(tool_name, str) else None,
+                        reason="token budget exhausted — agent budget-parked",
+                        tool_use_id=tool_use_id,
+                    )
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -760,7 +778,7 @@ class _RunnerFactoryMixin:
                     return replay_cache.complete(owner, {})
 
                 evaluation = await evaluate_scope(
-                    invocation, self.scope, dataset, correlation_id=corr
+                    invocation, self.scope, dataset, correlation_id=corr, decision_id=tool_use_id
                 )
                 if evaluation.allowed:
                     return replay_cache.complete(owner, {})
@@ -993,6 +1011,7 @@ class _RunnerFactoryMixin:
                     self.scope,
                     ScopeEvaluationRequest(dataset=dataset, allow_research=False),
                     correlation_id=corr,
+                    decision_id=tool_use_id,
                 )
                 if not evaluation.allowed:
                     return await _finalize(
@@ -2729,7 +2748,7 @@ class _RunnerFactoryMixin:
         enforced verdict to soft-stop (park) or hard-stop (interrupt), since
         only it can interrupt the live turn.
         """
-        from ._budget import BudgetAction, BudgetVerdict, evaluate_budget, turn_tokens
+        from ._budget import turn_tokens
 
         led = self._budget_ledger_get()
         charged = led.charge(agent, epoch, turn_seq, turn_tokens(usage))
@@ -2741,6 +2760,23 @@ class _RunnerFactoryMixin:
             except Exception:  # noqa: BLE001
                 pass
 
+        return self.budget_verdict(agent)
+
+    def budget_verdict(self, agent: str):
+        """Evaluate the CURRENT persisted spend against the configured ceilings
+        and return a :class:`BudgetVerdict`. No charge, no side effects.
+
+        Split out of :meth:`budget_charge` so enforcement can be re-derived from
+        state that survived a process boundary. Before this existed, the only
+        caller was the post-turn charge path, which meant the brake could only
+        be armed by the daemon incarnation that personally witnessed the turn
+        crossing the line — so a restart handed an over-ceiling agent a fresh
+        turn with its deny gate disarmed. Enforcement must follow the ledger,
+        not the process lifetime; see `_budget_arm_from_ledger`.
+        """
+        from ._budget import BudgetAction, BudgetVerdict, evaluate_budget
+
+        led = self._budget_ledger_get()
         verdicts = []
         acfg = self._budget_cfg(agent)
         agent_ceiling = acfg.get("ceiling_tokens")

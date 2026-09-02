@@ -290,6 +290,82 @@ class GenericExtractorTests(unittest.TestCase):
             )
         self.assertIn("spliced", str(cm.exception))
 
+    # ── path segments and attribute subscripts are not hosts ────────────────
+    # Regression pins for the 2026-07-29 false positives: the sweep read a
+    # local file path (`./app.apk`) and a pwntools subscript (`e.symbols[…]`)
+    # as remote hostnames, so `mobile.run` / `social_eng.run` / `pwn.gdb_batch`
+    # refused the local artifacts they exist to operate on.
+
+    def test_raw_argv_path_segment_is_not_a_host(self):
+        for cmd in (
+            "apktool d ./app.apk -o out",  # explicit relative
+            "apktool b out/dist/app.apk",  # bare relative, nested
+            "jadx /opt/loot/target.apk",  # absolute
+            "unzip ../stage/bundle.aab",  # parent-relative
+        ):
+            self.assertEqual(
+                extract_targets(ExtractorSpec(fields={"cmd": "raw_argv"}), {"cmd": cmd}),
+                [],
+                cmd,
+            )
+
+    def test_raw_argv_leading_double_slash_is_still_a_remote_host(self):
+        # The carve-out that makes the path rule safe: `//host/share` (UNC /
+        # scheme-relative) names a GENUINELY REMOTE host. Suppressing it would
+        # open a scope-blind hole, which is the one direction that matters.
+        for cmd, host in (
+            ("smbclient //fileserver.corp.com/share", "fileserver.corp.com"),
+            ("mount -t cifs //nas.example.com/vol /mnt", "nas.example.com"),
+        ):
+            self.assertEqual(
+                _kv(extract_targets(ExtractorSpec(fields={"cmd": "raw_argv"}), {"cmd": cmd})),
+                [("host", host)],
+                cmd,
+            )
+
+    def test_raw_argv_host_followed_by_path_still_extracts(self):
+        # Only a component AFTER a separator is a path segment — the host
+        # itself sits at the head of the word and must still be checked.
+        self.assertEqual(
+            _kv(
+                extract_targets(
+                    ExtractorSpec(fields={"cmd": "raw_argv"}),
+                    {"cmd": "curl example.com/api/v1"},
+                )
+            ),
+            [("host", "example.com")],
+        )
+
+    def test_raw_argv_attribute_subscript_is_not_a_host(self):
+        # `obj.attr[...]` — a DNS name is never indexed.
+        self.assertEqual(
+            extract_targets(
+                ExtractorSpec(fields={"cmd": "raw_argv"}),
+                {"cmd": "e = ELF('/bin/ls')\nprint(e.symbols['main'])"},
+            ),
+            [],
+        )
+
+    def test_binary_argv_local_artifact_is_not_a_host_but_remote_still_is(self):
+        # Both halves in one pin: the local artifact stops being a target, and
+        # a real remote target through the same extractor keeps being one.
+        self.assertEqual(
+            extract_targets(
+                ExtractorSpec(fields={"binary": "binary_argv"}),
+                {"binary": "apktool", "args": ["d", "./app.apk", "-o", "out"]},
+            ),
+            [],
+        )
+        self.assertEqual(
+            _kv(
+                extract_targets(
+                    ExtractorSpec(fields={"binary": "binary_argv"}),
+                    {"binary": "adb", "args": ["connect", "device.lan.example.com:5555"]},
+                )
+            ),
+            [("host", "device.lan.example.com")],
+        )
+
     def test_optional_kinds_empty_returns_empty(self):
         self.assertEqual(extract_targets(ExtractorSpec(fields={"x": "ip_optional"}), {"x": ""}), [])
         self.assertEqual(extract_targets(ExtractorSpec(fields={"x": "host_optional"}), {}), [])

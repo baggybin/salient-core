@@ -210,6 +210,23 @@ CREATE INDEX IF NOT EXISTS usage_ledger_by_correlation
     ON usage_ledger(correlation_id, ts);
 CREATE INDEX IF NOT EXISTS usage_ledger_by_agent
     ON usage_ledger(agent, ts);
+-- T3.1 H2 (killswitch coverage): operator emergency-STOP events, one row per
+-- runner stopped by the killswitch. STOP is proc-level — it has an agent and a
+-- time, not a request id — so reconstruct time-window-JOINS these to a turn: a
+-- STOP dispatched within a turn's [start,end] span cut that turn short and is
+-- surfaced in its chain, so a STOPped turn no longer reconstructs green. The
+-- skin killswitch handler records one per stopped runner (best-effort).
+CREATE TABLE IF NOT EXISTS stop_events (
+    rowid          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent          TEXT NOT NULL,
+    dispatched_at  REAL NOT NULL,      -- when stop(kill=True) was dispatched to this runner
+    proven_at      REAL,               -- when quiescence was proven / reap completed (NULL if unknown)
+    state          TEXT,               -- 'proven_quiescent' | 'force_reaped' | 'unverified'
+    reason         TEXT,               -- e.g. 'operator killswitch'
+    engagement_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS stop_events_by_agent_ts
+    ON stop_events(agent, dispatched_at);
 """
 
 
@@ -1156,6 +1173,109 @@ class ContextStore:
         except sqlite3.Error as e:
             self._mark_degraded("audit_mirror", e)
             return False
+
+    # T3.1 H2 — block ops recorded via `record_block`: the operator-visible ways
+    # a tool was stopped OTHER than a scope/safeguard deny, both riding the
+    # PreToolUse path (so a correlation_id + tool_use_id are in hand). They share
+    # the audit_mirror table (one surface, one join) but are DELIBERATELY not in
+    # reconstruct's `_SCOPE_DENY_OPS`, so they never enter the scope↔mirror
+    # cross-check — a block is not a dropped deny. Killswitch STOP is proc-level
+    # (no request id) and is time-window-joined at reconstruct, NOT recorded here.
+    _BLOCK_OPS = ("budget_park", "authz_latch")
+
+    def record_block(
+        self,
+        *,
+        kind: str,
+        agent: str,
+        correlation_id: str | None,
+        tool: str | None = None,
+        reason: str | None = None,
+        tool_use_id: str | None = None,
+    ) -> bool:
+        """Persist one T3.1 block-mirror row (H2): a tool stopped by a floor that
+        rides the PreToolUse path but is NOT a scope/safeguard deny —
+        ``budget_park`` (token ceiling reached) or ``authz_latch`` (authorization
+        quarantine). So a budget-parked or latched turn no longer reconstructs as
+        a clean chain that just ends: the block appears in the chain, keyed by
+        correlation_id like every other record.
+
+        The single chokepoint over the audit_mirror writer for block ops
+        (best-effort, idempotent on ``tool_use_id``, never raises into the
+        caller's control path). ``kind`` MUST be a known block op — an unknown
+        one is a programming error surfaced loudly, never a mis-recorded row.
+        """
+        if kind not in self._BLOCK_OPS:
+            raise ValueError(f"unknown block kind {kind!r}; expected one of {self._BLOCK_OPS}")
+        return self.record_audit_mirror(
+            op=kind,
+            agent=agent,
+            correlation_id=correlation_id,
+            tool=tool,
+            reason=reason,
+            tool_use_id=tool_use_id,
+        )
+
+    def record_stop_event(
+        self,
+        *,
+        agent: str,
+        dispatched_at: float,
+        proven_at: float | None = None,
+        state: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        """Persist one T3.1 H2 killswitch STOP event (best-effort, never raises).
+
+        STOP is proc-level — an agent + a time, no request id — so this is NOT a
+        correlation-keyed mirror row: reconstruct time-window-joins it to a turn
+        (a STOP dispatched within the turn's span cut it short). The skin
+        killswitch handler records one per stopped runner. Returns True on write
+        (or when no DB is attached), False only on a sqlite error with a DB.
+        """
+        if self._conn is None:
+            return True
+        try:
+            with self._lock:
+                if self._conn is None:
+                    return True
+                with self._txn() as conn:
+                    conn.execute(
+                        "INSERT INTO stop_events "
+                        "(agent, dispatched_at, proven_at, state, reason, engagement_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (agent, dispatched_at, proven_at, state, reason, self._engagement_id),
+                    )
+            return True
+        except sqlite3.Error as e:
+            self._mark_degraded("stop_events", e)
+            return False
+
+    def load_stop_events_in_span(
+        self, agent: str, start: float, end: float, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """T3.1 H2: killswitch STOP events for ``agent`` whose dispatch instant
+        falls within ``[start, end]`` — the point-in-turn join reconstruct uses to
+        show a STOP that cut a turn short. Empty without a DB."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT agent, dispatched_at, proven_at, state, reason FROM stop_events "
+                "WHERE agent = ? AND dispatched_at BETWEEN ? AND ? "
+                "ORDER BY dispatched_at LIMIT ?",
+                (agent, start, end, max(1, min(int(limit), 5000))),
+            ).fetchall()
+        return [
+            {
+                "agent": r[0],
+                "dispatched_at": r[1],
+                "proven_at": r[2],
+                "state": r[3],
+                "reason": r[4],
+            }
+            for r in rows
+        ]
 
     def load_audit_mirror(self, correlation_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
         """Return the audit-mirror rows for one correlation id, oldest→newest by

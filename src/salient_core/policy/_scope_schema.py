@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS scope_decisions (
     rule_ids_json TEXT    NOT NULL DEFAULT '[]',
     snapshot_id   TEXT    NOT NULL DEFAULT '',
     generation    INTEGER NOT NULL DEFAULT 0,
-    correlation_id TEXT                       -- T3.1 spine: join key for the reconstruct cross-check
+    correlation_id TEXT,                      -- T3.1 spine: join key for the reconstruct cross-check
+    decision_id   TEXT                        -- T3.1 H1: per-row twin key (the mirror's tool_use_id) so the cross-check matches denies row-for-row, not by (agent,tool) count
 );
 
 CREATE INDEX IF NOT EXISTS scope_decisions_ts          ON scope_decisions(ts);
@@ -75,6 +76,7 @@ def _migrate_scope_decisions(conn: sqlite3.Connection) -> None:
         ("snapshot_id", "TEXT NOT NULL DEFAULT ''"),
         ("generation", "INTEGER NOT NULL DEFAULT 0"),
         ("correlation_id", "TEXT"),
+        ("decision_id", "TEXT"),  # T3.1 H1: structural cross-check twin key
     )
     for name, declaration in additions:
         if name not in columns:

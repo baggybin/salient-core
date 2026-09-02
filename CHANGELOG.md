@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.21] - 2026-08-30
+
+Fifth public snapshot. Consolidates the private kernel's `0.8.18`–`0.8.21`
+(intermediate versions have no separate public entries; releases here are
+paused and there are no external consumers). Two scope/budget fixes and the
+T3.1 reconstruct-honesty line.
+
+### Fixed
+- **A path component is not a hostname, and neither is a subscript**
+  (`policy/scope.py`). The host-extraction sweep read local file operands and
+  attribute subscripts as remote hosts and scope-refused a tool on its own
+  argument: `apktool d ./app.apk` extracted host `app.apk`, and a pwntools
+  script's `e.symbols['main']` extracted host `e.symbols`. The fix is
+  structural rather than another extension-of-the-week denylist: a
+  separator-based path-segment suppressor (`./app.apk`, `out/app.apk`) that
+  still keeps `//host/share` UNC/scheme-relative names scope-checked, a `(?!\[)`
+  subscript guard that retires the whole `obj.attr[...]` class, and `apk` /
+  `ipa` / `dex` / `aab` added to the not-a-TLD set. The direction of error is
+  deliberate — it suppresses only on an explicit separator, so a real remote
+  host is never hidden; a refused local file is only noise.
+- **The token-budget brake was laundered by a daemon restart**
+  (`daemon/runner.py`, `daemon/_runner_factory.py`). `_budget_gate_armed` /
+  `_budget_parked` were set only from the post-turn charge path, so they died
+  with the process while the ledger they derive from persisted — a fresh
+  incarnation of an agent already over its hard ceiling came back with its
+  PreToolUse deny gate disarmed and reported `idle`, one full turn of unbounded
+  tool calls past the ceiling, per restart. The brake is now derived state:
+  `AgentRunner._arm_budget_from_ledger()` re-evaluates persisted spend against
+  the ceilings and re-parks (or re-stops) before the loop dequeues its first
+  job, called from the one point every start path reaches. `budget_charge()` is
+  split so arming and charging share one `budget_verdict()` decision path
+  instead of mirroring each other.
+- **`reconstruct` no longer reads a non-existent chain as complete**
+  (`coord/reconstruct.py`). `complete` is now gated on `found`: "nothing missing
+  over zero rows" is vacuously true and semantically wrong — a request that does
+  not exist is absent, not whole. Both renderers already gated on `found`, but
+  the raw dict is the contract a scorer/RPC caller reads directly.
+
+### Added / Changed
+- **Structural anti-green-paint cross-check** (`coord/reconstruct.py`,
+  `policy/scope.py`, `policy/_scope_schema.py`). Every scope.db deny now carries
+  a per-row twin key `decision_id` (== the audit mirror's `tool_use_id`), so the
+  `mirror ⊆ scope.db` subset relation matches denies row-for-row instead of by
+  `(agent, tool)` multiset. Two tool calls carry two ids, so a same-`(agent,
+  tool)` drop-plus-spurious pair can no longer cancel and read complete.
+  Pre-migration denies (NULL `decision_id`) fall back to the weaker multiset and
+  the tier actually used is disclosed to callers via `cross_check`, never passed
+  off as the strong check.
+- **Block coverage in the chain** (`coord/reconstruct.py`,
+  `daemon/_runner_factory.py`). Floors that stop a tool without being a
+  scope/safeguard deny are now surfaced so a stopped turn no longer reconstructs
+  as a clean chain that just ends: budget-park as a best-effort mirror `blocks`
+  entry, and an emergency killswitch STOP via a point-in-turn time-window join
+  (matched on agent + the turn's `[start, end]` span, since STOP is proc-level —
+  an agent and a time, not a request id). Both are deliberately excluded from the
+  deny cross-check so they never fabricate a `missing`/`orphan`.
+- An unclassified built-in under shadow mode is pinned to evaluate as
+  `verdict='deny'` (recorded authoritatively, then permitted and mirrored as
+  `scope_deny_shadowed`), closing a false-INCOMPLETE twin of the shadow-deny path.
+
 ## [0.8.17] - 2026-07-28
 
 Fourth public snapshot. Consolidates the `0.8.x` line and **realigns the public

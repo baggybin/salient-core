@@ -89,6 +89,7 @@ def _record(
     store: ScopeStore,
     audit: ScopeAudit,
     correlation_id: str | None = None,
+    decision_id: str | None = None,
 ) -> CheckResult:
     return store.log_decision(
         agent=invocation.agent_id,
@@ -98,6 +99,7 @@ def _record(
         relationships=list(audit.relationships),
         result=audit.result,
         correlation_id=correlation_id,
+        decision_id=decision_id,
     )
 
 
@@ -108,6 +110,7 @@ async def evaluate_scope(
     *,
     mode: Literal["enforce", "probe"] = "enforce",
     correlation_id: str | None = None,
+    decision_id: str | None = None,
 ) -> ScopeEvaluation:
     """Classify, evaluate, and durably record at most one scope decision.
 
@@ -128,7 +131,7 @@ async def evaluate_scope(
         # audit row into probe mode, because it never touches `mode` itself.
         if mode == "enforce":
             try:
-                return _record(invocation, store, audit, correlation_id), True
+                return _record(invocation, store, audit, correlation_id, decision_id), True
             except sqlite3.Error:
                 snapshot = store.pin_snapshot()
                 return (
@@ -372,6 +375,7 @@ async def evaluate_scope(
                 relationships,
                 relationship_variant=external_variant,
                 correlation_id=correlation_id,
+                decision_id=decision_id,
             )
         else:
             check = store.dry_check(

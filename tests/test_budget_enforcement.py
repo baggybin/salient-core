@@ -237,6 +237,95 @@ async def test_daemon_restart_does_not_launder_spend(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_restart_does_not_launder_ENFORCEMENT(tmp_path: Path) -> None:
+    """The gap between the two pins above: enforcement state across a restart.
+
+    `test_over_budget_parks_and_interrupts` proves enforcement arms, but never
+    restarts. `test_daemon_restart_does_not_launder_spend` restarts, but sets
+    "Ceiling high enough that nothing parks" — by its own comment it pins
+    ACCOUNTING and defers enforcement to the other test. Each half is pinned
+    alone; their INTERSECTION was pinned by nothing.
+
+    And the intersection is where the floor fails. `_budget_gate_armed` and
+    `_budget_parked` are plain runner fields defaulting to False, set only from
+    the live post-turn charge path and cleared only by `budget_resume()`.
+    Nothing re-derives them at boot from the (correctly persisted) ledger. So a
+    fresh incarnation of an agent that is massively over its ceiling comes back
+    accepting prompts with its PreToolUse deny gate disarmed — one full turn of
+    unbounded tool calls per restart, past a ceiling set to prevent exactly
+    that, repeatable because restarts are an operator lever.
+
+    The brake must be re-armed by the persisted spend, not by having personally
+    witnessed the turn that crossed the line.
+    """
+    db = tmp_path / "state.db"
+    ledger_file = tmp_path / "budget_ledger.json"
+    profile = {"token_budgets": {"sol": {"ceiling_tokens": 500, "on_exhaustion": "pause"}}}
+
+    # Incarnation 1: burn 2000 against a 500 ceiling, so it parks and arms.
+    first = _RestartableDaemon(profile, db, ledger_file)
+    epoch = first._allocate_runner_epoch("sol")
+    r1 = _make_runner("sol", first, _Backend(per_turn=2000), tmp_path, epoch=epoch)
+    await r1.start()
+    await _drive_one_job(r1)
+    await r1.stop()
+    if r1._task is not None:
+        await r1._task
+
+    assert r1._budget_gate_armed is True, "precondition: incarnation 1 must arm the gate"
+    assert r1._budget_parked is True, "precondition: incarnation 1 must park"
+
+    # Restart. The ledger persisted, so the spend is still 4x the ceiling.
+    second = _RestartableDaemon(profile, db, ledger_file)
+    assert second._budget_ledger_get().spent_for_agent("sol") == 2000
+    epoch2 = second._allocate_runner_epoch("sol")
+    r2 = _make_runner("sol", second, _Backend(per_turn=2000), tmp_path, epoch=epoch2)
+    await r2.start()
+    for _ in range(200):  # let _run reach the arming point
+        if r2.status in ("idle", "budget_parked"):
+            break
+        await asyncio.sleep(0.01)
+
+    try:
+        # The operator set a hard ceiling of 500 and this agent has spent 2000.
+        # Nothing about a process boundary should hand it another turn.
+        assert r2._budget_gate_armed is True, (
+            "RESTART LAUNDERS ENFORCEMENT: spend (2000) is 4x the ceiling (500) "
+            "and persisted correctly, but the PreToolUse deny gate came back "
+            "disarmed — every tool call in the next turn is permitted"
+        )
+        assert r2._budget_parked is True, (
+            "RESTART LAUNDERS ENFORCEMENT: an agent over its hard ceiling came "
+            "back accepting prompts (submit() only refuses on _budget_parked)"
+        )
+
+        # The observe half. `idle` reads as "ready for prompts" on every operator
+        # surface, which is how this stayed invisible on a live engagement.
+        assert r2.status == "budget_parked", (
+            f"an over-ceiling agent reported status {r2.status!r} after a restart"
+        )
+
+        # The floor itself: the PreToolUse deny gate must refuse tool calls.
+        hook = second._make_budget_gate_hook("sol")
+        outcome = await hook({"tool_name": "Bash", "tool_input": {}}, "tu-1", None)
+        decision = (outcome or {}).get("hookSpecificOutput", {}).get("permissionDecision")
+        assert decision == "deny", (
+            f"the PreToolUse budget gate permitted a tool call for an agent 4x "
+            f"over its ceiling after a restart (decision={decision!r})"
+        )
+
+        # And the operator-visible consequence: no new work is admitted.
+        refused = r2.submit("more work")
+        assert refused.error and "budget-parked" in refused.error, (
+            f"a restarted over-ceiling agent accepted a job (error={refused.error!r})"
+        )
+    finally:
+        await r2.stop()
+        if r2._task is not None:
+            await r2._task
+
+
+@pytest.mark.anyio
 async def test_budget_resume_clears_gate(tmp_path: Path) -> None:
     daemon = _BudgetDaemon(
         {"token_budgets": {"sol": {"ceiling_tokens": 500, "on_exhaustion": "pause"}}}
@@ -274,6 +363,38 @@ async def test_budget_gate_hook_denies_only_when_armed(tmp_path: Path) -> None:
     runner._budget_gate_armed = True
     out = await hook({}, "tid", None)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.anyio
+async def test_budget_gate_records_park_block_when_armed(tmp_path: Path) -> None:
+    """T3.1 H2: an armed budget gate records a `budget_park` block on the same
+    PreToolUse path as the deny (best-effort, keyed by the turn's correlation
+    id), so a parked turn no longer reconstructs as a chain that just ends. No
+    block row while disarmed."""
+    from types import SimpleNamespace
+
+    daemon = _BudgetDaemon({})
+    daemon.context = ContextStore(tmp_path / "state.db", engagement_id="op")
+    backend = _Backend()
+    runner = _make_runner("sol", daemon, backend, tmp_path)
+    runner.current = SimpleNamespace(correlation_id="op:sol:1:1")
+    hook = daemon._make_budget_gate_hook("sol")
+    try:
+        # Disarmed: pass-through, no block row.
+        assert await hook({"tool_name": "curl"}, "tu-0", None) == {}
+        assert daemon.context.load_audit_mirror("op:sol:1:1") == []
+
+        # Armed: deny AND a budget_park block row for the blocked call.
+        runner._budget_gate_armed = True
+        out = await hook({"tool_name": "curl"}, "tu-1", None)
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        rows = daemon.context.load_audit_mirror("op:sol:1:1")
+        assert len(rows) == 1
+        assert rows[0]["op"] == "budget_park"
+        assert rows[0]["tool"] == "curl"
+        assert rows[0]["tool_use_id"] == "tu-1"
+    finally:
+        daemon.context.close()
 
 
 @pytest.mark.anyio

@@ -94,6 +94,34 @@ def test_evaluator_missing_classification_fails_closed(tmp_path: Path) -> None:
         store.close()
 
 
+def test_unclassified_deny_persists_verdict_deny_for_shadowed_twin(tmp_path: Path) -> None:
+    """An unclassified tool persists ``scope_decisions.verdict='deny'``.
+
+    reconstruct's cross-check counts ``scope_deny_shadowed`` audit-mirror rows
+    and requires each to have an authoritative ``verdict='deny'`` twin in
+    scope.db (``salient_core.coord.reconstruct._SCOPE_DENY_OPS``). Those mirror
+    rows are written by the PreToolUse hook for an unclassified built-in in
+    shadow mode — the SAME call that lands here as an UNCLASSIFIED fail-closed
+    deny and writes this row. If this path ever recorded ``verdict='allow'``
+    (the tool *did* run, under shadow), every shadowed mirror row would lose its
+    twin and reconstruct would report a false INCOMPLETE orphan for a call that
+    actually ran. Pin the verdict so a regression breaks HERE, loudly, instead
+    of in a silent audit gap.
+    """
+    store = scope.ScopeStore(tmp_path / "scope.db", "shadowed-twin")
+    try:
+        result = _evaluate(
+            _invocation("alpha.scan", {"target": "example.com"}), store, _dataset({})
+        )
+        assert result.allowed is False
+        assert result.kind is ScopeEvaluationKind.UNCLASSIFIED
+        assert store._conn is not None
+        verdicts = [r[0] for r in store._conn.execute("SELECT verdict FROM scope_decisions")]
+        assert verdicts == ["deny"], verdicts
+    finally:
+        store.close()
+
+
 def test_evaluator_extracts_raw_nested_secret_but_persists_redaction(tmp_path: Path) -> None:
     # Given an extractor whose target is nested inside a secret-named field.
     def nested_secret(ctx: scope.ExtractorCtx) -> list[scope.Target]:

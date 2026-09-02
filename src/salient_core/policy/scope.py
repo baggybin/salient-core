@@ -940,9 +940,14 @@ _RX_IPV6_TOKEN = re.compile(
 #   (?!\()   — refuse matches immediately followed by `(`, which always
 #              signals a method/function call (`s.fileno()`, `os.path.join(`),
 #              never a real hostname-in-command.
+#   (?!\[)   — same idea for subscripts: `e.symbols['main']`, `cfg.hosts[0]`.
+#              A DNS name is never indexed (live false positive 2026-07-29:
+#              a pwntools script's `e.symbols['main']` extracted host
+#              `e.symbols`). Generic on purpose — it retires the whole
+#              `obj.attr[...]` class rather than one more attribute name.
 _RX_HOST_TOKEN = re.compile(
     r"(?<!\\)\b(?![\d])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b(?!\()",
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b(?!\()(?!\[)",
     re.IGNORECASE,
 )
 
@@ -1092,6 +1097,13 @@ _NOT_A_REAL_TLD: frozenset[str] = frozenset(
         "war",
         "ear",
         "class",
+        # Mobile build artifacts — the `jar` family's siblings, and the
+        # everyday operands of any tool that unpacks or repacks an app
+        # bundle. None is a registered TLD.
+        "apk",
+        "ipa",
+        "dex",
+        "aab",
         "ko",
         "mod",
         "map",
@@ -1287,6 +1299,41 @@ def _is_real_hostname_shape(token: str, extra: frozenset[str] = frozenset()) -> 
     return True
 
 
+def _is_path_segment(text: str, start: int) -> bool:
+    """True if the hostname-shaped match at `start` is really a component of a
+    filesystem path (`./app.apk`, `out/app.apk`, `/opt/tools/app.apk`).
+
+    Live false positive (2026-07-29): `apktool d ./app.apk` extracted host
+    `app.apk`, so a downstream tool that exists to unpack a local artifact was
+    scope-refused on its own operand. Extending the file-extension denylist only
+    ever chases the extension of the week; the structural signal is the separator.
+
+    The rule is "preceded by `/` inside the same shell word" — with one carve-out
+    that must not regress: `//host/share` (UNC / scheme-relative) names a GENUINELY
+    REMOTE host and has to stay scope-checked. So a match sitting at the first
+    component after a word's leading slash run is a host, not a path segment;
+    anything deeper is a path segment.
+
+    Direction of error is deliberate. Suppressing a real remote host would open a
+    scope-blind hole; refusing a local file is only noise. So this suppresses ONLY
+    on an explicit separator and never guesses from the token's own shape.
+    """
+    if start == 0 or text[start - 1] != "/":
+        return False
+    # Walk back to the start of the whitespace-delimited word.
+    word_start = start
+    while word_start > 0 and not text[word_start - 1].isspace():
+        word_start -= 1
+    # `//host/share` / `///a` — the first component after the leading slash run
+    # is a remote host, not a path segment.
+    lead = word_start
+    while lead < len(text) and text[lead] == "/":
+        lead += 1
+    if lead > word_start + 1 and lead == start:
+        return False
+    return True
+
+
 def _sweep_tokens(
     text: str,
     field: str,
@@ -1351,6 +1398,8 @@ def _sweep_tokens(
         if _overlaps(m.start(), m.end(), seen_spans):
             continue
         tok = m.group(0)
+        if _is_path_segment(text, m.start()):
+            continue
         if not _is_real_hostname_shape(tok, extra_not_tld):
             continue
         try:
@@ -3066,6 +3115,7 @@ class ScopeStore:
         *,
         relationship_variant: ExternalModeVariant | None = None,
         correlation_id: str | None = None,
+        decision_id: str | None = None,
     ) -> CheckResult:
         if self._conn is None:
             return self.check(
@@ -3105,6 +3155,7 @@ class ScopeStore:
                 relationships=list(audit.relationships),
                 result=audit.result,
                 correlation_id=correlation_id,
+                decision_id=decision_id,
             )
             consumed = [
                 decision.matched_rule
@@ -3179,6 +3230,7 @@ class ScopeStore:
         relationships: list[PrincipalResourceRelationship],
         result: CheckResult,
         correlation_id: str | None = None,
+        decision_id: str | None = None,
     ) -> None:
         assert self._conn is not None
         decisions = [
@@ -3197,8 +3249,9 @@ class ScopeStore:
         self._conn.execute(
             "INSERT INTO scope_decisions "
             "(ts,engagement_id,agent,tool,args_json,targets_json,verdict,matched_rule,reason,"
-            " decisions_json,relationships_json,rule_ids_json,snapshot_id,generation,correlation_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " decisions_json,relationships_json,rule_ids_json,snapshot_id,generation,correlation_id,"
+            " decision_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 time.time(),
                 self.engagement_id,
@@ -3215,6 +3268,7 @@ class ScopeStore:
                 result.snapshot_id,
                 result.snapshot_generation,
                 correlation_id,
+                decision_id,
             ),
         )
 
@@ -3227,6 +3281,7 @@ class ScopeStore:
         relationships: list[PrincipalResourceRelationship],
         result: CheckResult,
         correlation_id: str | None = None,
+        decision_id: str | None = None,
     ) -> CheckResult:
         if self._conn is None:
             return replace(
@@ -3250,6 +3305,7 @@ class ScopeStore:
                 relationships,
                 pinned_result,
                 correlation_id=correlation_id,
+                decision_id=decision_id,
             )
             self._conn.execute("COMMIT")
         except BaseException:  # noqa: BLE001 — roll back, then re-raise unchanged
@@ -3315,12 +3371,22 @@ class ScopeStore:
         if self._conn is None:
             return []
         cur = self._conn.execute(
-            "SELECT ts,agent,tool,targets_json,reason FROM scope_decisions "
+            "SELECT ts,agent,tool,targets_json,reason,decision_id FROM scope_decisions "
             "WHERE verdict='deny' AND correlation_id=? ORDER BY ts LIMIT ?",
             (correlation_id, max(1, min(int(limit), 5000))),
         )
         return [
-            {"ts": r[0], "agent": r[1], "tool": r[2], "targets": _json_loads(r[3]), "reason": r[4]}
+            {
+                "ts": r[0],
+                "agent": r[1],
+                "tool": r[2],
+                "targets": _json_loads(r[3]),
+                "reason": r[4],
+                # T3.1 H1: the per-row twin key (the mirror's tool_use_id). NULL
+                # on pre-migration rows — reconstruct falls back to the weak
+                # (agent,tool) multiset and discloses the weaker tier when so.
+                "decision_id": r[5],
+            }
             for r in cur.fetchall()
         ]
 
