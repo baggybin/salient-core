@@ -143,8 +143,12 @@ def make_lifecycle_tools(daemon: DaemonServices, owner: str) -> list:
         from ._delegation import _record_approval_bypass
 
         await _record_approval_bypass(
-            daemon, owner, spawned_name, "spawn_template",
-            f"spawn_template({spawned_name})", caller_bus_trusted,
+            daemon,
+            owner,
+            spawned_name,
+            "spawn_template",
+            f"spawn_template({spawned_name})",
+            caller_bus_trusted,
         )
         # Use the same code path as the spawn RPC.
         try:

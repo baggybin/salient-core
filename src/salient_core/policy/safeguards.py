@@ -98,11 +98,30 @@ _DELEGATION_QUALIFIED: frozenset[str] = frozenset(
 # hardcoded 6-tuple (`/home /etc /var /usr /root`) missed `/boot /bin /sbin
 # /lib* /opt /mnt /srv /media /proc /sys /dev`, each an equally system-wide
 # tree, so a recursive `scp_get(remote_path="/boot")` slipped the block.
-_SYSTEM_TREE_ROOTS = frozenset({
-    "bin", "sbin", "lib", "lib32", "lib64", "libx32", "boot", "opt", "mnt",
-    "srv", "media", "proc", "sys", "dev", "run", "home", "etc", "var", "usr",
-    "root",
-})
+_SYSTEM_TREE_ROOTS = frozenset(
+    {
+        "bin",
+        "sbin",
+        "lib",
+        "lib32",
+        "lib64",
+        "libx32",
+        "boot",
+        "opt",
+        "mnt",
+        "srv",
+        "media",
+        "proc",
+        "sys",
+        "dev",
+        "run",
+        "home",
+        "etc",
+        "var",
+        "usr",
+        "root",
+    }
+)
 
 
 def _is_system_tree(p: str) -> bool:
@@ -179,7 +198,8 @@ def _warn_bad_pattern(label: str, pattern: str) -> None:
     _log.warning(
         "malformed safeguard regex skipped (label=%r): %r failed to compile — "
         "this block will NOT fire until the pattern is fixed",
-        label, pattern,
+        label,
+        pattern,
     )
 
 

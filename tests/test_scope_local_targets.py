@@ -57,9 +57,7 @@ def test_flag_on_without_scope_denies_loopback() -> None:
 
 def test_flag_on_enrolled_loopback_allowed_unenrolled_denied() -> None:
     store = ScopeStore(None, "flag-on")
-    store.load_engagement_rules(
-        {"scope": {"local_targets": True, "in_targets": ["127.0.0.1"]}}
-    )
+    store.load_engagement_rules({"scope": {"local_targets": True, "in_targets": ["127.0.0.1"]}})
     assert store.check([_loopback()]).allowed is True
     denied = store.check([_loopback("127.0.0.9")])
     assert denied.allowed is False

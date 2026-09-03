@@ -169,9 +169,22 @@ class StructuralTransferToolsTests(unittest.TestCase):
             loud_patterns={},
             structural_transfer_tools=frozenset({"x.transfer"}),
         )
-        for bad in ("/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt",
-                    "/mnt", "/srv", "/media", "/proc", "/sys", "/dev", "/",
-                    "/usr/"):
+        for bad in (
+            "/boot",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/opt",
+            "/mnt",
+            "/srv",
+            "/media",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/",
+            "/usr/",
+        ):
             with self.subTest(path=bad):
                 ok, reason = safeguards.check_intent(
                     "x.transfer",
@@ -214,15 +227,12 @@ class MalformedRegexLoggedTests(unittest.TestCase):
             extra_patterns={"x.y": [("bad-lookahead", r"rm\s+(?!oops")]}  # unclosed
         )
         with self.assertLogs("salient.policy.safeguards", level="WARNING") as cm:
-            ok, _ = safeguards.check_intent(
-                "x.y", {"cmd": "rm foo"}, config=cfg, dataset=self._DS)
+            ok, _ = safeguards.check_intent("x.y", {"cmd": "rm foo"}, config=cfg, dataset=self._DS)
         self.assertTrue(ok, "a broken pattern is skipped, not treated as a block")
         self.assertTrue(any("malformed safeguard regex" in m for m in cm.output))
 
     def test_repeat_is_deduped(self):
-        cfg = safeguards.SafeguardConfig(
-            extra_patterns={"x.y": [("dup", r"(?!oops")]}
-        )
+        cfg = safeguards.SafeguardConfig(extra_patterns={"x.y": [("dup", r"(?!oops")]})
         with self.assertLogs("salient.policy.safeguards", level="WARNING"):
             safeguards.check_intent("x.y", {"cmd": "z"}, config=cfg, dataset=self._DS)
         with self.assertNoLogs("salient.policy.safeguards", level="WARNING"):
