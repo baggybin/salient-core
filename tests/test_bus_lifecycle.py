@@ -9,7 +9,11 @@ suite stayed green while the path was broken).
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from salient_core.bus._lifecycle import make_lifecycle_tools
@@ -17,6 +21,75 @@ from salient_core.bus._lifecycle import make_lifecycle_tools
 
 def _text_of(res: dict) -> str:
     return " ".join(b.get("text", "") for b in (res.get("content") or []) if isinstance(b, dict))
+
+
+class _Runner:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.status = "idle"
+
+    async def start(self) -> None:
+        pass
+
+
+class _SpawnDaemon:
+    """Minimal daemon for spawn_template: caller trust + a runner table."""
+
+    def __init__(self, caller_cfg: dict) -> None:
+        self.all_cfgs = {"caller": caller_cfg}
+        self.runners: dict = {}
+
+    def _make_runner(self, cfg: dict) -> _Runner:
+        return _Runner(cfg["name"])
+
+    def _notify_agent_spawn(self, *a, **k) -> None:
+        pass
+
+    def _persist_running_agents(self) -> None:
+        pass
+
+
+class SpawnTemplateTrustTests(unittest.IsolatedAsyncioTestCase):
+    """A1 (bus-runner bug hunt): spawn_template must gate on PER-TARGET trust
+    (`_trust_covers`), not raw `bus_trusted` truthiness — a scoped list is truthy
+    but not a licence to spawn any template."""
+
+    def setUp(self) -> None:
+        self._prev = os.getcwd()
+        self._tmp = tempfile.mkdtemp(prefix="spawn-tmpl-")
+        os.chdir(self._tmp)
+        (Path("templates")).mkdir()
+        (Path("templates") / "planner.yaml").write_text(
+            "name: planner\nteam: neutral\nsystem_prompt: a planner\n"
+        )
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self.addCleanup(os.chdir, self._prev)
+
+    def _spawn_tool(self, daemon, owner):
+        return next(t for t in make_lifecycle_tools(daemon, owner) if t.name == "spawn_template")
+
+    async def test_scoped_trust_cannot_spawn_uncovered_template(self):
+        d = _SpawnDaemon({"bus_trusted": ["someone_else"]})  # truthy, does NOT cover planner
+        res = await self._spawn_tool(d, "caller").handler({"name": "planner"})
+        self.assertIn("not trusted to spawn", _text_of(res))
+        self.assertNotIn("planner", d.runners)  # nothing spawned
+
+    async def test_trust_list_covering_target_spawns(self):
+        d = _SpawnDaemon({"bus_trusted": ["planner"]})  # covers planner
+        res = await self._spawn_tool(d, "caller").handler({"name": "planner"})
+        self.assertNotIn("not trusted", _text_of(res))
+        self.assertIn("planner", d.runners)
+
+    async def test_blanket_trust_spawns(self):
+        d = _SpawnDaemon({"bus_trusted": True})
+        await self._spawn_tool(d, "caller").handler({"name": "planner"})
+        self.assertIn("planner", d.runners)
+
+    async def test_untrusted_caller_refused(self):
+        d = _SpawnDaemon({})  # no bus_trusted at all
+        res = await self._spawn_tool(d, "caller").handler({"name": "planner"})
+        self.assertIn("not trusted to spawn", _text_of(res))
+        self.assertNotIn("planner", d.runners)
 
 
 class SwarmFinishTests(unittest.IsolatedAsyncioTestCase):

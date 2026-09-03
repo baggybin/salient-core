@@ -14,11 +14,13 @@ without dooming the engagement.
 
 from __future__ import annotations
 
+import logging
 import re
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -90,6 +92,48 @@ _DELEGATION_QUALIFIED: frozenset[str] = frozenset(
 )
 
 
+# Top-level directories whose recursive whole-tree transfer is a system-wide
+# exfil, not a scoped copy. A single-segment absolute path under one of these
+# (or `/` itself) is the prohibited shape. The set is deliberately broad — a
+# hardcoded 6-tuple (`/home /etc /var /usr /root`) missed `/boot /bin /sbin
+# /lib* /opt /mnt /srv /media /proc /sys /dev`, each an equally system-wide
+# tree, so a recursive `scp_get(remote_path="/boot")` slipped the block.
+_SYSTEM_TREE_ROOTS = frozenset(
+    {
+        "bin",
+        "sbin",
+        "lib",
+        "lib32",
+        "lib64",
+        "libx32",
+        "boot",
+        "opt",
+        "mnt",
+        "srv",
+        "media",
+        "proc",
+        "sys",
+        "dev",
+        "run",
+        "home",
+        "etc",
+        "var",
+        "usr",
+        "root",
+    }
+)
+
+
+def _is_system_tree(p: str) -> bool:
+    """True if ``p`` names the root or a top-level system directory in whole
+    (e.g. `/`, `/etc`, `/boot`) — NOT a nested path under one (`/home/user`,
+    `/etc/nginx`), which is a scoped target, not a system-wide tree."""
+    if p in ("", "/"):
+        return True
+    parts = PurePosixPath(p).parts  # '/etc' -> ('/', 'etc'); '/etc/x' -> ('/','etc','x')
+    return len(parts) == 2 and parts[0] == "/" and parts[1] in _SYSTEM_TREE_ROOTS
+
+
 # Structural checks — beyond regex, some prohibited intents are
 # detectable by argument SHAPE (e.g. recursive system-tree copy).
 def _structural_block(
@@ -106,7 +150,7 @@ def _structural_block(
             path = tool_input.get("remote_path") or tool_input.get("local_path") or ""
             if isinstance(path, str):
                 p = path.strip().rstrip("/")
-                if p in ("", "/", "/home", "/etc", "/var", "/usr", "/root"):
+                if _is_system_tree(p):
                     return (
                         "unauthorized-mass-system-transfer",
                         f"recursive transfer of {path!r} is a system-wide tree",
@@ -135,6 +179,28 @@ def _string_haystack(tool_input: Mapping[str, Any]) -> str:
 
     _walk(tool_input)
     return " \n".join(parts)
+
+
+_log = logging.getLogger("salient.policy.safeguards")
+
+# A malformed regex (built-in OR operator-supplied) is skipped so it can't
+# crash the PreToolUse hook — but skipping SILENTLY means the intended block
+# never fires with no signal (fail-open). Log once per (label, pattern) so the
+# operator learns their block is dead without spamming the hot path every call.
+_warned_bad_patterns: set[tuple[str, str]] = set()
+
+
+def _warn_bad_pattern(label: str, pattern: str) -> None:
+    key = (label, pattern)
+    if key in _warned_bad_patterns:
+        return
+    _warned_bad_patterns.add(key)
+    _log.warning(
+        "malformed safeguard regex skipped (label=%r): %r failed to compile — "
+        "this block will NOT fire until the pattern is fixed",
+        label,
+        pattern,
+    )
 
 
 def check_intent(
@@ -199,9 +265,10 @@ def check_intent(
             if re.search(pattern, haystack):
                 return False, label
         except re.error:
-            # Malformed engagement-supplied regex — skip silently rather
-            # than crash the hook. The operator notices via missing
-            # blocks on that pattern; the daemon stays up.
+            # Malformed regex — log once (see _warn_bad_pattern) and skip
+            # rather than crash the hook; the daemon stays up and the operator
+            # gets a signal instead of a silent fail-open.
+            _warn_bad_pattern(label, pattern)
             continue
 
     structural = _structural_block(qualified, tool_input, _ds.structural_transfer_tools)
@@ -251,6 +318,7 @@ def check_posture(
             if re.search(pattern, haystack):
                 return False, label
         except re.error:
+            _warn_bad_pattern(label, pattern)
             continue
     return True, ""
 
@@ -378,6 +446,7 @@ def check_prompt_intent(
             if re.search(pattern, prompt, flags=re.IGNORECASE):
                 return False, label
         except re.error:
+            _warn_bad_pattern(label, pattern)
             continue
     return True, ""
 
@@ -390,7 +459,16 @@ def resolve_config(
        agent_cfg.safeguards > engagement_profile.safeguards > defaults.
 
     `safeguards.posture` (stealth|normal|loud) resolves the same way;
-    unknown values fall back to "normal"."""
+    unknown values fall back to "normal".
+
+    EXCEPTION — `extra_patterns` are UNIONED, not overridden: an agent's
+    extra_patterns ADD to the profile's for the same key (profile blocks +
+    agent blocks all fire), and an empty agent list does NOT clear a profile
+    entry. This is deliberate fail-CLOSED — a lower-scoped config cannot
+    subtract a safeguard block a higher-scoped one imposed. There is no
+    per-agent removal path by design; to drop a block, remove it at the level
+    that defines it. (The scalar fields above DO override; only the pattern
+    LISTS accumulate.)"""
     cfg = SafeguardConfig()
     profile_block = (engagement_profile or {}).get("safeguards") or {}
     agent_block = (agent_cfg or {}).get("safeguards") or {}
