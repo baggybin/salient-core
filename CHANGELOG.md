@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.24] - 2026-09-03
+
+Sixth public snapshot. Consolidates the private kernel's `0.8.22`–`0.8.24`
+(intermediate versions have no separate public entries; releases here are
+paused and there are no external consumers). One trust-gate fix, one
+safeguard-hardening pass, and one opt-in scope flag.
+
+### Fixed
+- **`spawn_template` gated on raw `bus_trusted` truthiness, not per-target
+  trust** (`bus/_lifecycle.py`, private `0.8.22`, bug hunt A1). A caller with
+  a SCOPED trust list (`bus_trusted: ["planner"]`) — truthy, but not a
+  licence to spawn anything — could spawn ANY shipped template. The gate now
+  resolves per-target trust via `_trust_covers`, and the spawn's
+  agent-start-gate bypass is audited like ask_agent's.
+- **Safeguard hardening** (`policy/safeguards.py`, private `0.8.23`): the
+  recursive whole-tree transfer block now covers a broad system-root set
+  (`/boot /proc /sys /dev …`), not a hardcoded 6-tuple; malformed
+  prohibited/loud regexes log one deduped WARNING per (label, pattern)
+  instead of failing open silently; `resolve_config` documents that
+  `extra_patterns` union (fail-closed), never subtract.
+
+### Added
+- **Opt-in `scope.local_targets` profile flag** (`policy/scope.py`,
+  private `0.8.24`). Default off keeps the historical behavior: addresses
+  bound to a local NIC are filtered out of scope evaluation as operator-side
+  infrastructure. When true, local/loopback addresses are ordinary targets —
+  default-deny unless enrolled — so a lab hosted on the daemon box is
+  scopeable. The flag travels in the authorization snapshot
+  (checkpoint/restore/restart safe), is serialized only when set (pre-flag
+  scope.db snapshots still load), and does not touch the research lane's
+  fail-closed local-address floor. Pinned in
+  `tests/test_scope_local_targets.py`.
+
 ## [0.8.21] - 2026-08-30
 
 Fifth public snapshot. Consolidates the private kernel's `0.8.18`–`0.8.21`

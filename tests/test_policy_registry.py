@@ -158,6 +158,96 @@ class StructuralTransferToolsTests(unittest.TestCase):
         )
         self.assertTrue(ok, "a specific subdir isn't a system-wide tree")
 
+    def test_blocks_the_broader_system_tree_set(self):
+        """The block must cover every top-level system dir, not just the
+        original hardcoded 6-tuple — /boot, /bin, /lib*, /opt, /proc, … are
+        equally system-wide trees (a recursive scp of /boot slipped the old
+        denylist)."""
+        ds = PolicyDataset(
+            tool_targets={},
+            prohibited_patterns={},
+            loud_patterns={},
+            structural_transfer_tools=frozenset({"x.transfer"}),
+        )
+        for bad in ("/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt",
+                    "/mnt", "/srv", "/media", "/proc", "/sys", "/dev", "/",
+                    "/usr/"):
+            with self.subTest(path=bad):
+                ok, reason = safeguards.check_intent(
+                    "x.transfer",
+                    {"recursive": True, "remote_path": bad},
+                    dataset=ds,
+                )
+                self.assertFalse(ok, f"{bad!r} must be blocked")
+                self.assertEqual(reason, "unauthorized-mass-system-transfer")
+
+    def test_nested_path_under_system_root_still_allowed(self):
+        """Defensive: a nested target under a system root (/etc/nginx) is a
+        scoped copy, not the whole tree — must NOT trip the block."""
+        ds = PolicyDataset(
+            tool_targets={},
+            prohibited_patterns={},
+            loud_patterns={},
+            structural_transfer_tools=frozenset({"x.transfer"}),
+        )
+        for ok_path in ("/etc/nginx", "/boot/grub/grub.cfg", "/var/log"):
+            with self.subTest(path=ok_path):
+                ok, _ = safeguards.check_intent(
+                    "x.transfer",
+                    {"recursive": True, "remote_path": ok_path},
+                    dataset=ds,
+                )
+                self.assertTrue(ok, f"{ok_path!r} is scoped, not a system tree")
+
+
+class MalformedRegexLoggedTests(unittest.TestCase):
+    """P5: a malformed safeguard regex is skipped (never crashes the hook) but
+    must LOG a warning — the old silent skip was a fail-open with no signal."""
+
+    _DS = PolicyDataset(tool_targets={}, prohibited_patterns={}, loud_patterns={})
+
+    def setUp(self):
+        safeguards._warned_bad_patterns.clear()
+
+    def test_malformed_extra_pattern_logs_and_does_not_block(self):
+        cfg = safeguards.SafeguardConfig(
+            extra_patterns={"x.y": [("bad-lookahead", r"rm\s+(?!oops")]}  # unclosed
+        )
+        with self.assertLogs("salient.policy.safeguards", level="WARNING") as cm:
+            ok, _ = safeguards.check_intent(
+                "x.y", {"cmd": "rm foo"}, config=cfg, dataset=self._DS)
+        self.assertTrue(ok, "a broken pattern is skipped, not treated as a block")
+        self.assertTrue(any("malformed safeguard regex" in m for m in cm.output))
+
+    def test_repeat_is_deduped(self):
+        cfg = safeguards.SafeguardConfig(
+            extra_patterns={"x.y": [("dup", r"(?!oops")]}
+        )
+        with self.assertLogs("salient.policy.safeguards", level="WARNING"):
+            safeguards.check_intent("x.y", {"cmd": "z"}, config=cfg, dataset=self._DS)
+        with self.assertNoLogs("salient.policy.safeguards", level="WARNING"):
+            safeguards.check_intent("x.y", {"cmd": "z"}, config=cfg, dataset=self._DS)
+
+
+class ExtraPatternsUnionTests(unittest.TestCase):
+    """P6: extra_patterns are UNIONED across profile+agent (fail-closed), not
+    overridden — pins the real contract the corrected docstring now states, so
+    nobody 'fixes' it to override and silently weakens a block."""
+
+    def test_agent_and_profile_patterns_union(self):
+        profile = {"safeguards": {"extra_patterns": {"x.y": [{"label": "p", "pattern": "prof"}]}}}
+        agent = {"safeguards": {"extra_patterns": {"x.y": [{"label": "a", "pattern": "agnt"}]}}}
+        cfg = safeguards.resolve_config(agent, profile)
+        labels = [lab for (lab, _) in cfg.extra_patterns["x.y"]]
+        self.assertIn("p", labels)
+        self.assertIn("a", labels)
+
+    def test_empty_agent_list_does_not_clear_profile(self):
+        profile = {"safeguards": {"extra_patterns": {"x.y": [{"label": "p", "pattern": "prof"}]}}}
+        agent = {"safeguards": {"extra_patterns": {"x.y": []}}}
+        cfg = safeguards.resolve_config(agent, profile)
+        self.assertEqual([lab for (lab, _) in cfg.extra_patterns["x.y"]], ["p"])
+
 
 if __name__ == "__main__":
     unittest.main()

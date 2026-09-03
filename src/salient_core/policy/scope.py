@@ -2176,7 +2176,7 @@ class ScopeStore:
             self._snapshot = self._build_snapshot(
                 0,
                 None,
-                SnapshotDraft((), ResearchPolicy(), False, "{}", ()),
+                SnapshotDraft((), ResearchPolicy(), False, "{}", (), False),
             )
         self._publish_snapshot(self._snapshot)
 
@@ -2284,7 +2284,7 @@ class ScopeStore:
             snapshot = self._build_snapshot(
                 0,
                 None,
-                SnapshotDraft(rules, ResearchPolicy(), False, "{}", ()),
+                SnapshotDraft(rules, ResearchPolicy(), False, "{}", (), False),
             )
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -2407,6 +2407,9 @@ class ScopeStore:
             )
             or False
         )
+        # Opt-in: local-NIC/loopback addresses are scopeable targets
+        # (default-deny unless enrolled) instead of operator-side filtered.
+        local_targets = bool(scope_block.get("local_targets") or False)
         in_pats = _coalesce(scope_block, "in_targets", "in") or []
         out_pats = _coalesce(scope_block, "out_targets", "out") or []
         new_rules: list[ScopeRule] = []
@@ -2453,6 +2456,7 @@ class ScopeStore:
                 session_strict,
                 json.dumps(scope_resource_context, sort_keys=True, separators=(",", ":")),
                 parse_credential_bindings(scope_credential_bindings),
+                local_targets,
             ),
         )
         if generation != current.generation:
@@ -2524,6 +2528,7 @@ class ScopeStore:
                 source.session_strict,
                 source.resource_context_json,
                 source.credential_bindings,
+                source.local_targets,
             ),
         )
         return self._commit_snapshot(restored, generation)
@@ -2576,6 +2581,7 @@ class ScopeStore:
                 current.session_strict,
                 current.resource_context_json,
                 current.credential_bindings,
+                current.local_targets,
             ),
         )
         self._commit_snapshot(snapshot, current.generation)
@@ -2613,6 +2619,7 @@ class ScopeStore:
                     current.session_strict,
                     current.resource_context_json,
                     current.credential_bindings,
+                    current.local_targets,
                 ),
             )
             self._commit_snapshot(snapshot, current.generation)
@@ -2774,7 +2781,14 @@ class ScopeStore:
                     snapshot_generation=snapshot.generation,
                     relationship_denied=True,
                 )
-        targets, op_filtered = _split_operator_targets(targets)
+        if snapshot.local_targets:
+            # Opt-in (scope.local_targets): local-NIC/loopback addresses are
+            # ordinary targets — evaluated against the rules below, so the
+            # default-deny ("engagement has no scope set" / no matching
+            # in-rule) applies to loopback labs too.
+            op_filtered: list[Target] = []
+        else:
+            targets, op_filtered = _split_operator_targets(targets)
         op_note = _operator_filter_note(op_filtered)
         if not targets:
             if op_filtered:
@@ -2908,6 +2922,15 @@ class ScopeStore:
         (default), session_scoped tools keep their legacy established-session
         trust bypass. See SC-1 / docs/SCOPE.md."""
         return self._snapshot.session_strict
+
+    def local_targets(self) -> bool:
+        """True iff the engagement opted INTO scope-checking local-NIC /
+        loopback addresses (scope.local_targets). When False (default),
+        local addresses are filtered out as operator-side infrastructure
+        before rule evaluation; when True they are ordinary targets —
+        default-deny unless enrolled. The research lane is unaffected: its
+        public floor fails closed on local addresses either way."""
+        return self._snapshot.local_targets
 
     def research_summary(self) -> dict[str, Any]:
         """Operator-facing snapshot of the research lane policy (for
@@ -3092,6 +3115,7 @@ class ScopeStore:
                 pinned.session_strict,
                 pinned.resource_context_json,
                 pinned.credential_bindings,
+                pinned.local_targets,
             ),
         )
         self._commit_snapshot(snapshot, pinned.generation)
@@ -3185,6 +3209,7 @@ class ScopeStore:
                         pinned.session_strict,
                         pinned.resource_context_json,
                         pinned.credential_bindings,
+                        pinned.local_targets,
                     ),
                 )
                 self._insert_snapshot_row(published)

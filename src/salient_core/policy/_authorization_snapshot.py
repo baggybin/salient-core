@@ -74,6 +74,11 @@ class SnapshotDraft:
     session_strict: bool
     resource_context_json: str
     credential_bindings: tuple[CredentialBindingMetadata, ...]
+    # scope.local_targets: when True, local-NIC/loopback addresses go through
+    # normal rule evaluation instead of being filtered out as operator-side.
+    # Required positional (no default) so every draft site must confront it —
+    # a defaulted field would silently reset the flag on checkpoint restore.
+    local_targets: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +101,7 @@ class AuthorizationSnapshot:
     session_strict: bool
     resource_context_json: str
     credential_bindings: tuple[CredentialBindingMetadata, ...]
+    local_targets: bool
 
 
 class ScopeSnapshotError(RuntimeError):
@@ -161,6 +167,11 @@ def snapshot_payload(snapshot: AuthorizationSnapshot) -> str:
         "rules": rule_rows,
         "session_strict": snapshot.session_strict,
     }
+    # Backward-compatible persistence: the flag is opt-in (default off), so
+    # it is serialized ONLY when set — snapshots persisted before the flag
+    # existed carry no key and must still digest-match on parse.
+    if snapshot.local_targets:
+        body["local_targets"] = True
     return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
 
@@ -179,6 +190,7 @@ def build_snapshot(
         session_strict=draft.session_strict,
         resource_context_json=draft.resource_context_json,
         credential_bindings=draft.credential_bindings,
+        local_targets=draft.local_targets,
     )
     return dataclasses.replace(
         provisional,
@@ -197,6 +209,10 @@ def parse_snapshot(payload_json: str, stored_id: str) -> AuthorizationSnapshot:
             raise ScopeSnapshotCompatibilityError("stored snapshot generation is malformed")
         if type(payload["session_strict"]) is not bool:
             raise ScopeSnapshotCompatibilityError("stored session posture is malformed")
+        # Opt-in flag, absent in snapshots persisted before it existed.
+        local_targets = payload.get("local_targets", False)
+        if type(local_targets) is not bool:
+            raise ScopeSnapshotCompatibilityError("stored local-targets posture is malformed")
         rules_list = payload["rules"]
         if not isinstance(rules_list, list):
             raise ScopeSnapshotCompatibilityError("stored snapshot rules are malformed")
@@ -238,6 +254,7 @@ def parse_snapshot(payload_json: str, stored_id: str) -> AuthorizationSnapshot:
                 payload["resource_context"], sort_keys=True, separators=(",", ":")
             ),
             credential_bindings=parse_credential_bindings(bindings_by_id),
+            local_targets=local_targets,
         )
         snapshot = build_snapshot(payload["generation"], payload["predecessor_id"], draft)
     except (KeyError, TypeError, json.JSONDecodeError) as exc:

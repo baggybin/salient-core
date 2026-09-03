@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 
 from ._common import *  # noqa: F401,F403
-from ._common import bus_tool
+from ._common import _trust_covers, bus_tool
 
 if TYPE_CHECKING:
     from ..protocols import DaemonServices
@@ -63,18 +63,15 @@ def make_lifecycle_tools(daemon: DaemonServices, owner: str) -> list:
 
         import yaml as _yaml
 
-        # Trust check — only bus_trusted callers spawn.
+        # Resolve the caller's trust config. The AUTHORITATIVE gate is applied
+        # per-target once the spawned agent's name is known (A1 — see below);
+        # `bus_trusted` here may be a scoped list, so raw truthiness is not a
+        # licence to spawn.
         _caller_runner = daemon.runners.get(owner)
         caller_cfg = (
             daemon.all_cfgs.get(owner) or (_caller_runner.cfg if _caller_runner else None) or {}
         )
-        if not caller_cfg.get("bus_trusted"):
-            return _text(
-                f"spawn_template refused: caller {owner!r} is not "
-                f"bus_trusted. Use <ask_operator> to request the operator "
-                f"run `salientctl spawn templates/<name>.yaml`.",
-                error=True,
-            )
+        caller_bus_trusted = caller_cfg.get("bus_trusted")
 
         raw_name = (args.get("name") or "").strip()
         if not raw_name:
@@ -119,6 +116,20 @@ def make_lifecycle_tools(daemon: DaemonServices, owner: str) -> list:
             )
 
         spawned_name = cfg["name"]
+        # A1: gate on PER-TARGET trust, not raw truthiness. `bus_trusted` may be
+        # a SCOPED list (e.g. ["planner"]) — truthy, but not a licence to spawn
+        # ANY template. `_trust_covers` is the same resolver ask_agent uses, and
+        # a non-trusted caller (falsy) also fails it. This closes the hole where
+        # the bare-`bus_trusted` boot floor steers operators to the list form —
+        # exactly the form a raw truthiness check waved through.
+        if not _trust_covers(caller_bus_trusted, spawned_name):
+            return _text(
+                f"spawn_template refused: caller {owner!r} is not trusted to "
+                f"spawn {spawned_name!r} (bus_trusted={caller_bus_trusted!r}). "
+                f"Use a bus_trusted list covering {spawned_name!r}, or "
+                f"<ask_operator> to have the operator spawn it.",
+                error=True,
+            )
         existing = daemon.runners.get(spawned_name)
         if existing is not None and existing.status not in ("stopped",):
             return _text(
@@ -127,6 +138,14 @@ def make_lifecycle_tools(daemon: DaemonServices, owner: str) -> list:
                 f"ask_agent({spawned_name!r}, ...)"
             )
 
+        # Spawning a (usually bus_trusted) lead bypasses the operator's
+        # agent-start gate, so audit the bypass exactly as ask_agent does (A1).
+        from ._delegation import _record_approval_bypass
+
+        await _record_approval_bypass(
+            daemon, owner, spawned_name, "spawn_template",
+            f"spawn_template({spawned_name})", caller_bus_trusted,
+        )
         # Use the same code path as the spawn RPC.
         try:
             runner = daemon._make_runner(cfg)
