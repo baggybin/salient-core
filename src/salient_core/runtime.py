@@ -390,18 +390,36 @@ class AgentBackend(Protocol):
 
 @runtime_checkable
 class ReapableBackend(Protocol):
-    """OPTIONAL `AgentBackend` extension: exposes the backend's underlying model
-    subprocess so the runner can *prove* it died during quiescence (T2.4b).
+    """OPTIONAL `AgentBackend` extension: answers for the backend's underlying
+    model subprocess so the runner can *prove* it died during quiescence (T2.4b).
 
-    Kept separate from `AgentBackend` (not a required member) so backends without
-    a locally-reapable child — a remote/HTTP backend, a test fake — stay
-    conforming; the runner probes `isinstance(backend, ReapableBackend)` and a
-    backend that isn't one degrades to `sdk_state="no_pid"` (honest, never a
-    crash)."""
+    **Implementing this protocol IS the positive declaration** that the backend
+    can account for its local model process — including the answer "there is
+    none". A pure HTTP/remote brain implements it and returns `None` / `False`;
+    that costs two trivial methods and earns `sdk_state="no_pid"`.
+
+    A backend that does NOT implement it has said *nothing*, and the runner
+    classifies it `sdk_state="unknown"` → `state="unverified"`. It is deliberately
+    NOT treated as childless: "I could not determine whether there is a child"
+    and "there is definitively no child" are different claims, and only the
+    second one may earn green. Collapsing them is what let a live `codex` CLI
+    subprocess be reported as proven dead — the backend simply never implemented
+    this protocol, and silence read as absence.
+
+    Failing to implement this is therefore a backend *defect*, not a supported
+    configuration. Third-party backends loaded from entry points fail closed
+    (loud, never green) until they declare."""
 
     def child_pid(self) -> int | None:
-        """PID of the model subprocess, or None if not connected / no local
-        child."""
+        """PID of the model subprocess, or None when the backend is certain it
+        owns no live local child (not connected, or HTTP-only by construction).
+
+        `None` is a POSITIVE claim of absence and earns `sdk_state="no_pid"`.
+        A backend that owns a local child but cannot currently resolve its pid
+        must NOT return None — it must raise, which the runner classifies as
+        `unknown` → `unverified`. Raising is the supported way to say "I cannot
+        account for my child"; returning None to mean that is the fail-open bug
+        this contract exists to prevent."""
         ...
 
     def child_alive(self) -> bool:

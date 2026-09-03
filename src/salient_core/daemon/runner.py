@@ -152,25 +152,55 @@ class QuiescenceReport:
     """Evidence that a runner is dead, returned by `AgentRunner.quiesce()`
     (T2.4b). `state` is honest about what could be *proven*, never optimistic:
 
-    - ``proven_quiescent`` — task terminal, SDK child proven gone (ESRCH) or the
-      backend exposes no local child, and no registered tool subprocess survived.
+    - ``proven_quiescent`` — task terminal, the backend accounted for its model
+      child (proven gone via ESRCH, or positively declared it has none), and no
+      registered tool subprocess survived.
     - ``force_reaped`` — the tool children are gone but the task did not exit
       cleanly (it was cancelled / is wedged past the force deadline).
-    - ``unverified`` — some death could not be proven (SDK child still alive, a
-      tool subprocess survived, or a signal was refused). NEVER faked as
-      quiescent.
+    - ``unverified`` — some death could not be proven (model child still alive,
+      a tool subprocess survived, a signal was refused, or the backend cannot
+      account for its model child at all). NEVER faked as quiescent.
+
+    `state` is deliberately kept to those THREE values. A separate fourth state
+    for "the backend didn't declare" was considered and rejected: every consumer
+    match/switch would grow an arm it has never heard of, and any consumer whose
+    default arm reads unrecognized-as-benign would reintroduce exactly the
+    fail-open bug this classification exists to close. The *cause* is carried as
+    data in ``unverified_reasons`` instead, so escalation policy can distinguish
+    "a process survived" (retry the kill, page) from "this backend never declared
+    whether it has a child" (a backend defect — fix the backend) without the
+    severity lattice growing a point that can be silently mis-ranked.
+
+    Consumers deriving a green light MUST test membership of the good values
+    (``state in {"proven_quiescent", ...}``), never ``state != "unverified"``.
+    An allowlist keeps any future state fail-closed by construction.
+
+    Parity note, deliberate: ``cgroup_state == "unavailable"`` is the same
+    structural shape ("an attester is missing") but does NOT force
+    ``unverified``. The cgroup reaper is an optional *second* attester for
+    escaped grandchildren; the model child is a first-class process this report
+    claims to account for. Do not "fix" this symmetrically — it would turn every
+    box without delegated cgroup v2 permanently red.
     """
 
     runner: str
     task_done: bool
     task_cancelled: bool
     sdk_pid: int | None
-    sdk_state: str  # "proven_dead" | "alive" | "no_pid"
+    # "proven_dead" — probed, gone (ESRCH)
+    # "alive"       — probed, still running
+    # "no_pid"      — backend positively declared no local child right now
+    # "unknown"     — backend cannot account for a child (undeclared, or its
+    #                 probe raised). Never confuse this with "no_pid".
+    sdk_state: str
     tool_reaped: tuple[int, ...]
     tool_survived: tuple[int, ...]
     state: str  # "proven_quiescent" | "force_reaped" | "unverified"
     elapsed_ms: int
     cgroup_state: str = "unavailable"  # "empty" | "reaped" | "survivors" | "unavailable"
+    # Why `state` is "unverified", for escalation routing. Empty otherwise.
+    # Additive field — existing consumers keep working untouched.
+    unverified_reasons: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2790,15 +2820,29 @@ class AgentRunner:
         task = self._task
         task_done = task is None or task.done()
 
-        # SDK CLI subprocess: prove death via os.kill(pid, 0) → ESRCH.
+        # Model subprocess: prove death via os.kill(pid, 0) → ESRCH.
+        #
+        # The default is "unknown", NOT "no_pid": a backend that never declared
+        # whether it owns a local child has proven nothing, and must not inherit
+        # the green-earning value that belongs to a backend which positively
+        # answered "none". Note the exception path *sets* unknown rather than
+        # merely failing to set alive — a probe that throws is not proof either.
         sdk_pid: int | None = None
-        sdk_state = "no_pid"
+        sdk_state = "unknown"
         backend = self._backend
-        if isinstance(backend, ReapableBackend):
-            with suppress(Exception):
+        if backend is None:
+            # Never built / already torn down: there is no backend object, so
+            # there is definitively no model child to account for.
+            sdk_state = "no_pid"
+        elif isinstance(backend, ReapableBackend):
+            try:
                 sdk_pid = backend.child_pid()
-                if sdk_pid is not None:
+                if sdk_pid is None:
+                    sdk_state = "no_pid"
+                else:
                     sdk_state = "alive" if backend.child_alive() else "proven_dead"
+            except Exception:  # noqa: BLE001 — a probe that raises proves nothing
+                sdk_pid, sdk_state = None, "unknown"
 
         # Tool subprocesses: reap any survivor (backstop for the wedged/finally-
         # skipped case), let SIGKILL land, then re-check what's still alive.
@@ -2833,12 +2877,36 @@ class AgentRunner:
                     tool_survived = tuple(sorted(set(tool_survived) | set(members)))
                 reaper.remove_runner(self.name)
 
-        if tool_survived or sdk_state == "alive" or cgroup_state == "survivors":
+        reasons: list[str] = []
+        if tool_survived:
+            reasons.append("tool_survivors")
+        if sdk_state == "alive":
+            reasons.append("sdk_alive")
+        if cgroup_state == "survivors":
+            reasons.append("cgroup_survivors")
+        if sdk_state == "unknown":
+            reasons.append("sdk_unverifiable")
+
+        if reasons:
             state = "unverified"
         elif task_done:
             state = "proven_quiescent"
         else:
             state = "force_reaped"
+
+        # A backend that cannot account for its own model child is a backend
+        # DEFECT, not a survivor sighting. Say so where the operator will read
+        # it, naming the class to fix, so the fail-closed state is cheap to
+        # exit correctly instead of being reverted as noise.
+        if reasons == ["sdk_unverifiable"]:
+            _log.warning(
+                "%s: quiescence unproven — backend %s implements no "
+                "ReapableBackend (child_pid/child_alive), so a local model "
+                "process cannot be accounted for. Declare it (return None/False "
+                "if the backend has no local child) to restore provable STOP.",
+                self.name,
+                type(backend).__name__ if backend is not None else "<none>",
+            )
 
         return QuiescenceReport(
             runner=self.name,
@@ -2851,6 +2919,7 @@ class AgentRunner:
             state=state,
             elapsed_ms=int((time.monotonic() - t0) * 1000),
             cgroup_state=cgroup_state,
+            unverified_reasons=tuple(reasons),
         )
 
     def snapshot_jobs(self) -> dict[str, Any]:
