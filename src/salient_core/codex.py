@@ -66,6 +66,23 @@ class CodexAuthenticationError(RuntimeError):
         super().__init__("Codex is not authenticated; run `codex login` or set OPENAI_API_KEY")
 
 
+class CodexChildUnresolvableError(RuntimeError):
+    """Raised by `CodexBackend.child_pid()` when the backend is connected — so it
+    owns a live `codex` CLI subprocess — but cannot resolve that child's pid.
+
+    This is the ReapableBackend contract's "unknown" signal (T2.4b). It must NOT
+    be softened into `return None`: None means "I am certain there is no live
+    local child" and earns `sdk_state="no_pid"` → green. Raising here classifies
+    the runner `unknown` → `unverified`, which is the honest answer when we
+    cannot see the process we are meant to be proving dead."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "codex CLI subprocess pid could not be resolved; STOP cannot be proven "
+            "for this runner (see CodexBackend._resolve_child_pid)"
+        )
+
+
 # The mcp_servers key under which salient's own bus-tool gateway is registered on
 # the codex thread (see CodexProvider.create_backend). Codex gates every MCP tool
 # call with an elicitation ("Allow server X to run tool Y?"); for OUR gateway that
@@ -491,6 +508,9 @@ class CodexBackend:
         )
         self._thread_id: str | None = None
         self._turn_id: str | None = None
+        # pid handed to proc_registry at connect, so quiesce's reap backstop can
+        # reach the codex CLI even if the runner task never runs its finally.
+        self._registered_pid: int | None = None
         self._usage = TurnUsage()
         self._closed = False
         self._followup_handler = followup_handler
@@ -562,6 +582,7 @@ class CodexBackend:
 
     async def connect(self) -> None:
         await self._run(self._client.start)
+        self._register_child()
         await self._run(self._client.initialize)
         account = _dump(await self._run(self._client.account_read))
         if not account.get("account"):
@@ -640,6 +661,7 @@ class CodexBackend:
             except (EOFError, OSError, RuntimeError):
                 pass
         await self._run(self._client.close)
+        self._deregister_child()
         if self._revoke_mcp is not None:
             self._revoke_mcp()
         self._executor.shutdown(wait=not pending, cancel_futures=True)
@@ -766,6 +788,97 @@ class CodexBackend:
     async def interrupt(self) -> None:
         if self._thread_id and self._turn_id:
             await self._run(self._client.turn_interrupt, self._thread_id, self._turn_id)
+
+    # ── ReapableBackend (T2.4b) ───────────────────────────────────────────
+    # Unlike the polybrain/HTTP brains, this backend drives a LOCAL `codex` CLI
+    # subprocess (see `_default_client_factory`: CodexConfig(codex_bin=...)), so
+    # it owns a process the killswitch must be able to prove dead.
+    #
+    # It previously implemented neither method. That made it fail the
+    # `isinstance(backend, ReapableBackend)` probe, which the runner used to read
+    # as "no local child" — so a live codex CLI, plus anything it spawned, was
+    # reported `proven_quiescent`. Two further reasons the task-level proof is
+    # not a substitute here: codex work runs in a ThreadPoolExecutor and threads
+    # are not cancellable (an abandoned `run_in_executor` future leaves the
+    # thread running), and `interrupt()` is only a cooperative RPC. The proof has
+    # to come from the pid.
+
+    def _register_child(self) -> None:
+        """Put the codex CLI in the runner's proc_registry so quiescence's reap
+        backstop can kill it when the task is wedged and never runs its
+        `finally` → `disconnect()`. Registered UNWRAPPED (single-pid signal, not
+        killpg): the SDK spawns it without `start_new_session`, so it shares the
+        daemon's process group and a group signal would hit the daemon itself.
+        Never fatal — a registry miss must not fail an otherwise-good start."""
+        from .daemon import proc_registry
+
+        with suppress(Exception):
+            pid = self._resolve_child_pid()
+            if pid is not None:
+                proc_registry.register_subprocess(pid, wrapped=False)
+                self._registered_pid = pid
+
+    def _deregister_child(self) -> None:
+        from .daemon import proc_registry
+
+        pid, self._registered_pid = self._registered_pid, None
+        if pid is not None:
+            with suppress(Exception):
+                proc_registry.deregister_subprocess(pid)
+
+    def _resolve_child_pid(self) -> int | None:
+        """Best-effort walk to the CLI subprocess the vendor SDK spawned.
+
+        Every hop is guarded independently so an SDK layout change degrades to
+        "not found" rather than crashing quiescence — the same defensive style
+        `LocalClaudeBackend._child_process` uses against the Claude SDK. The
+        candidate paths are ordered most- to least-specific; `None` here means
+        "could not resolve", which the caller escalates, never "no child"."""
+        for path in (
+            ("_process",),
+            ("_proc",),
+            ("process",),
+            ("_transport", "_process"),
+            ("_server", "_process"),
+            ("_conn", "_process"),
+        ):
+            node: Any = self._client
+            for hop in path:
+                node = getattr(node, hop, None)
+                if node is None:
+                    break
+            if node is None:
+                continue
+            pid = getattr(node, "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                return pid
+        # Some clients expose the pid directly rather than a process object.
+        pid = getattr(self._client, "pid", None)
+        return pid if isinstance(pid, int) and pid > 0 else None
+
+    def child_pid(self) -> int | None:
+        # Not connected (or already torn down) → no live child to account for.
+        # This is a genuine claim of absence, so returning None is correct here.
+        if self._closed or self._thread_id is None:
+            return None
+        pid = self._resolve_child_pid()
+        if pid is None:
+            # Connected, so a codex CLI exists, but we cannot see it. Fail
+            # closed — see CodexChildUnresolvableError.
+            raise CodexChildUnresolvableError
+        return pid
+
+    def child_alive(self) -> bool:
+        pid = self.child_pid()  # propagates CodexChildUnresolvableError
+        if pid is None:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:  # ESRCH — proven gone
+            return False
+        except PermissionError:  # EPERM — exists, not ours to signal
+            return True
+        return True
 
     async def get_context_usage(self) -> ContextUsage | None:
         if self._usage.total_tokens is None:

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Sixth public snapshot. Consolidates the private kernel's `0.8.22`–`0.8.24`
 (intermediate versions have no separate public entries; releases here are
 paused and there are no external consumers). One trust-gate fix, one
+killswitch-honesty fix, one
 safeguard-hardening pass, and one opt-in scope flag.
 
 ### Fixed
@@ -27,6 +28,22 @@ safeguard-hardening pass, and one opt-in scope flag.
   prohibited/loud regexes log one deduped WARNING per (label, pattern)
   instead of failing open silently; `resolve_config` documents that
   `extra_patterns` union (fail-closed), never subtract.
+- **Killswitch honesty: an undeclared backend can no longer read
+  `proven_quiescent`** (`daemon/runner.py`, `codex.py`,
+  `polybrain/backend.py`, `runtime.py`, private `0.8.24`).
+  `_build_quiescence_report` collapsed "probed, definitively no local model
+  child" and "this backend never declared whether it owns one" into a single
+  `sdk_state="no_pid"`, which earned green; a `CodexBackend` driving a local
+  `codex` CLI subprocess implemented neither `ReapableBackend` method, so a
+  live model process was reported provably dead. Implementing `ReapableBackend`
+  is now the positive declaration — undeclared, or a probe that raises, is
+  `sdk_state="unknown"` -> `unverified` (fail closed); `no_pid` is reserved for
+  a backend that positively answered "none". `CodexBackend` resolves and
+  registers its CLI pid (unwrapped, so a group signal never reaches the daemon)
+  and raises rather than claiming absence when it cannot see the child;
+  `PolybrainBackend` declares `None`/`False` explicitly. The cause is carried
+  additively in `unverified_reasons` rather than a fourth state consumers could
+  silently mis-rank. Pinned in `tests/test_quiescence.py`.
 
 ### Added
 - **Opt-in `scope.local_targets` profile flag** (`policy/scope.py`,

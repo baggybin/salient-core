@@ -18,8 +18,9 @@ from salient_core.protocols import AgentBackend, ReapableBackend
 
 
 class _FakeBackend:
-    """A complete AgentBackend that exposes no reapable child (like a remote
-    backend / the codex path)."""
+    """A complete AgentBackend that says NOTHING about a local child — it does
+    not implement `ReapableBackend`, so quiescence cannot tell whether a model
+    process is still running. Undeclared is not the same as childless."""
 
     def __init__(self, options: Any = None) -> None:
         self.options = options
@@ -40,6 +41,10 @@ class _FakeBackend:
 
 
 class _ReapableFake(_FakeBackend):
+    """Implements `ReapableBackend`. Constructed bare (`pid=None`) it is the
+    *declared-childless* backend — an HTTP/remote brain that positively answers
+    "no local child" — which is what earns `no_pid`."""
+
     def __init__(self, pid: int | None = None, alive: bool = False) -> None:
         super().__init__()
         self._pid, self._alive = pid, alive
@@ -49,6 +54,49 @@ class _ReapableFake(_FakeBackend):
 
     def child_alive(self) -> bool:
         return self._alive
+
+
+class _BrokenReapableFake(_FakeBackend):
+    """Claims `ReapableBackend` but throws when asked. A backend that cannot
+    answer has not proven anything."""
+
+    def child_pid(self) -> int | None:
+        raise RuntimeError("SDK internals moved")
+
+    def child_alive(self) -> bool:
+        raise RuntimeError("SDK internals moved")
+
+
+class _StubCodexClient:
+    """Enough of the `_CodexClient` protocol to construct a `CodexBackend`
+    without the optional `openai_codex` SDK installed."""
+
+    def start(self) -> None: ...
+    def close(self) -> None: ...
+
+
+class _StubCodexClientWithProcess(_StubCodexClient):
+    """A stub whose CLI subprocess is reachable, mimicking the vendor SDK
+    holding an `anyio`/`subprocess` handle."""
+
+    class _Proc:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+    def __init__(self, pid: int) -> None:
+        self._process = self._Proc(pid)
+
+
+def _unused_pid() -> int:
+    """A pid with no live process, for the ESRCH path."""
+    for candidate in range(4_000_000, 4_000_100):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except PermissionError:
+            continue
+    raise unittest.SkipTest("no free pid found for the ESRCH probe")
 
 
 def _runner(**kw: Any) -> AgentRunner:
@@ -114,7 +162,7 @@ class ReapableBackendTests(unittest.TestCase):
 
     def test_plain_backend_is_not_reapable(self):
         # A backend without child_pid/child_alive stays a valid AgentBackend but
-        # is NOT a ReapableBackend → the runner degrades it to no_pid.
+        # is NOT a ReapableBackend → the runner cannot prove anything about it.
         self.assertIsInstance(_FakeBackend(), AgentBackend)
         self.assertNotIsInstance(_FakeBackend(), ReapableBackend)
 
@@ -122,6 +170,54 @@ class ReapableBackendTests(unittest.TestCase):
         b = LocalClaudeBackend(ClaudeAgentOptions())
         self.assertIsNone(b.child_pid())
         self.assertFalse(b.child_alive())
+
+    def test_codex_backend_is_reapable(self):
+        """The codex runtime drives a LOCAL `codex` CLI subprocess, so it must
+        be able to answer for that child. Before this pin it implemented
+        neither method, so quiescence read it as "no local child" and called a
+        possibly-live model process proven dead."""
+        from salient_core.codex import CodexBackend, CodexBackendConfig
+
+        backend = CodexBackend(
+            CodexBackendConfig(cwd="/tmp"),
+            client_factory=lambda **_kw: _StubCodexClient(),
+        )
+        self.assertIsInstance(backend, ReapableBackend)
+
+    def _codex(self, client: Any) -> Any:
+        from salient_core.codex import CodexBackend, CodexBackendConfig
+
+        return CodexBackend(CodexBackendConfig(cwd="/tmp"), client_factory=lambda **_kw: client)
+
+    def test_codex_before_connect_declares_no_child(self):
+        # Nothing spawned yet → a genuine claim of absence, so None is correct.
+        self.assertIsNone(self._codex(_StubCodexClient()).child_pid())
+        self.assertFalse(self._codex(_StubCodexClient()).child_alive())
+
+    def test_codex_connected_but_unresolvable_child_refuses_to_claim_absence(self):
+        """The load-bearing half. Connected means a codex CLI exists; if we
+        cannot see it we must raise (→ unknown → unverified), NOT return None,
+        which would claim "no child" and earn green all over again."""
+        from salient_core.codex import CodexChildUnresolvableError
+
+        backend = self._codex(_StubCodexClient())  # no reachable process attr
+        backend._thread_id = "thread-1"  # connected
+        with self.assertRaises(CodexChildUnresolvableError):
+            backend.child_pid()
+        with self.assertRaises(CodexChildUnresolvableError):
+            backend.child_alive()
+
+    def test_codex_resolves_a_reachable_child_pid(self):
+        backend = self._codex(_StubCodexClientWithProcess(os.getpid()))
+        backend._thread_id = "thread-1"
+        self.assertEqual(backend.child_pid(), os.getpid())
+        self.assertTrue(backend.child_alive())  # our own pid is alive
+
+    def test_codex_dead_child_is_proven_dead(self):
+        # A pid that cannot exist → ESRCH → proven dead, not "alive".
+        backend = self._codex(_StubCodexClientWithProcess(_unused_pid()))
+        backend._thread_id = "thread-1"
+        self.assertFalse(backend.child_alive())
 
 
 class QuiesceLadderTests(unittest.IsolatedAsyncioTestCase):
@@ -131,7 +227,7 @@ class QuiesceLadderTests(unittest.IsolatedAsyncioTestCase):
         return r
 
     async def test_graceful_exit_is_proven_quiescent(self):
-        r = self._make(_FakeBackend())
+        r = self._make(_ReapableFake())  # declares: no local child
         r._task = asyncio.create_task(asyncio.sleep(0))
         rep = await r.quiesce(grace=1.0, force=0.5)
         self.assertIsInstance(rep, QuiescenceReport)
@@ -141,11 +237,41 @@ class QuiesceLadderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rep.state, "proven_quiescent")
 
     async def test_wedged_task_is_cancelled_then_proven(self):
-        r = self._make(_FakeBackend())
+        r = self._make(_ReapableFake())
         r._task = asyncio.create_task(asyncio.sleep(100))
         rep = await r.quiesce(grace=0.15, force=0.5)
         self.assertTrue(rep.task_cancelled)
         self.assertTrue(rep.task_done)  # cancel landed
+        self.assertEqual(rep.state, "proven_quiescent")
+
+    async def test_undeclared_backend_can_never_be_proven(self):
+        """The gap this pin exists for. A backend that implements neither
+        `child_pid` nor `child_alive` has told us NOTHING about a local model
+        process. Silence must not buy `proven_quiescent` — that is how a live
+        `codex` CLI got reported as dead."""
+        r = self._make(_FakeBackend())
+        r._task = asyncio.create_task(asyncio.sleep(0))
+        rep = await r.quiesce(grace=1.0, force=0.5)
+        self.assertTrue(rep.task_done)  # the task really did exit...
+        self.assertEqual(rep.sdk_state, "unknown")  # ...but the child is unknown
+        self.assertEqual(rep.state, "unverified")
+
+    async def test_backend_that_cannot_answer_is_not_proven(self):
+        # Claims the protocol, throws when asked → still unproven, never a crash.
+        r = self._make(_BrokenReapableFake())
+        r._task = asyncio.create_task(asyncio.sleep(0))
+        rep = await r.quiesce(grace=1.0, force=0.5)
+        self.assertEqual(rep.sdk_state, "unknown")
+        self.assertEqual(rep.state, "unverified")
+
+    async def test_runner_with_no_backend_is_proven(self):
+        # Guards the other direction: a runner that never built a backend has
+        # definitively no model child, so it must NOT go falsely red.
+        r = self._make(_FakeBackend())
+        r._backend = None
+        r._task = asyncio.create_task(asyncio.sleep(0))
+        rep = await r.quiesce(grace=1.0, force=0.5)
+        self.assertEqual(rep.sdk_state, "no_pid")
         self.assertEqual(rep.state, "proven_quiescent")
 
     async def test_swallowed_cancel_is_force_reaped_not_faked(self):
@@ -156,7 +282,7 @@ class QuiesceLadderTests(unittest.IsolatedAsyncioTestCase):
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.sleep(0.03)
 
-        r = self._make(_FakeBackend())
+        r = self._make(_ReapableFake())
         r._task = asyncio.create_task(wedged())
         rep = await r.quiesce(grace=0.1, force=0.3)
         self.assertTrue(rep.task_cancelled)
@@ -182,7 +308,7 @@ class QuiesceLadderTests(unittest.IsolatedAsyncioTestCase):
     async def test_surviving_tool_subprocess_forces_unverified(self):
         # A registered tool subprocess that outlives the reap (simulated by
         # patching reap to a no-op) must force unverified, never proven.
-        r = self._make(_FakeBackend())
+        r = self._make(_ReapableFake())
         r._task = asyncio.create_task(asyncio.sleep(0))
         proc = await _spawn(True)
         proc_registry.register_subprocess(proc.pid, wrapped=True, runner=r.name)

@@ -13,10 +13,13 @@ Control honesty:
   hooks; codex needed its own gate). `_make_runner` passes a `safeguard_hook`
   here and EVERY tool call is evaluated through it before the handler runs;
   a denial returns an error tool result and the handler is never invoked.
-- **STOP**: pure HTTP backend, no `ReapableBackend` child — the runner
-  reports `sdk_state="no_pid"`. `interrupt()` cancels the in-flight request
-  and terminates `receive_response()` promptly so the quiesce ladder never
-  wedges on us.
+- **STOP**: pure HTTP backend with no local model child. It still IMPLEMENTS
+  `ReapableBackend` — returning `None`/`False` — because under the T2.4b
+  contract implementing the protocol is the positive declaration "I can account
+  for my model process", and the answer "there is none" only counts when it is
+  actually given. A backend that stays silent is classified `unknown` →
+  `unverified`, never `no_pid`. `interrupt()` cancels the in-flight request and
+  terminates `receive_response()` promptly so the quiesce ladder never wedges.
 """
 
 from __future__ import annotations
@@ -114,6 +117,18 @@ class PolybrainBackend:
         self._closed = True
         await self.interrupt()
         await self._brain.aclose()
+
+    # -- ReapableBackend (T2.4b) -------------------------------------------
+    # Declared, not inferred. This brain talks HTTP and never spawns a local
+    # model process, so the honest answer is "none" — but it has to be SAID:
+    # under the quiescence contract a backend that implements neither method is
+    # classified `unknown` (unprovable) rather than childless.
+
+    def child_pid(self) -> int | None:
+        return None
+
+    def child_alive(self) -> bool:
+        return False
 
     # -- turn pump ---------------------------------------------------------
 
