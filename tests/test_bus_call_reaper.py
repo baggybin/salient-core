@@ -67,6 +67,13 @@ class _ReaperDaemon(_QuestionsMixin):
         pass
 
 
+class _SkinReaperDaemon(_ReaperDaemon):
+    """Same shim, but a downstream skin has named its own console via the
+    `ctl_name` seam (see CtlNameSeamTests in test_daemon_seams)."""
+
+    ctl_name = "salient-assay"
+
+
 def _stale_call(call_id: int, age_seconds: float, state: str = "awaiting_reply") -> BusCall:
     """Build a BusCall that started `age_seconds` ago."""
     loop = asyncio.get_event_loop()
@@ -183,6 +190,31 @@ class BusCallReaperTests(unittest.IsolatedAsyncioTestCase):
         # The text points the operator at the real cancel paths.
         self.assertIn("cancel", q.text.lower())
         self.assertIn("bus cancel --id 1", q.text)
+
+    async def test_stall_text_names_the_operators_own_ctl(self):
+        """The stall question hands the operator two shell commands to type.
+        Both must name the console they actually have: `salientctl` by
+        default, the skin's own when it set `ctl_name`. A wrong name here is
+        worse than no hint — the operator types it and gets
+        `command not found` while the call stays wedged."""
+        d = _ReaperDaemon(prompt_timeout=60.0)
+        d._bus_calls[1] = _stale_call(1, age_seconds=200.0)
+        await self._run_reaper_once(d)
+        self.assertIn("salientctl bus cancel --id 1", d.inbox.added[0].text)
+        self.assertIn("salientctl restart", d.inbox.added[0].text)
+
+        skin = _SkinReaperDaemon(prompt_timeout=60.0)
+        skin._bus_calls[1] = _stale_call(1, age_seconds=200.0)
+        await self._run_reaper_once(skin)
+        text = skin.inbox.added[0].text
+        self.assertIn("salient-assay bus cancel --id 1", text)
+        self.assertIn("salient-assay restart", text)
+        self.assertNotIn(
+            "salientctl",
+            text,
+            "both hints must be renamed together — a half-renamed pair "
+            "leaves the operator guessing which CLI each line means.",
+        )
 
     async def test_reaper_skips_snoozed_call(self):
         """After the operator answers 'wait', the call is snoozed; the reaper
