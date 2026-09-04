@@ -2,6 +2,10 @@
 
 **An agent-control kernel for multi-agent systems. We optimize for what agents *can't* do.**
 
+*A **guardrail and permission layer for AI agent harnesses** — sandboxed tool
+scopes, default-deny policy, human-in-the-loop approval, and a replayable audit
+trail, under Claude Code, Codex, or your own agent loop.*
+
 [![CI](https://github.com/baggybin/salient-core/actions/workflows/ci.yml/badge.svg)](https://github.com/baggybin/salient-core/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -10,7 +14,8 @@
 Most AI frameworks focus on giving agents more capabilities. `salient-core`
 focuses on **proving what they actually did**, and **stopping them from doing
 what they shouldn't**. It sits below the LLM — between the model and your
-tools — as a **default-deny control kernel**.
+tools — as a **default-deny control kernel**. Whichever harness drives the loop,
+the gates are the same.
 
 > Let agents act on your infrastructure, but never outside the box you drew —
 > and always keep the receipts.
@@ -34,8 +39,10 @@ tool invocation, across SDK built-ins, MCP, bus tools, and model-emitted text.
 
 ## The solution
 
-`salient-core` moves control out of the prompt and into the kernel. Every tool
-call passes through **scope + safeguard gates** *before* anything executes.
+`salient-core` moves control out of the prompt and into the kernel. An agent that
+can still run `rm -rf` because a prompt asked it not to is not **sandboxed** — it
+is hoping. Every tool call passes through **scope + safeguard gates** *before*
+anything executes.
 Capability exposure and authorization are separate: enabling a tool never
 implicitly authorizes it. Unclassified tools fail closed. A denied call
 **never runs**.
@@ -198,4 +205,6 @@ Apache 2.0 — see [`LICENSE`](LICENSE).
 
 ---
 
-*Built for constrained multi-agent systems on the Model Context Protocol (MCP).*
+*Built for constrained multi-agent systems on the Model Context Protocol (MCP) —
+agent security, tool-use permissions, and provable operator control over
+autonomous agents.*
