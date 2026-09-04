@@ -177,3 +177,38 @@ def test_scope_api_version_bump_and_stale_skin_failure() -> None:
     with pytest.raises(scope_api.ScopeApiVersionError, match="scope API mismatch"):
         scope_api.require_scope_api_version(2)
     scope_api.require_scope_api_version(3)
+
+
+def test_scope_api_facade_exports_the_evaluation_entry_point() -> None:
+    """The facade's contract is "the kernel refactors internals freely as long
+    as this surface holds" — so a name a skin depends on has to BE on the
+    surface. `salient-assay`'s redirect floor re-judges every HTTP hop by
+    calling the kernel's own evaluator; before these were promoted it reached
+    into `policy.decision` / `policy.scope_evaluation` directly, and a rename
+    there would have broken a skin's floor without any version signal.
+    """
+    for name in (
+        "evaluate_scope",
+        "ToolInvocation",
+        "InvocationIdentity",
+        "InvocationTransport",
+        "ScopeEvaluation",
+        "ScopeEvaluationKind",
+    ):
+        assert name in scope_api.__all__, f"{name} dropped out of the facade"
+        assert getattr(scope_api, name, None) is not None
+
+    # Same objects as the internals — a facade, not a reimplementation.
+    from salient_core.policy import decision, scope_evaluation
+
+    assert scope_api.evaluate_scope is scope_evaluation.evaluate_scope
+    assert scope_api.ToolInvocation is decision.ToolInvocation
+    assert scope_api.InvocationIdentity is decision.InvocationIdentity
+
+
+def test_scope_api_facade_promotion_was_additive() -> None:
+    """Promoting evaluate_scope must not have moved the version: the check is
+    exact equality, so a bump breaks every pinned skin. Removing or changing
+    a facade name is what earns a bump."""
+    assert scope_api.SCOPE_API_VERSION == 3
+    scope_api.require_scope_api_version(3)

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`policy.scope_api` now exports the evaluation entry point**
+  (`evaluate_scope`, `ToolInvocation`, `InvocationIdentity`,
+  `InvocationTransport`, `ScopeEvaluation`, `ScopeEvaluationKind`). The gate
+  judges a call's ARGUMENTS, once. A skin whose tool can be redirected
+  mid-call — an HTTP `Location`, a follow-up dial — must re-judge the new
+  destination against the same rules and the same lane, and the only correct
+  way to do that is to call the kernel's own evaluator; reimplementing lane
+  selection skin-side is a second, weaker copy of the rules. A downstream
+  skin built exactly that floor and had to import `policy.decision` /
+  `policy.scope_evaluation` directly — depending on internals this facade's
+  contract explicitly does not cover, where a rename would have broken a
+  downstream floor with no version signal.
+
+  **Additive, so `SCOPE_API_VERSION` stays 3**: no existing skin must adapt,
+  and `require_scope_api_version` is an exact-equality check, so bumping to
+  announce a larger facade would break every pinned skin for no functional
+  reason. The cost of that choice, stated plainly: a skin using these names
+  against an older kernel gets an `ImportError` rather than a clean
+  `ScopeApiVersionError`. Changing or removing a facade name is still a bump.
+
 ## [0.8.24] - 2026-09-03
 
 Sixth public snapshot. Consolidates the private kernel's `0.8.22`–`0.8.24`
