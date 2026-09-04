@@ -1,21 +1,28 @@
 [project]
 name = "salient-core"
 version = "0.8.24"
-description = "A multi-agent coordination kernel with policy gates, knowledge graph, and operator-mediated delegation."
+description = "Guardrail and permission layer for AI agent harnesses — a default-deny control kernel that gates every tool call before it runs."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11,<3.14"
 authors = [{ name = "Jon O'Brien" }]
-keywords = ["agents", "multi-agent", "coordination", "mcp", "knowledge-graph", "claude"]
+keywords = [
+    "agents", "ai-agents", "llm", "agent-harness", "guardrails", "permissions",
+    "sandbox", "policy-engine", "ai-safety", "agent-security", "tool-use",
+    "multi-agent", "coordination", "mcp", "knowledge-graph", "claude",
+]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
@@ -29,6 +36,7 @@ dependencies = [
 Homepage = "https://github.com/baggybin/salient-core"
 Repository = "https://github.com/baggybin/salient-core"
 Issues = "https://github.com/baggybin/salient-core/issues"
+Documentation = "https://github.com/baggybin/salient-core/blob/main/docs/ARCHITECTURE.md"
 Changelog = "https://github.com/baggybin/salient-core/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]

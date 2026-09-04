@@ -7,9 +7,9 @@ scopes, default-deny policy, human-in-the-loop approval, and a replayable audit
 trail, under Claude Code, Codex, or your own agent loop.*
 
 [![CI](https://github.com/baggybin/salient-core/actions/workflows/ci.yml/badge.svg)](https://github.com/baggybin/salient-core/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/baggybin/salient-core/blob/main/LICENSE)
 
-![salient-core — an agent-control kernel](imgs/social-preview.jpg)
+![salient-core — an agent-control kernel](https://raw.githubusercontent.com/baggybin/salient-core/main/imgs/social-preview.jpg)
 
 Most AI frameworks focus on giving agents more capabilities. `salient-core`
 focuses on **proving what they actually did**, and **stopping them from doing
@@ -61,7 +61,7 @@ I/O is persisted — secrets redacted — so you can reconstruct what happened.
 - **Provable stop**: Stop mechanisms that return evidence the agent died, rather than just assuming a prompt instruction was followed.
 - **Typed MCP bus**: Inter-agent tools provided seamlessly through a Model Context Protocol (MCP) server.
 
-*For a deep dive into the kernel's capabilities, see the [Detailed Features Table](docs/FEATURES.md).*
+*For a deep dive into the kernel's capabilities, see the [Detailed Features Table](https://github.com/baggybin/salient-core/blob/main/docs/FEATURES.md).*
 
 ---
 
@@ -87,9 +87,9 @@ LLM / agent loop
 ```
 
 Full data-flow, persistence model, the control ladder, and seams:
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+[`docs/ARCHITECTURE.md`](https://github.com/baggybin/salient-core/blob/main/docs/ARCHITECTURE.md) ·
 hardening log:
-[`docs/KERNEL-HARDENING-v0.6.0.md`](docs/KERNEL-HARDENING-v0.6.0.md).
+[`docs/KERNEL-HARDENING-v0.6.0.md`](https://github.com/baggybin/salient-core/blob/main/docs/KERNEL-HARDENING-v0.6.0.md).
 
 ---
 
@@ -121,13 +121,14 @@ OpenAI-compatible API brains; anything else means writing an `AgentProvider`
 - **[`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) `>=0.2.110,<0.3`**
   (pulled in automatically, alongside `pydantic` and `httpx`). Claude access via
   `ANTHROPIC_API_KEY` or an existing Claude Code OAuth session.
-- Optional: `pip install 'salient-core[codex]'` for the OpenAI Codex runner
+- Optional: `pip install 'salient-core[codex] @ git+https://github.com/baggybin/salient-core.git'`
+  for the OpenAI Codex runner
   (same bus + gates; your own Codex/OpenAI auth).
 - The `polybrain` runtime needs no extra install — just an API key for the
   sub-brain you want (`MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`,
   `GLM_API_KEY`/`ZHIPU_API_KEY`).
 
-> **Default-deny, out of the box.** By default, an engagement with no policy refuses **every** tool call. Policy is opt-in-safe on purpose. See [`docs/EXTRACTION.md`](docs/EXTRACTION.md) for how to configure your permissions.
+> **Default-deny, out of the box.** By default, an engagement with no policy refuses **every** tool call. Policy is opt-in-safe on purpose. See [`docs/EXTRACTION.md`](https://github.com/baggybin/salient-core/blob/main/docs/EXTRACTION.md) for how to configure your permissions.
 
 ---
 
@@ -136,7 +137,8 @@ OpenAI-compatible API brains; anything else means writing an `AgentProvider`
 ### 1. Install
 
 ```bash
-pip install salient-core
+# not on PyPI yet — install from source:
+pip install git+https://github.com/baggybin/salient-core.git
 ```
 
 ### 2. Run the multi-agent showcase (no API key)
@@ -145,12 +147,12 @@ Fans one prompt across a panel over the bus, captures each leg, and scores
 **semantic convergence** — real `ask_consensus` machinery, offline:
 
 ```bash
-pip install salient-core starlette uvicorn
+pip install git+https://github.com/baggybin/salient-core.git starlette uvicorn
 cd examples/consensus_panel
 uvicorn server:app --reload      # → http://127.0.0.1:8055
 ```
 
-See [`examples/consensus_panel/`](examples/consensus_panel/README.md) to swap
+See [`examples/consensus_panel/`](https://github.com/baggybin/salient-core/blob/main/examples/consensus_panel/README.md) to swap
 the mock runner for live models. Full app on the kernel:
 [`salient-tutor`](https://github.com/baggybin/salient-tutor).
 
@@ -171,17 +173,17 @@ mastery = next_mastery(prev_mastery=0.5, grade="easy")      # → ~0.75
 
 `salient-core` is designed to be wired into your own daemon. We provide comprehensive documentation on how to configure policies, implement protocols, and understand the internal architecture.
 
-- **[Detailed Features Table](docs/FEATURES.md)**
-- **[Architecture & Control Ladder](docs/ARCHITECTURE.md)**
-- **[Extension & Daemon Integration Guide](docs/EXTRACTION.md)**
-- **[Bus Tool Field Reference](docs/BUS_TOOL_FIELDS.md)**
+- **[Detailed Features Table](https://github.com/baggybin/salient-core/blob/main/docs/FEATURES.md)**
+- **[Architecture & Control Ladder](https://github.com/baggybin/salient-core/blob/main/docs/ARCHITECTURE.md)**
+- **[Extension & Daemon Integration Guide](https://github.com/baggybin/salient-core/blob/main/docs/EXTRACTION.md)**
+- **[Bus Tool Field Reference](https://github.com/baggybin/salient-core/blob/main/docs/BUS_TOOL_FIELDS.md)**
 
 ---
 
 ## Status
 
 Pre-alpha (`0.8.17`). APIs are evolving; 1090 tests, 66% coverage. See
-[`CHANGELOG.md`](CHANGELOG.md).
+[`CHANGELOG.md`](https://github.com/baggybin/salient-core/blob/main/CHANGELOG.md).
 
 ## Contributing
 
@@ -197,11 +199,11 @@ pre-commit install
 pytest tests/ -q
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+See [`CONTRIBUTING.md`](https://github.com/baggybin/salient-core/blob/main/CONTRIBUTING.md).
 
 ## License
 
-Apache 2.0 — see [`LICENSE`](LICENSE).
+Apache 2.0 — see [`LICENSE`](https://github.com/baggybin/salient-core/blob/main/LICENSE).
 
 ---
 
