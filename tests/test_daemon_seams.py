@@ -5,13 +5,17 @@ downstream skin plugs its factories + prompts into the kernel daemon.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
 
 from salient_core import daemon
+from salient_core.coord.questions import QuestionInbox
 from salient_core.daemon import _prompts, _tool_registry
 from salient_core.daemon._helpers import Job
+from salient_core.daemon._questions import _QuestionsMixin
 from salient_core.protocols import ToolBuildContext
 from salient_core.runtime import ToolBundle
 
@@ -150,6 +154,87 @@ class VerificationLegPassthroughTests(unittest.TestCase):
         self.assertTrue(j.verification_leg)
         # inert: the field carries, the rest of the job is unchanged
         self.assertEqual((j.id, j.prompt, j.result, j.error), (1, "p", "", None))
+
+
+class _BannerDaemon(_QuestionsMixin):
+    """Minimal daemon shim carrying exactly what the banner paths read: the
+    real in-memory QuestionInbox (no store) and an empty runner map. Stays a
+    `_QuestionsMixin` subclass so the production `add_question` /
+    `add_operator_note` / `add_suggestion` run unchanged."""
+
+    def __init__(self) -> None:
+        self.inbox = QuestionInbox()
+        self.runners: dict = {}
+
+
+class _SkinDaemon(_BannerDaemon):
+    """A downstream skin naming its own console — the whole seam surface."""
+
+    ctl_name = "salient-assay"
+
+
+class CtlNameSeamTests(unittest.TestCase):
+    """`ctl_name` — the one seam a skin sets by ASSIGNMENT on its daemon class
+    rather than by a `set_*` call. `_QuestionsMixin._ctl()` reads it at render
+    time so operator-facing banners name the console the operator actually
+    has installed.
+
+    Pinned here because the banners are built inline in three separate
+    methods (plus the bus-stall pair, pinned in test_bus_call_reaper): a
+    refactor that re-hardcodes "salientctl" in any one of them stays green
+    across the whole kernel suite while sending a skin's operator to a CLI
+    that isn't on their PATH.
+    """
+
+    def _banners(self, daemon_cls) -> str:
+        """Drive the three sync banner paths and return what they printed.
+
+        Deliberately called with NO running loop: that's the branch that
+        prints to stdout instead of scheduling `_emit`, and it renders the
+        identical body, so stdout is a faithful read of the banner text.
+        """
+        d = daemon_cls()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.add_question("scout", "which target?")  # Q1
+            d.add_operator_note("jon", "handing over")  # N2
+            d.add_suggestion("copilot", "try the other lane")  # S3
+        return buf.getvalue()
+
+    def test_unset_ctl_name_keeps_salientctl(self):
+        """Default must be the status quo — a daemon that sets nothing prints
+        the same bytes it printed before the seam existed."""
+        out = self._banners(_BannerDaemon)
+        self.assertIn("salientctl answer 1 <text>", out)
+        self.assertIn("salientctl note-resolve 2", out)
+        self.assertIn("salientctl suggestion dismiss 3", out)
+
+    def test_ctl_name_renames_every_banner(self):
+        """One assignment must cover ALL the hints, not just the answer one:
+        a half-renamed set is worse than none — the operator can't tell which
+        of the two CLIs a given line means."""
+        out = self._banners(_SkinDaemon)
+        self.assertIn("salient-assay answer 1 <text>", out)
+        self.assertIn("salient-assay note-resolve 2", out)
+        self.assertIn("salient-assay suggestion dismiss 3", out)
+        self.assertNotIn(
+            "salientctl",
+            out,
+            "a skin that set ctl_name must see NO salientctl left in the "
+            "question banners — a leftover names a CLI its operator has "
+            "never installed.",
+        )
+
+    def test_ctl_is_read_at_render_time(self):
+        """Read per render, not captured at import/init — a skin that names
+        its console after construction (from parsed argv, say) still gets
+        the right banner."""
+        d = _BannerDaemon()
+        d.ctl_name = "latectl"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.add_question("scout", "which target?")
+        self.assertIn("latectl answer 1 <text>", buf.getvalue())
 
 
 if __name__ == "__main__":
