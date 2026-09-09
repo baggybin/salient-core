@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Operator-facing question banners name the skin's own CLI** — a new
+  `ctl_name` seam. The question / note / suggestion banners and the
+  bus-stall prompt hardcoded `salientctl` at five sites, so a downstream
+  skin's console told its operator to type commands belonging to a
+  different product: found live when an `approve_before` banner sent a
+  salient-assay operator to `salientctl answer`, a CLI that machine does
+  not have. `_QuestionsMixin._ctl()` now renders
+  `getattr(self, "ctl_name", "salientctl")` at all five, and a skin names
+  its console by setting `ctl_name` on the daemon class that assembles the
+  mixins.
+
+  **Nothing changes for a daemon that sets nothing** — the default IS the
+  status quo, byte for byte. Two costs, stated plainly. This seam is read
+  at call time like the others but registered by ATTRIBUTE rather than a
+  `set_*` call, so a skin's typo (`ctlname = "…"`) falls back silently to
+  `salientctl` instead of failing loud. And the rename covers the questions
+  path only: the scope-deny hints, `ask_operator`'s tool description, and
+  the spawn/restart nudges still say `salientctl` unconditionally.
+
 - **`policy.scope_api` now exports the evaluation entry point**
   (`evaluate_scope`, `ToolInvocation`, `InvocationIdentity`,
   `InvocationTransport`, `ScopeEvaluation`, `ScopeEvaluationKind`). The gate

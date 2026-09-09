@@ -160,7 +160,7 @@ class _QuestionsMixin(_EventObservationMixin):
         target = f" → {to_op}" if to_op else ""
         body = (
             f"📝 NOTE N{q.id} from {from_op}{target}: {q.text}\n"
-            f"   → acknowledge with: salientctl note-resolve {q.id}"
+            f"   → acknowledge with: {self._ctl()} note-resolve {q.id}"
         )
         try:
             loop = asyncio.get_running_loop()
@@ -179,7 +179,7 @@ class _QuestionsMixin(_EventObservationMixin):
         q: Question = self.inbox.add_suggestion(source, text)
         body = (
             f"💡 SUGGESTION S{q.id} from {source}: {q.text}\n"
-            f"   → dismiss with: salientctl suggestion dismiss {q.id}"
+            f"   → dismiss with: {self._ctl()} suggestion dismiss {q.id}"
         )
         try:
             loop = asyncio.get_running_loop()
@@ -902,8 +902,8 @@ class _QuestionsMixin(_EventObservationMixin):
                         f"unblocks with a cancellation error) or 'wait' to "
                         f"keep waiting (I'll re-check and ask again if it's "
                         f"still stalled). You can also run "
-                        f"`salientctl bus cancel --id {call.id}`, or restart "
-                        f"{call.target!r} via `salientctl restart`."
+                        f"`{self._ctl()} bus cancel --id {call.id}`, or restart "
+                        f"{call.target!r} via `{self._ctl()} restart`."
                     )
                     # kind="bus_stall": the answer drives a mechanical cancel,
                     # NOT a queued prompt the blocked caller can't consume.
@@ -1112,6 +1112,13 @@ class _QuestionsMixin(_EventObservationMixin):
         self._announce_question(q, source=source)
         return q
 
+    def _ctl(self) -> str:
+        """The CLI name in operator-facing question banners/hints.
+
+        A skin names its own console by setting ``ctl_name`` on its daemon
+        class; defaults to salient's own ctl."""
+        return getattr(self, "ctl_name", "salientctl")
+
     def _announce_question(self, q: Question, source: str) -> None:
         """Make a new question visible everywhere we can:
         - high-visibility banner on daemon stdout (asyncio task to use _emit)
@@ -1122,7 +1129,7 @@ class _QuestionsMixin(_EventObservationMixin):
         body = (
             f"⚠ NEW QUESTION Q{q.id} from {q.agent} "
             f"(via {source}): {q.text}\n"
-            f"   → reply with: salientctl answer {q.id} <text>"
+            f"   → reply with: {self._ctl()} answer {q.id} <text>"
         )
         if runner is not None:
             # Inject into the runner's pubsub channel so any tail subscriber
