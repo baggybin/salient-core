@@ -182,7 +182,7 @@ mastery = next_mastery(prev_mastery=0.5, grade="easy")      # → ~0.75
 
 ## Status
 
-Pre-alpha (`0.8.17`). APIs are evolving; 1090 tests, 66% coverage. See
+Pre-alpha (`0.8.24`). APIs are evolving; 1137 tests, 67% coverage. See
 [`CHANGELOG.md`](https://github.com/baggybin/salient-core/blob/main/CHANGELOG.md).
 
 ## Contributing

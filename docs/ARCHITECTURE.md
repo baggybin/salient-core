@@ -436,7 +436,7 @@ The turn-keyed tables (`jobs`, `questions`, `approval_bypass`, `audit_mirror`,
 
 ## Testing
 
-1090 tests across 89 files (plus 23 subtests), 66% overall coverage
+1137 tests across 94 files (plus 40 subtests), 67% overall coverage
 (`pytest tests/ --cov=salient_core`; the CI gate is an interim `fail_under = 30`).
 Bus wire schemas are additionally pinned byte-for-byte by golden-master
 snapshots (31 of them, `tests/golden/bus_schemas/`, see
