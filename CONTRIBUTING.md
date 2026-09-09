@@ -54,8 +54,8 @@ pre-commit install
 ## Tests
 
 ```bash
-pytest tests/ -q                          # fast unit tests (~11s, 1090 tests)
-pytest tests/ --cov=salient_core          # with coverage (currently 66%; the
+pytest tests/ -q                          # fast unit tests (~11s, 1137 tests)
+pytest tests/ --cov=salient_core          # with coverage (currently 67%; the
                                           # gate is an interim ≥30%, rising to
                                           # 80% as the kernel fills out)
 ```
