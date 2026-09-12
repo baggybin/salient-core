@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.28] - 2026-09-12
+
+Eighth public snapshot. One correctness fix from the private kernel's v0.8.28.
+
+### Fixed
+
+- **Codex provider probe no longer freezes the event loop.**
+  `CodexProvider.probe()` ran `executor.shutdown(wait=True)` in its `finally` on
+  the event-loop thread; when a caller's `asyncio.wait_for` cancelled while the
+  worker was wedged in the codex app-server handshake, the blocking join froze
+  the whole server and the timeout could never fire. It now detaches with
+  `shutdown(wait=False, cancel_futures=True)`.
+
 ## [0.8.27] - 2026-09-12
 
 Seventh public snapshot. Consolidates the private kernel's `0.8.25`–`0.8.27`
