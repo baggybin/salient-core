@@ -8,9 +8,10 @@ never runs.
 [![CI](https://github.com/baggybin/salient-core/actions/workflows/ci.yml/badge.svg)](https://github.com/baggybin/salient-core/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/baggybin/salient-core/blob/main/LICENSE)
 
-> One developer, pre-alpha (`0.8.24`), not yet on PyPI, APIs still moving. 1137 tests.
-> I extracted this from a private multi-agent security orchestrator; the control
-> layer turned out to generalize, so it's here under Apache-2.0.
+> One developer, pre-alpha (`0.8.27`), not yet on PyPI, APIs still moving. 1143 tests.
+> The control model was forged inside a private multi-agent security system, where
+> the gates had to hold under real pressure — then it generalized out to this.
+> Apache-2.0.
 
 ![salient-core — a permission layer below the model](https://raw.githubusercontent.com/baggybin/salient-core/main/imgs/social-preview.jpg)
 
@@ -210,7 +211,7 @@ Swap the mock for live models per
 
 ## Status
 
-Pre-alpha (`0.8.24`). APIs are evolving. 1137 tests, 67% coverage overall —
+Pre-alpha (`0.8.27`). APIs are evolving. 1143 tests, 68% coverage overall —
 concentrated in the policy/gate core, which is what I'd trust most today. See
 [`CHANGELOG.md`](https://github.com/baggybin/salient-core/blob/main/CHANGELOG.md).
 

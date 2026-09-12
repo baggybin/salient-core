@@ -1494,8 +1494,8 @@ class ContextStore:
         ]
 
     def usage_totals_by_agent(self) -> dict[str, dict[str, int]]:
-        """Per-agent lifetime totals from the usage ledger: ``{agent: {"turns":
-        n, "tokens": t}}``. Empty without a DB.
+        """Per-agent usage totals for THIS store's engagement: ``{agent:
+        {"turns": n, "tokens": t}}``. Empty without a DB.
 
         ``tokens`` uses the same four categories the budget ledger charges
         (input + output + cache-create + cache-read), so the two accountings are
@@ -1504,15 +1504,32 @@ class ContextStore:
         enforcement accumulator, this is a best-effort audit ledger), and for
         most of their life nothing checked that they agreed. See
         ``_RunnerFactoryMixin.budget_reconcile``.
+
+        **Scoped to ``self._engagement_id`` when set.** The one caller,
+        ``budget_reconcile``, compares this against a *per-run* budget ledger
+        (``budget_ledger.json`` lives in the engagement dir). A DB reused across
+        engagements holds many runs' rows for the same agent name, so an
+        unscoped ``GROUP BY agent`` would sum a stranger engagement's tokens into
+        this run's total and manufacture a divergence the reconcile then reports
+        as a spend leak. Filtering by the store's own engagement keeps the
+        comparison run-for-run. When the store has no engagement id (None), fall
+        back to all rows — the historical behaviour, correct when the DB is
+        single-engagement anyway.
         """
         if self._conn is None:
             return {}
+        sql = (
+            "SELECT agent, COUNT(*), "
+            "SUM(input_tokens + output_tokens + cache_create_tokens + cache_read_tokens) "
+            "FROM usage_ledger "
+        )
+        params: tuple[Any, ...] = ()
+        if self._engagement_id is not None:
+            sql += "WHERE engagement_id = ? "
+            params = (self._engagement_id,)
+        sql += "GROUP BY agent"
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT agent, COUNT(*), "
-                "SUM(input_tokens + output_tokens + cache_create_tokens + cache_read_tokens) "
-                "FROM usage_ledger GROUP BY agent"
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return {r[0]: {"turns": int(r[1] or 0), "tokens": int(r[2] or 0)} for r in rows}
 
     def load_jobs_for_correlation(self, correlation_id: str) -> list[dict[str, Any]]:

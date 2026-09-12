@@ -296,6 +296,15 @@ async def _echo_child_stream(
             caller_runner._publish(
                 f"delegated:{evt.get('kind', '')}",
                 evt.get("text", ""),
+                # Forward the child's full-text payload so the caller's pane can
+                # make the `... [+N chars]` marker on a truncated delegated body
+                # (e.g. delegated:thinking) clickable — same as on the child's
+                # own pane. Without this the echo carried only the truncated
+                # `text` and the expand control was inert. `_publish` re-guards
+                # (attaches only when text_full != text and under the inline
+                # cap), so untruncated events are unaffected. None when the
+                # child event had no full payload.
+                text_full=evt.get("text_full"),
                 meta={
                     "delegated_from": child,
                     "child_job_id": child_job_id,

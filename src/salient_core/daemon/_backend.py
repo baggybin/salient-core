@@ -78,6 +78,42 @@ class LocalClaudeBackend:
 
     def __init__(self, options: ClaudeAgentOptions) -> None:
         self._client = ClaudeSDKClient(options=options)
+        # Last SESSION-CUMULATIVE cost seen from a ResultMessage. The SDK's
+        # `total_cost_usd` is a running total for the whole session, not this
+        # turn — see `_turn_cost`. Held per backend instance, which is built
+        # fresh per connect (so it re-zeros with the session it tracks).
+        self._last_total_cost_usd: float = 0.0
+
+    def _turn_cost(self, cumulative: float | None) -> float | None:
+        """Normalise the SDK's SESSION-CUMULATIVE `total_cost_usd` into THIS
+        turn's cost, so `TurnUsage.cost_usd` is per-turn like the token fields
+        beside it.
+
+        The bug this fixes: `total_cost_usd` only ever grows within a session
+        (it resets on a conversation reset), but every consumer of
+        `TurnUsage.cost_usd` treats it like the per-turn token counts and *sums*
+        it — the runner's `total_cost_usd += cost`, the `usage_ledger` rows,
+        `reconstruct`'s per-correlation sum. Emitting the cumulative value made
+        all of them add cumulative-on-cumulative, inflating reported cost
+        ~2.5-3.4x per session. Converting to a delta at this one boundary — the
+        only place that knows the value is cumulative — keeps the rest of the
+        system a plain per-turn sum.
+
+        A value below the last seen one means the session's cost was reset out
+        from under us (reconnect / new conversation): re-baseline and treat the
+        new value as this turn's cost rather than emit a negative delta. (A
+        reconnect that *attaches* to a still-running session it did not observe
+        from the start will bill the first observed turn for the whole prior
+        cumulative — accepted: cost is a notional display figure, and the common
+        fresh-session-per-epoch path is exact.)
+        """
+        if cumulative is None:
+            return None
+        delta = cumulative - self._last_total_cost_usd
+        if delta < 0:
+            delta = cumulative
+        self._last_total_cost_usd = cumulative
+        return delta
 
     async def connect(self) -> None:
         await self._client.connect()
@@ -133,7 +169,7 @@ class LocalClaudeBackend:
                             output_tokens=_usage_value(usage, "output_tokens"),
                             cache_read_tokens=_usage_value(usage, "cache_read_input_tokens"),
                             cache_create_tokens=_usage_value(usage, "cache_creation_input_tokens"),
-                            cost_usd=message.total_cost_usd,
+                            cost_usd=self._turn_cost(message.total_cost_usd),
                         ),
                     )
                 case _:

@@ -108,6 +108,64 @@ def test_record_usage_write_failure_signals_false() -> None:
             store.close()
 
 
+def test_usage_totals_by_agent_is_engagement_scoped() -> None:
+    # A DB reused across engagements holds rows for the SAME agent name under
+    # different engagement_ids. usage_totals_by_agent must return only THIS
+    # store's engagement — else budget_reconcile (which compares against a
+    # per-RUN budget_ledger.json) folds a stranger run's tokens into this run's
+    # total and reports a phantom under-charge / spend leak. Regression for the
+    # mythical run audit's engagement_id rider.
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "state.db"
+        a = ContextStore(db, engagement_id="engA")
+        b = ContextStore(db, engagement_id="engB")
+        try:
+            assert a.record_usage(
+                agent="red_lead",
+                model="m",
+                correlation_id="engA:1:1",
+                input_tokens=100,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_create_tokens=0,
+            )
+            assert b.record_usage(
+                agent="red_lead",
+                model="m",
+                correlation_id="engB:1:1",
+                input_tokens=900,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_create_tokens=0,
+            )
+            # Scoped: each engagement sees only its own tokens, never the sum.
+            assert a.usage_totals_by_agent() == {"red_lead": {"turns": 1, "tokens": 100}}
+            assert b.usage_totals_by_agent() == {"red_lead": {"turns": 1, "tokens": 900}}
+        finally:
+            a.close()
+            b.close()
+
+
+def test_usage_totals_by_agent_unscoped_when_no_engagement() -> None:
+    # With no engagement id the store falls back to all rows (historical
+    # behaviour) — correct when the DB is single-engagement anyway.
+    with tempfile.TemporaryDirectory() as td:
+        store = ContextStore(Path(td) / "state.db")  # engagement_id=None
+        try:
+            assert store.record_usage(
+                agent="scout",
+                model="m",
+                correlation_id="c1",
+                input_tokens=10,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_create_tokens=0,
+            )
+            assert store.usage_totals_by_agent() == {"scout": {"turns": 1, "tokens": 10}}
+        finally:
+            store.close()
+
+
 # ── end-to-end: a turn writes a usage row ──────────────────────────────
 
 
