@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Brainstorm Conference</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <main>
+    <h1>Brainstorm Conference</h1>
+    <p class="sub">Pick the bench, set a topic, and let the models argue it out.</p>
+
+    <section class="card">
+      <label class="field">
+        <span>Topic</span>
+        <textarea id="topic" rows="2" placeholder="e.g. shard the DB by tenant or by customer?"></textarea>
+      </label>
+
+      <div class="row">
+        <label class="field small">
+          <span>Max rounds</span>
+          <input id="rounds" type="number" min="1" max="20" value="3" />
+        </label>
+        <label class="field small">
+          <span>Convergence threshold</span>
+          <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.85" />
+        </label>
+      </div>
+
+      <h2>Debaters</h2>
+      <p class="hint">Tick at least two. Greyed-out providers have no API key set.</p>
+      <div id="families" class="families">Loading models…</div>
+
+      <button id="run" type="button">Run conference</button>
+      <p id="error" class="error" hidden></p>
+    </section>
+
+    <section id="result" class="result" hidden>
+      <div id="summary" class="summary"></div>
+      <h2>Idea leaderboard <span class="muted">(by cross-model support)</span></h2>
+      <ol id="leaderboard" class="leaderboard"></ol>
+      <h2>Map of the disagreement</h2>
+      <pre id="map" class="map"></pre>
+      <h2>Transcript</h2>
+      <div id="transcript" class="transcript"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
