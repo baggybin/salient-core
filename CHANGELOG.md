@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.27] - 2026-09-12
+
+Seventh public snapshot. Consolidates the private kernel's `0.8.25`–`0.8.27`
+(intermediate versions have no separate public entries; releases here are
+paused and there are no external consumers). A new operator-CLI-naming seam
+and the scope-evaluation facade, plus three correctness fixes.
 
 ### Added
 
@@ -47,6 +52,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason. The cost of that choice, stated plainly: a skin using these names
   against an older kernel gets an `ImportError` rather than a clean
   `ScopeApiVersionError`. Changing or removing a facade name is still a bump.
+
+### Fixed
+
+- **`cost_usd` is per-turn now, not the SDK's session-cumulative total**
+  (private `0.8.25`). `LocalClaudeBackend` copied `ResultMessage.total_cost_usd`
+  (a running session total) verbatim into `TurnUsage.cost_usd`, while every
+  consumer sums it per turn — so reported cost added cumulative-on-cumulative and
+  inflated ~2.5–3.4× per session. The backend now emits `cumulative - last_seen`
+  at the one boundary that knows the value is cumulative; a reconnect / new epoch
+  re-baselines rather than emitting a negative delta. Token ledgers were never
+  affected (enforcement charges tokens); forward-looking only, since historical
+  `usage_ledger` rows stay cumulative.
+- **`usage_totals_by_agent` scopes to the store's own engagement** (private
+  `0.8.26`). The reader behind `budget_reconcile` summed `usage_ledger` rows
+  across ALL engagements in a shared DB (`GROUP BY agent`, no `engagement_id`
+  filter), so a DB reused across runs for the same agent name could fold a
+  stranger run's tokens into this run's total and surface a phantom spend leak.
+  Now filtered by `self._engagement_id` when the store has one, with an all-rows
+  fallback when it does not.
+- **Delegation echo forwards the child's `text_full`** (private `0.8.27`). A
+  child truncates a long body to `... [+N chars]` and publishes the full body as
+  `text_full` (the web pane uses it to make the marker a clickable expand
+  control). `_echo_child_stream` re-published only the truncated `text`, so the
+  caller's pane expand toggle was inert. The echo now forwards `text_full`;
+  `_publish` re-guards, so untruncated events are unaffected. Pinned by
+  `test_delegation_echo_text_full`.
 
 ## [0.8.24] - 2026-09-03
 

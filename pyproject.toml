@@ -1,6 +1,6 @@
 [project]
 name = "salient-core"
-version = "0.8.24"
+version = "0.8.27"
 description = "Guardrail and permission layer for AI agent harnesses — a default-deny control kernel that gates every tool call before it runs."
 readme = "README.md"
 license = "Apache-2.0"

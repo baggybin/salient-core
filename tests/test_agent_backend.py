@@ -159,7 +159,73 @@ class AgentBackendSeamTests(unittest.IsolatedAsyncioTestCase):
         assert isinstance(events[2], TurnCompletedEvent)
         self.assertEqual(events[2].usage.input_tokens, 3)
         self.assertEqual(events[2].usage.output_tokens, 4)
+        # A lone turn's per-turn cost equals the cumulative (baseline 0.0).
         self.assertEqual(events[2].usage.cost_usd, 0.25)
+
+    async def test_cost_usd_is_per_turn_not_session_cumulative(self):
+        # The SDK's `total_cost_usd` is a SESSION-CUMULATIVE running total, but
+        # every consumer sums `TurnUsage.cost_usd` per turn. The backend must
+        # emit the per-turn delta so those sums are correct — else reported cost
+        # inflates cumulative-on-cumulative. Regression for the ledger audit's
+        # real (audit-missed) finding: cost over-summed ~2.5-3.4x.
+        backend = LocalClaudeBackend(ClaudeAgentOptions())
+
+        async def _one_turn(cumulative: float) -> TurnCompletedEvent:
+            # Each job runs its own receive_response() stream over the SAME
+            # backend instance (one connected session) — mirrors the runner.
+            class _Client:
+                async def receive_response(self):
+                    yield ResultMessage(
+                        subtype="success",
+                        duration_ms=1,
+                        duration_api_ms=1,
+                        is_error=False,
+                        num_turns=1,
+                        session_id="s",
+                        total_cost_usd=cumulative,
+                        usage={"input_tokens": 1, "output_tokens": 1},
+                    )
+
+            backend._client = _Client()
+            events = [e async for e in backend.receive_response()]
+            assert isinstance(events[0], TurnCompletedEvent)
+            return events[0]
+
+        # Cumulative rises within the session → emitted cost is the per-turn delta.
+        self.assertAlmostEqual((await _one_turn(0.677)).usage.cost_usd, 0.677)
+        self.assertAlmostEqual((await _one_turn(0.941)).usage.cost_usd, 0.264)
+        self.assertAlmostEqual((await _one_turn(1.047)).usage.cost_usd, 0.106)
+        # Summing the per-turn costs recovers the true final cumulative — the
+        # property every downstream `sum(cost_usd)` relies on.
+        self.assertAlmostEqual(0.677 + 0.264 + 0.106, 1.047)
+        # A drop below the last seen cumulative = the session's cost was reset
+        # (reconnect / new epoch). Re-baseline: emit the new value, never a
+        # negative delta.
+        self.assertAlmostEqual((await _one_turn(0.798)).usage.cost_usd, 0.798)
+        self.assertAlmostEqual((await _one_turn(1.075)).usage.cost_usd, 0.277)
+
+    async def test_cost_usd_none_is_passed_through(self):
+        # An endpoint/provider that reports no dollar cost must yield None, not 0.0,
+        # and must not disturb the per-turn delta baseline.
+        backend = LocalClaudeBackend(ClaudeAgentOptions())
+
+        class _Client:
+            async def receive_response(self):
+                yield ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="s",
+                    total_cost_usd=None,
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                )
+
+        backend._client = _Client()
+        events = [e async for e in backend.receive_response()]
+        assert isinstance(events[0], TurnCompletedEvent)
+        self.assertIsNone(events[0].usage.cost_usd)
 
     async def test_factory_builds_and_connects_on_reconnect(self):
         # The runner builds its backend via backend_factory — inject a fake so
