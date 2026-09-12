@@ -1,75 +1,121 @@
 # salient-core
 
-**An agent-control kernel for multi-agent systems. We optimize for what agents *can't* do.**
-
-*A **guardrail and permission layer for AI agent harnesses** — sandboxed tool
-scopes, default-deny policy, human-in-the-loop approval, and a replayable audit
-trail, under Claude Code, Codex, or your own agent loop.*
+**A permission layer that runs *below* the model, not in its prompt.** Every tool
+call — SDK built-in, MCP, inter-agent bus, or one the model tries to slip through
+as plain text — hits the same default-deny gate before it executes. A denied call
+never runs.
 
 [![CI](https://github.com/baggybin/salient-core/actions/workflows/ci.yml/badge.svg)](https://github.com/baggybin/salient-core/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/baggybin/salient-core/blob/main/LICENSE)
 
-![salient-core — an agent-control kernel](https://raw.githubusercontent.com/baggybin/salient-core/main/imgs/social-preview.jpg)
+> One developer, pre-alpha (`0.8.24`), not yet on PyPI, APIs still moving. 1137 tests.
+> I extracted this from a private multi-agent security orchestrator; the control
+> layer turned out to generalize, so it's here under Apache-2.0.
 
-Most AI frameworks focus on giving agents more capabilities. `salient-core`
-focuses on **proving what they actually did**, and **stopping them from doing
-what they shouldn't**. It sits below the LLM — between the model and your
-tools — as a **default-deny control kernel**. Whichever harness drives the loop,
-the gates are the same.
-
-> Let agents act on your infrastructure, but never outside the box you drew —
-> and always keep the receipts.
-
-**Showcase:** [salient-tutor](https://github.com/baggybin/salient-tutor) — a
-Socratic teaching agent built on this kernel.
+![salient-core — a permission layer below the model](https://raw.githubusercontent.com/baggybin/salient-core/main/imgs/social-preview.jpg)
 
 ---
 
-## The problem
+Most stacks secure agents with a system prompt: *"don't touch production,"*
+*"don't delete that folder."* That's a request, not a wall. If the model
+hallucinates, gets prompt-injected, or is just over-eager, nothing underneath the
+loop stops the destructive call — it runs. An agent that can still run `rm -rf`
+because a prompt asked it not to isn't sandboxed; it's hoping.
 
-Right now, most stacks secure agents with system prompts like *"please don't
-delete that folder"* or *"be careful with production."* That is **probabilistic
-safety**. If the model hallucinates, is manipulated, or simply gets over-eager,
-nothing *underneath* the loop enforces the rule — the destructive tool call
-still runs.
+`salient-core` moves the rule out of the prompt and into the call path. It sits
+between the model and your tools as a default-deny kernel: every invocation is
+classified and checked *before* anything executes, the decision is recorded, and
+anything a human needs to approve waits in a typed inbox. Enabling a tool never
+implicitly authorizes it — capability and authorization are separate, and
+unclassified tools fail closed.
 
-Orchestrators (LangGraph, CrewAI, AutoGen, …) excel at composing workflows and
-roles. They do not put a **transport-neutral, default-deny gate** under every
-tool invocation, across SDK built-ins, MCP, bus tools, and model-emitted text.
+## The one thing a prompt-level guardrail can't do
 
-## The solution
+The gate keys off a *canonical* identity, not the wire name the model chose — so a
+call can't rename itself, or switch transports, to dodge the rule. Here the same
+policy denies a structured tool call and the model's fallback of re-emitting that
+call as plain text. No API key, no daemon:
 
-`salient-core` moves control out of the prompt and into the kernel. An agent that
-can still run `rm -rf` because a prompt asked it not to is not **sandboxed** — it
-is hoping. Every tool call passes through **scope + safeguard gates** *before*
-anything executes.
-Capability exposure and authorization are separate: enabling a tool never
-implicitly authorizes it. Unclassified tools fail closed. A denied call
-**never runs**.
+```python
+import anyio
+from salient_core.policy import scope
+from salient_core.policy.registry import PolicyDataset
+from salient_core.policy.scope_api import (
+    InvocationIdentity, InvocationTransport, ToolInvocation, evaluate_scope,
+)
 
-Delegation is bus-mediated and operator-visible. Anything that needs a human
-lands in a typed **operator inbox** and waits. Every gate decision and tool
-I/O is persisted — secrets redacted — so you can reconstruct what happened.
+# One policy: `context_write` may only write values that resolve to an in-scope
+# host. Nothing is added to scope, so every host is out of scope.
+dataset = PolicyDataset(
+    tool_targets={"bus.context_write": scope.ExtractorSpec(fields={"value": "host"})},
+    prohibited_patterns={}, loud_patterns={},
+)
+store = scope.ScopeStore(None, "agent")  # in-memory audit
 
----
+def call(transport, args):
+    identity = InvocationIdentity(
+        transport=transport, wire_name="context_write",
+        qualified_name="bus.context_write", agent_id="agent",
+    )
+    return ToolInvocation.normalize(identity, args)
 
-## Core features
+async def main():
+    args = {"key": "finding", "value": "prod.internal", "token": "sk-live-42"}
+    structured = await evaluate_scope(call(InvocationTransport.MCP, args), store, dataset)
+    as_text    = await evaluate_scope(call(InvocationTransport.TEXT, args), store, dataset)
+    print(structured.allowed, as_text.allowed)   # -> False False  (same policy, both denied)
 
-- **Default-deny policy gates**: Unclassified tools fail closed. Every tool call passes through scope and safeguard checks *before* execution.
-- **Operator inbox**: Delegation and policy walls become typed tickets for human operators—no silent failures or free rein.
-- **Redacted audit trail**: A fully replayable record of gate decisions and tool I/O, with secrets automatically redacted.
-- **Provable stop**: Stop mechanisms that return evidence the agent died, rather than just assuming a prompt instruction was followed.
-- **Typed MCP bus**: Inter-agent tools provided seamlessly through a Model Context Protocol (MCP) server.
+anyio.run(main)
+```
 
-*For a deep dive into the kernel's capabilities, see the [Detailed Features Table](https://github.com/baggybin/salient-core/blob/main/docs/FEATURES.md).*
+The end-to-end version — the model literally emitting
+`<function=context_write>…</function>` text and the runner denying it before any
+mutation — is
+[`tests/test_policy_cross_transport.py`](https://github.com/baggybin/salient-core/blob/main/tests/test_policy_cross_transport.py).
 
----
+### The receipt it leaves
 
-## Architecture
+Every decision is persisted, secrets redacted, so you can reconstruct what
+happened. That same denial writes a row like:
 
-Every agent runs its own provider loop with a **bus MCP server** attached.
-Tool calls hit the gates first; human decisions hit the inbox; learning lands
-in the shared KG. The kernel's value is this topology, not any one box.
+```json
+{
+  "agent": "agent",
+  "tool": "context_write",
+  "verdict": "deny",
+  "reason": "engagement has no scope set. Run: `salientctl scope add <pattern> …`",
+  "targets_json": [{"kind": "host", "value": "prod.internal", "source_field": "value"}],
+  "args_json": {"key": "finding", "value": "prod.internal", "token": "<redacted-secret>"}
+}
+```
+
+Note the `token`: redaction runs on the audit projection, so a credential in the
+arguments never lands in the log.
+
+## What's in the box
+
+- **Default-deny gate.** Every tool call is classified and checked before it runs.
+  Unclassified tools fail closed. Enabling a tool is not authorizing it.
+- **Transport-neutral.** SDK built-ins, MCP tools, the inter-agent bus, and
+  model-emitted text all go through one policy object, keyed off a canonical name.
+- **Operator inbox.** Anything an agent isn't allowed to decide alone becomes a
+  typed question and waits for a human — no silent failure, no free rein.
+- **Redacted, replayable audit.** Gate decisions and tool I/O are persisted with
+  secrets stripped, so a run can be reconstructed after the fact.
+- **Provable stop.** Stopping an agent returns evidence it actually died, rather
+  than trusting that a prompt instruction was obeyed.
+- **Typed MCP bus + shared knowledge graph.** Agents coordinate over an MCP bus
+  rather than an in-process call graph, and what they learn persists in a
+  cross-session KG with noisy-OR corroboration.
+
+Deeper reference: [`docs/FEATURES.md`](https://github.com/baggybin/salient-core/blob/main/docs/FEATURES.md).
+
+## Not an orchestrator
+
+LangGraph, CrewAI, and AutoGen *compose* the loop — roles, workflows, state. This
+*gates* it. They're complementary: run an orchestrator to decide what the agents
+do, run this to bound what they're allowed to do while they do it. The value here
+is the control topology, not workflow expressiveness.
 
 ```
 LLM / agent loop
@@ -86,110 +132,103 @@ LLM / agent loop
 (scoped)   (bus-mediated)  (typed Q/A)
 ```
 
-Full data-flow, persistence model, the control ladder, and seams:
-[`docs/ARCHITECTURE.md`](https://github.com/baggybin/salient-core/blob/main/docs/ARCHITECTURE.md) ·
-hardening log:
-[`docs/KERNEL-HARDENING-v0.6.0.md`](https://github.com/baggybin/salient-core/blob/main/docs/KERNEL-HARDENING-v0.6.0.md).
+Full data-flow, persistence model, and the control ladder:
+[`docs/ARCHITECTURE.md`](https://github.com/baggybin/salient-core/blob/main/docs/ARCHITECTURE.md).
 
----
+## What doesn't work yet (read this)
 
-## Where it sits (not another orchestrator)
+- **It's a policy kernel, not a sandbox.** It gates calls that route *through* it.
+  It does not contain code that has already escaped the process — if an agent
+  shells out to something that ignores the gate, the gate can't help. Scope it to
+  tools you route.
+- **It's a library you wire into your own daemon**, not a hosted runtime and not a
+  no-code product. Single-agent workflows pay control-plane overhead for a trust
+  boundary they don't have — the payoff is multi-agent.
+- **Runtime maturity is uneven.** The Claude runtime (via `claude-agent-sdk`) is
+  the most exercised. The OpenAI Codex runner and the OpenAI-compatible
+  `polybrain` brains are newer and less battle-tested. A new runtime means writing
+  an `AgentProvider`; it inherits the gates automatically.
+- **No clean one-call decision seam yet.** `evaluate_scope` above is the real,
+  importable entry point, but the three-way allow/deny/inbox routing isn't a
+  single tidy `decide()` function. On the roadmap.
+- **Not on PyPI.** You install from a git ref (below). Pin a commit.
 
-| | salient-core | LangGraph | CrewAI / AutoGen |
-|---|---|---|---|
-| **Optimizes for** | operator control over agents | workflow expressiveness | role-based collaboration |
-| **Coordination** | typed **MCP bus** per agent | in-process state graph | in-process agent/role objects |
-| **Policy / gating** | **default-deny below the model**, every call | prompt- / code-level | prompt-level convention |
-| **Human-in-the-loop** | first-class **operator inbox** | interrupts / checkpoints | optional human proxy |
-| **Audit** | **redacted, replayable** gate + tool trail | app-level logging | app-level logging |
-| **Memory** | **noisy-OR KG** + corroboration | checkpointer state | external add-ons |
+## Before you trust it
 
-Use an orchestrator to *compose* LLM calls. Use this kernel when agents must
-be *constrained* — and you need receipts.
+You'd be `pip install`-ing an unpinned pre-alpha into a process that holds your
+credentials. Fair to be wary. Two things help: the scope decision core
+(`evaluate_scope`) imports and runs without the daemon, so you can read and
+exercise the gate in isolation — that whole example above needs no engagement, no
+API key; and the threat model lives in
+[`SECURITY.md`](https://github.com/baggybin/salient-core/blob/main/SECURITY.md).
+Pin a commit you've read.
 
-**When *not* to use it:** single-agent toys (control-plane overhead), or if you
-want a hosted no-code runtime. This is a **library kernel** you wire into your
-own daemon. Runtimes that ship today are Claude, OpenAI Codex, and
-OpenAI-compatible API brains; anything else means writing an `AgentProvider`
-(the seam is real, and a new provider inherits the policy gates automatically).
+## Try it
 
----
+```bash
+# not on PyPI — install from a pinned git ref
+pip install "git+https://github.com/baggybin/salient-core.git@main"
+```
+
+Then run the offline multi-agent showcase — fans one prompt across a panel over
+the bus, captures each leg, and scores semantic convergence, all with a mock
+runner so no API key is needed:
+
+```bash
+pip install starlette uvicorn
+cd examples/consensus_panel
+uvicorn server:app --reload      # -> http://127.0.0.1:8055
+```
+
+Swap the mock for live models per
+[`examples/consensus_panel/`](https://github.com/baggybin/salient-core/blob/main/examples/consensus_panel/README.md).
+
+## Built on it
+
+- **[salient-tutor](https://github.com/baggybin/salient-tutor)** — a Socratic
+  teaching agent; a full application running on the kernel.
+- **salient-assay** — the multi-agent security-research orchestrator
+  `salient-core` was extracted from. Hunter, analyst, and sceptic agents work a
+  target together under these same gates, with source analysis, evidence
+  corroboration, and a redirect floor that re-judges every hop. The
+  security-specific parts stayed private while this control layer generalized;
+  salient-assay is intended for public release, on top of this kernel, once it's
+  ready.
 
 ## Requirements
 
-- **Python ≥ 3.11, < 3.14**
-- **[`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/) `>=0.2.110,<0.3`**
-  (pulled in automatically, alongside `pydantic` and `httpx`). Claude access via
-  `ANTHROPIC_API_KEY` or an existing Claude Code OAuth session.
-- Optional: `pip install 'salient-core[codex] @ git+https://github.com/baggybin/salient-core.git'`
-  for the OpenAI Codex runner
-  (same bus + gates; your own Codex/OpenAI auth).
-- The `polybrain` runtime needs no extra install — just an API key for the
-  sub-brain you want (`MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`,
-  `GLM_API_KEY`/`ZHIPU_API_KEY`).
+- Python ≥ 3.11, < 3.14
+- [`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/)
+  `>=0.2.110,<0.3` (pulled in automatically with `pydantic` and `httpx`). Claude
+  access via `ANTHROPIC_API_KEY` or an existing Claude Code OAuth session.
+- Optional Codex runner:
+  `pip install 'salient-core[codex] @ git+https://github.com/baggybin/salient-core.git'`
+  (bring your own Codex/OpenAI auth).
+- The `polybrain` runtime needs only an API key for the sub-brain you want
+  (`MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `GLM_API_KEY`/`ZHIPU_API_KEY`).
 
-> **Default-deny, out of the box.** By default, an engagement with no policy refuses **every** tool call. Policy is opt-in-safe on purpose. See [`docs/EXTRACTION.md`](https://github.com/baggybin/salient-core/blob/main/docs/EXTRACTION.md) for how to configure your permissions.
-
----
-
-## Quick start
-
-### 1. Install
-
-```bash
-# not on PyPI yet — install from source:
-pip install git+https://github.com/baggybin/salient-core.git
-```
-
-### 2. Run the multi-agent showcase (no API key)
-
-Fans one prompt across a panel over the bus, captures each leg, and scores
-**semantic convergence** — real `ask_consensus` machinery, offline:
-
-```bash
-pip install git+https://github.com/baggybin/salient-core.git starlette uvicorn
-cd examples/consensus_panel
-uvicorn server:app --reload      # → http://127.0.0.1:8055
-```
-
-See [`examples/consensus_panel/`](https://github.com/baggybin/salient-core/blob/main/examples/consensus_panel/README.md) to swap
-the mock runner for live models. Full app on the kernel:
-[`salient-tutor`](https://github.com/baggybin/salient-tutor).
-
-### 3. Use a standalone module
-
-Some pieces work without the full daemon — e.g. the SM-2 scheduler:
-
-```python
-from salient_core.tutor.schedule import next_interval_days, next_mastery
-
-interval = next_interval_days(prev_days=7.0, grade="good")  # → ~16.1
-mastery = next_mastery(prev_mastery=0.5, grade="easy")      # → ~0.75
-```
-
----
-
-## Documentation & Advanced Integration
-
-`salient-core` is designed to be wired into your own daemon. We provide comprehensive documentation on how to configure policies, implement protocols, and understand the internal architecture.
-
-- **[Detailed Features Table](https://github.com/baggybin/salient-core/blob/main/docs/FEATURES.md)**
-- **[Architecture & Control Ladder](https://github.com/baggybin/salient-core/blob/main/docs/ARCHITECTURE.md)**
-- **[Extension & Daemon Integration Guide](https://github.com/baggybin/salient-core/blob/main/docs/EXTRACTION.md)**
-- **[Bus Tool Field Reference](https://github.com/baggybin/salient-core/blob/main/docs/BUS_TOOL_FIELDS.md)**
-
----
+> **Default-deny out of the box.** An engagement with no policy refuses *every*
+> tool call — opt-in-safe on purpose. Configuring permissions:
+> [`docs/EXTRACTION.md`](https://github.com/baggybin/salient-core/blob/main/docs/EXTRACTION.md).
 
 ## Status
 
-Pre-alpha (`0.8.24`). APIs are evolving; 1137 tests, 67% coverage. See
+Pre-alpha (`0.8.24`). APIs are evolving. 1137 tests, 67% coverage overall —
+concentrated in the policy/gate core, which is what I'd trust most today. See
 [`CHANGELOG.md`](https://github.com/baggybin/salient-core/blob/main/CHANGELOG.md).
+
+## More docs
+
+- [Architecture & control ladder](https://github.com/baggybin/salient-core/blob/main/docs/ARCHITECTURE.md)
+- [Detailed feature table](https://github.com/baggybin/salient-core/blob/main/docs/FEATURES.md)
+- [Extension & daemon integration](https://github.com/baggybin/salient-core/blob/main/docs/EXTRACTION.md)
+- [Bus tool field reference](https://github.com/baggybin/salient-core/blob/main/docs/BUS_TOOL_FIELDS.md)
 
 ## Contributing
 
-Kernel changes land **here first**. Public API is guarded by
+Kernel changes land here first. The public API is guarded by
 `tests/test_public_api.py`; new capabilities go through Protocol contracts and
-`set_*` seams — not domain specifics baked into the kernel.
+`set_*` seams, not domain specifics baked into the kernel.
 
 ```bash
 git clone https://github.com/baggybin/salient-core.git
@@ -204,9 +243,3 @@ See [`CONTRIBUTING.md`](https://github.com/baggybin/salient-core/blob/main/CONTR
 ## License
 
 Apache 2.0 — see [`LICENSE`](https://github.com/baggybin/salient-core/blob/main/LICENSE).
-
----
-
-*Built for constrained multi-agent systems on the Model Context Protocol (MCP) —
-agent security, tool-use permissions, and provable operator control over
-autonomous agents.*
