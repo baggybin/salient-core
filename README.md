@@ -182,9 +182,18 @@ uvicorn server:app --reload      # -> http://127.0.0.1:8055
 
 Swap the mock for live models per
 [`examples/consensus_panel/`](https://github.com/baggybin/salient-core/blob/main/examples/consensus_panel/README.md).
-A full application built on the kernel:
-[`salient-tutor`](https://github.com/baggybin/salient-tutor), a Socratic teaching
-agent.
+
+## Built on it
+
+- **[salient-tutor](https://github.com/baggybin/salient-tutor)** — a Socratic
+  teaching agent; a full application running on the kernel.
+- **salient-assay** — the multi-agent security-research orchestrator
+  `salient-core` was extracted from. Hunter, analyst, and sceptic agents work a
+  target together under these same gates, with source analysis, evidence
+  corroboration, and a redirect floor that re-judges every hop. The
+  security-specific parts stayed private while this control layer generalized;
+  salient-assay is intended for public release, on top of this kernel, once it's
+  ready.
 
 ## Requirements
 
