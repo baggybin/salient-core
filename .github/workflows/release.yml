@@ -1,4 +1,8 @@
-# Publish to PyPI on a version tag, via Trusted Publishing.
+# Build + validate the package on a version tag; publish to PyPI via Trusted
+# Publishing MANUALLY only. A tag push runs `build` (which validates the package
+# renders on PyPI) but NOT `publish` — so cutting a GitHub Release never pushes
+# to PyPI. Publishing is a deliberate act: run this workflow by hand ("Run
+# workflow" / workflow_dispatch) once the PyPI publisher below is configured.
 #
 # No API token is stored in this repo or in GitHub secrets: PyPI verifies the
 # short-lived OIDC token GitHub mints for this exact (repo, workflow,
@@ -15,6 +19,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,6 +45,8 @@ jobs:
 
   publish:
     needs: build
+    # MANUAL-only: a tag push builds + validates but never publishes to PyPI.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
