@@ -1012,7 +1012,12 @@ class CodexProvider:
         except (FileNotFoundError, OSError, RuntimeError) as error:
             return ProviderProbe(False, f"Codex runtime probe failed: {error}")
         finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+            # Never wait here: callers wrap probe() in wait_for, and when that
+            # fires the worker thread can be wedged in the codex handshake —
+            # shutdown(wait=True) would then block the EVENT-LOOP thread
+            # joining it, freezing the whole server. Detach instead; the
+            # process reaps the thread when the wedge eventually clears.
+            executor.shutdown(wait=False, cancel_futures=True)
         if account_ready:
             return ProviderProbe(True, "openai-codex 0.1.0b3; account session ready")
         if os.environ.get("OPENAI_API_KEY"):

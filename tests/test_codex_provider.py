@@ -1107,3 +1107,64 @@ def test_codex_error_notification_terminates_without_turn_completed() -> None:
         assert events[0].code == "codex_error"
 
     asyncio.run(scenario())
+
+
+def test_probe_executor_shutdown_detaches_instead_of_blocking_loop(monkeypatch):
+    # Regression (tutor bug-hunt #5): probe()'s finally ran
+    # executor.shutdown(wait=True) on the EVENT-LOOP thread. Callers wrap
+    # probe() in asyncio.wait_for; when that fires while the worker is wedged
+    # in the codex handshake, the blocking join froze the whole server and the
+    # caller's timeout could never fire. The executor must be detached.
+    import sys
+    import types
+    from concurrent.futures import ThreadPoolExecutor
+
+    import salient_core.codex as codex_mod
+    from salient_core.codex import CodexProvider
+
+    fake_pkg = types.ModuleType("openai_codex")
+    fake_client_mod = types.ModuleType("openai_codex.client")
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def initialize(self) -> None:
+            pass
+
+        def account_read(self) -> dict:
+            return {}
+
+        def close(self) -> None:
+            pass
+
+    class _Config:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+    fake_client_mod.CodexClient = _Client
+    fake_client_mod.CodexConfig = _Config
+    fake_pkg.client = fake_client_mod
+    monkeypatch.setitem(sys.modules, "openai_codex", fake_pkg)
+    monkeypatch.setitem(sys.modules, "openai_codex.client", fake_client_mod)
+
+    shutdown_waits: list[bool] = []
+
+    class _RecordingExecutor:
+        def __init__(self, **kwargs: Any) -> None:
+            self._real = ThreadPoolExecutor(**kwargs)
+
+        def submit(self, *args: Any, **kwargs: Any):
+            return self._real.submit(*args, **kwargs)
+
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            shutdown_waits.append(wait)
+            self._real.shutdown(wait=True)
+
+    monkeypatch.setattr(codex_mod, "ThreadPoolExecutor", _RecordingExecutor)
+
+    asyncio.run(CodexProvider().probe())
+    assert shutdown_waits == [False]
