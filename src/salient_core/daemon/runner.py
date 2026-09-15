@@ -795,27 +795,23 @@ class AgentRunner:
             except Exception:
                 pass
             return
-        # Cross-job / cross-agent ledger check. The in-memory deque misses
-        # two cases: (a) the agent did >window other things between repeats,
-        # (b) a different agent already ran this same (tool, args) earlier
-        # in the engagement. The ledger catches both.
+        # Cross-job ledger check, counted PER CALLER. The in-memory deque above
+        # is per-process, so a loop spanning a restart is invisible to it —
+        # this is the only check that sees run 2 (supervisor restarts the job,
+        # it repeats the same call, dies, repeats). A loop is the SAME agent
+        # repeating the same call, across runs; N distinct seats each calling
+        # once is fan-out, not a loop.
         #
-        # A NO-ARGUMENT call is exempt here. It carries no work — polling a
-        # no-arg query from several seats is a wait pattern, not a stuck loop —
-        # and its args-hash is IDENTICAL for every caller, so shared registry
-        # tools (`list_agents`, `kg_stats`, `sessions`) accumulated across
-        # agents and runs and filed false operator questions at threshold 3.
-        # Same principle as the read-suffix exemption above; that one misses
-        # these because it matches NAME suffixes and their names are bare. The
-        # per-agent in-memory check above is unaffected: one agent spinning on
-        # the same no-arg call still fires. A call WITH args is unaffected too,
-        # so detection over real work (scans, writes) is unchanged.
-        if not tool_input:
-            return
+        # Counting engagement-wide merged those two and fired false questions
+        # on shared registry queries (`sessions`, `list_agents`, `kg_stats`),
+        # whose args-hash is identical for every caller — five seats, one call
+        # each, read as "5× in a row". Scoping the count to the caller keeps
+        # the crash-restart signal and drops the fan-out noise, and it holds
+        # whether the client serialises no args as `{}` or `{"verbose": false}`.
         #
         # The current call has NOT been recorded yet (action_ledger_start
         # runs after _check_loop), so prior_count is exactly "how many
-        # identical calls happened before this one". If prior_count + 1
+        # identical calls THIS AGENT made before this one". If prior_count + 1
         # (this call) ≥ threshold, fire.
         pretty = bare  # already mcp__ stripped
         ledger = getattr(self, "_action_ledger", None)
@@ -828,6 +824,7 @@ class AgentRunner:
                 tool=pretty,
                 args_hash=arg_hash,
                 since_ts=since_ts,
+                agent_name=self.name,
             )
         except Exception:
             return

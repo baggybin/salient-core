@@ -255,36 +255,53 @@ async def test_context_read_polling_does_not_trip_loop_detection() -> None:
 
 
 @pytest.mark.anyio
-async def test_no_arg_polling_does_not_trip_the_cross_agent_ledger() -> None:
-    """A no-arg call's args-hash is identical for every caller, so the
-    cross-agent ledger counted shared registry queries (`list_agents`,
-    `kg_stats`, `sessions`) toward the threshold and filed false "loop
-    suspected" questions across seats and runs. A no-arg call carries no work
-    — polling a no-arg query is a wait pattern — so it is exempt from the
-    LEDGER check only: the per-agent in-memory check still catches one agent
-    spinning on it, and a call WITH args is unchanged (detection over real
-    work stays intact). Same principle as the read-suffix exemption above."""
+async def test_cross_job_loop_counts_per_caller_not_engagement_wide() -> None:
+    """A shared no-arg registry query (`sessions`, `list_agents`, `kg_stats`) is
+    called once by several seats — fan-out, not a loop — while the SAME agent
+    repeating the same call across runs IS a loop (which matters because the
+    in-memory deque above is per-process: the ledger is the only check that
+    sees run 2 after a crash-restart). Counting engagement-wide merged the two
+    and fired false questions on the fan-out."""
+    from salient_core.memory.actions import canonical_args
 
-    class _Ledger:
-        def count_recent(self, *, tool, args_hash, since_ts):
-            return 99  # far past threshold: the ledger path WOULD fire
+    _, h = canonical_args({})  # the runner hashes identically (verified)
 
-    runner = AgentRunner(name="worker", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
-    runner._action_ledger = _Ledger()
+    # five OTHER seats called it once each; THIS runner has not
+    runner = AgentRunner(name="attach", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
+    runner._action_ledger = _Ledger([("sessions", h, f"seat-{i}") for i in range(5)])
     fired: list[tuple[str, int]] = []
     runner._on_loop_detected = lambda _r, tool, repeats, _h: fired.append((tool, repeats))
-
-    # no-arg query: never fires, however often the LEDGER has seen it
     await runner._check_loop("mcp__bus__osint__sessions", {})
-    assert fired == []
+    assert fired == []  # engagement-wide this would be 5 + 1 >= 3
 
-    # with args: the ledger path still fires — real work stays covered
-    await runner._check_loop("mcp__bus__osint__sessions", {"target": "host"})
-    assert len(fired) == 1
+    # the SAME agent repeating it across runs still fires — no-arg included
+    runner2 = AgentRunner(name="attach", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
+    runner2._action_ledger = _Ledger([("sessions", h, "attach")] * 3)
+    fired2: list[tuple[str, int]] = []
+    runner2._on_loop_detected = lambda _r, tool, repeats, _h: fired2.append((tool, repeats))
+    await runner2._check_loop("mcp__bus__osint__sessions", {})
+    assert len(fired2) == 1 and fired2[0][0] == "mcp__bus__osint__sessions"
 
-    # ...but ONE agent spinning on the same no-arg call still fires: the
-    # exemption is the ledger check, not the per-agent in-memory check.
-    fired.clear()
-    for _ in range(4):
-        await runner._check_loop("mcp__bus__osint__stats", {})
-    assert len(fired) == 1 and fired[0][0] == "mcp__bus__osint__stats"
+    # a call WITH args is unaffected (real work stays counted)
+    runner3 = AgentRunner(name="attach", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
+    runner3._action_ledger = _Ledger(
+        [("nmap_scan", canonical_args({"target": "h"})[1], "attach")] * 4
+    )
+    fired3: list[tuple[str, int]] = []
+    runner3._on_loop_detected = lambda _r, tool, repeats, _h: fired3.append((tool, repeats))
+    await runner3._check_loop("mcp__probe__nmap_scan", {"target": "h"})
+    assert len(fired3) == 1
+
+
+class _Ledger:
+    """Per-caller rows: (tool, args_hash, agent)."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def count_recent(self, *, tool, args_hash, since_ts, agent_name=None):
+        return sum(
+            1
+            for t, h, a in self._rows
+            if t == tool and h == args_hash and (agent_name is None or a == agent_name)
+        )

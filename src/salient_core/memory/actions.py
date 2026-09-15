@@ -264,18 +264,25 @@ class ActionLedger:
         tool: str,
         args_hash: str,
         since_ts: float,
+        agent_name: str | None = None,
     ) -> int:
         """Count rows matching exact tool + args_hash since `since_ts`.
-        Used by the daemon's cross-job loop detector — answers "how many
-        times has this exact (tool, args) call happened engagement-wide
-        in the last N minutes?" Hits the `actions_dedup` index, so this
+
+        Used by the daemon's cross-job loop detector. `agent_name` narrows the
+        count to ONE caller: a loop is the same agent repeating the same call
+        (across runs — the per-process in-memory check cannot see run 2 after a
+        restart), whereas several seats independently calling the same query
+        once each is fan-out. Omit it for the engagement-wide count. Hits the
+        `actions_dedup` index (plus `actions_agent_ts` when narrowed), so this
         is a covered-index lookup even when the table grows large."""
+        sql = "SELECT COUNT(*) FROM actions WHERE tool = ? AND args_hash = ? AND started_ts >= ?"
+        params: list[Any] = [tool, args_hash, float(since_ts)]
+        if agent_name is not None:
+            sql += " AND agent = ?"
+            params.append(agent_name)
         with self._lock:
             assert self._conn is not None
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM actions WHERE tool = ? AND args_hash = ? AND started_ts >= ?",
-                (tool, args_hash, float(since_ts)),
-            ).fetchone()
+            row = self._conn.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
 
     def stats(self) -> dict[str, Any]:

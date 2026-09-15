@@ -365,6 +365,33 @@ class TestCountRecent(unittest.TestCase):
             1,
         )
 
+    def test_count_recent_can_narrow_to_one_caller(self):
+        """Per-caller narrowing (the loop detector's use): a loop is the SAME
+        agent repeating a call, not several seats each calling it once."""
+        args = {}
+        _, h = A.canonical_args(args)
+        for agent in ("seat-0", "seat-1", "seat-2"):
+            self.ledger.record_start(
+                agent=agent, job_id=1, tool="sessions", args=args, target_key=None
+            )
+        self.ledger.record_start(
+            agent="attach", job_id=1, tool="sessions", args=args, target_key=None
+        )
+        self.ledger.record_start(
+            agent="attach", job_id=1, tool="sessions", args=args, target_key=None
+        )
+        # engagement-wide sees all five …
+        self.assertEqual(self.ledger.count_recent(tool="sessions", args_hash=h, since_ts=0), 5)
+        # … narrowed to one caller, only that caller's repeats
+        self.assertEqual(
+            self.ledger.count_recent(tool="sessions", args_hash=h, since_ts=0, agent_name="attach"),
+            2,
+        )
+        self.assertEqual(
+            self.ledger.count_recent(tool="sessions", args_hash=h, since_ts=0, agent_name="seat-0"),
+            1,
+        )
+
     def test_respects_since_ts(self):
         args = {"target": "10.0.0.5"}
         _, h = A.canonical_args(args)

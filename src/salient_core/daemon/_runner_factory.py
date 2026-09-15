@@ -2513,9 +2513,9 @@ class _RunnerFactoryMixin:
         operator can intervene; agent will see the operator's reply as its
         next prompt and can adjust / stop / continue."""
         question = (
-            f"loop suspected — I've called `{tool_name}` {repeats}× in a row "
-            f"with the same arguments (arg-hash {arg_hash}). This usually "
-            f"means I'm stuck. Reply:\n"
+            f"loop suspected — `{tool_name}` has repeated {repeats}× with "
+            f"identical arguments (arg-hash {arg_hash}). This usually "
+            f"means the call is not making progress. Reply:\n"
             f"  STOP — I'll abandon this approach\n"
             f"  CONTINUE — false alarm, keep going\n"
             f"  ADJUST [direction] — try a different approach you suggest"
