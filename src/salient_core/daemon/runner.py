@@ -760,7 +760,15 @@ class AgentRunner:
             ).hexdigest()[:12]
         except Exception:
             return  # malformed input, can't hash — skip silently
-        key = (tool_name, arg_hash)
+        # Key on the BARE (mcp-stripped) name, the canonical form the cross-job
+        # ledger count already uses (`pretty = bare`). Keying on the full
+        # `mcp__server__tool` name made the in-memory count and the report-once
+        # cooldown treat `mcp__a__sessions` / `mcp__b__sessions` as distinct while
+        # the ledger merged them — so aliases of one (tool, args) loop condition
+        # either under-counted in memory or fired the operator question twice
+        # (handoff #124 §4). One canonical key everywhere: count, report-once,
+        # and the tool_use_id ring/pop path.
+        key = (bare, arg_hash)
         self._recent_tool_calls.append(key)
         if tool_use_id is not None:
             self._loop_ring_index[tool_use_id] = key

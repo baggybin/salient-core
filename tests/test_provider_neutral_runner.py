@@ -293,6 +293,46 @@ async def test_cross_job_loop_counts_per_caller_not_engagement_wide() -> None:
     assert len(fired3) == 1
 
 
+@pytest.mark.anyio
+async def test_mcp_aliases_of_one_loop_condition_are_reported_once() -> None:
+    """Two MCP aliases of the same (bare tool, args) that both trip the CROSS-JOB
+    ledger check must file ONE operator question, not one per alias. The ledger
+    counts by the BARE name, so keying the report-once cooldown on the full
+    ``mcp__…`` name let each alias fire separately for a condition the detector
+    treats as one — the operator saw the same question twice (handoff #124 §4)."""
+    from salient_core.memory.actions import canonical_args
+
+    args = {"k": "v"}
+    _, h = canonical_args(args)
+    runner = AgentRunner(name="attach", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
+    # `write` already ran 3× by this agent — the ledger counts by bare name.
+    runner._action_ledger = _Ledger([("write", h, "attach")] * 3)
+    fired: list[tuple[str, int]] = []
+    runner._on_loop_detected = lambda _r, tool, repeats, _h: fired.append((tool, repeats))
+
+    await runner._check_loop("mcp__osint__write", args)
+    await runner._check_loop("mcp__recon__write", args)  # same tool+args, other server
+
+    assert len(fired) == 1, f"aliases of one loop condition must fire once: {fired}"
+
+
+@pytest.mark.anyio
+async def test_mcp_aliases_merge_in_the_in_memory_loop_count() -> None:
+    """The in-memory ring must count MCP aliases of the same (bare tool, args)
+    together, matching the cross-job ledger. Keyed on the full name, two aliases
+    each below threshold would never reach it even though they are one call."""
+    runner = AgentRunner(name="worker", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
+    fired: list[tuple[str, int]] = []
+    runner._on_loop_detected = lambda _r, tool, repeats, _h: fired.append((tool, repeats))
+
+    args = {"k": "v"}  # threshold is 3; no _action_ledger → in-memory branch only
+    await runner._check_loop("mcp__osint__write", args)
+    await runner._check_loop("mcp__osint__write", args)
+    await runner._check_loop("mcp__recon__write", args)  # 3rd call of one (bare tool, args)
+
+    assert len(fired) == 1, f"three aliased calls of one (tool,args) must fire once: {fired}"
+
+
 class _Ledger:
     """Per-caller rows: (tool, args_hash, agent)."""
 
