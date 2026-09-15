@@ -800,6 +800,19 @@ class AgentRunner:
         # (b) a different agent already ran this same (tool, args) earlier
         # in the engagement. The ledger catches both.
         #
+        # A NO-ARGUMENT call is exempt here. It carries no work — polling a
+        # no-arg query from several seats is a wait pattern, not a stuck loop —
+        # and its args-hash is IDENTICAL for every caller, so shared registry
+        # tools (`list_agents`, `kg_stats`, `sessions`) accumulated across
+        # agents and runs and filed false operator questions at threshold 3.
+        # Same principle as the read-suffix exemption above; that one misses
+        # these because it matches NAME suffixes and their names are bare. The
+        # per-agent in-memory check above is unaffected: one agent spinning on
+        # the same no-arg call still fires. A call WITH args is unaffected too,
+        # so detection over real work (scans, writes) is unchanged.
+        if not tool_input:
+            return
+        #
         # The current call has NOT been recorded yet (action_ledger_start
         # runs after _check_loop), so prior_count is exactly "how many
         # identical calls happened before this one". If prior_count + 1

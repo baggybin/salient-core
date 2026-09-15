@@ -252,3 +252,39 @@ async def test_context_read_polling_does_not_trip_loop_detection() -> None:
     for _ in range(6):
         await runner._check_loop("mcp__bus__osint__context_write", {"agent": "x", "key": "y"})
     assert len(fired) == 2
+
+
+@pytest.mark.anyio
+async def test_no_arg_polling_does_not_trip_the_cross_agent_ledger() -> None:
+    """A no-arg call's args-hash is identical for every caller, so the
+    cross-agent ledger counted shared registry queries (`list_agents`,
+    `kg_stats`, `sessions`) toward the threshold and filed false "loop
+    suspected" questions across seats and runs. A no-arg call carries no work
+    — polling a no-arg query is a wait pattern — so it is exempt from the
+    LEDGER check only: the per-agent in-memory check still catches one agent
+    spinning on it, and a call WITH args is unchanged (detection over real
+    work stays intact). Same principle as the read-suffix exemption above."""
+
+    class _Ledger:
+        def count_recent(self, *, tool, args_hash, since_ts):
+            return 99  # far past threshold: the ledger path WOULD fire
+
+    runner = AgentRunner(name="worker", cfg={}, prompt_timeout=60.0, idle_timeout=0.0)
+    runner._action_ledger = _Ledger()
+    fired: list[tuple[str, int]] = []
+    runner._on_loop_detected = lambda _r, tool, repeats, _h: fired.append((tool, repeats))
+
+    # no-arg query: never fires, however often the LEDGER has seen it
+    await runner._check_loop("mcp__bus__osint__sessions", {})
+    assert fired == []
+
+    # with args: the ledger path still fires — real work stays covered
+    await runner._check_loop("mcp__bus__osint__sessions", {"target": "host"})
+    assert len(fired) == 1
+
+    # ...but ONE agent spinning on the same no-arg call still fires: the
+    # exemption is the ledger check, not the per-agent in-memory check.
+    fired.clear()
+    for _ in range(4):
+        await runner._check_loop("mcp__bus__osint__stats", {})
+    assert len(fired) == 1 and fired[0][0] == "mcp__bus__osint__stats"
