@@ -203,6 +203,19 @@ class QuiescenceReport:
     unverified_reasons: tuple[str, ...] = ()
 
 
+# ── Runner status vocabulary ────────────────────────────────────────────────
+# A runner is LIVE when it is doing (or about to do) work; TERMINAL when it has
+# stopped and a fresh start() is required. A caller guarding "is this agent
+# already up?" (e.g. an app's ensure()) MUST test membership of LIVE_STATUSES —
+# not a hand-written literal like "running" that this vocabulary never emits (a
+# guard on such a literal silently degrades). RUNNER_STATUSES is the exhaustive
+# set, pinned by test_runner_start_guard so a new status can't ship without
+# deciding its liveness.
+LIVE_STATUSES = frozenset({"starting", "idle", "busy", "budget_parked"})
+TERMINAL_STATUSES = frozenset({"faulted", "stopped"})
+RUNNER_STATUSES = LIVE_STATUSES | TERMINAL_STATUSES
+
+
 @dataclass
 class AgentRunner:
     name: str
@@ -1519,6 +1532,14 @@ class AgentRunner:
         await _offload_blocking_io(self._save_evidence, job, kind, text)
 
     async def start(self) -> None:
+        # Idempotent: a second start() while the run loop is live would spawn a
+        # DUPLICATE _run on the same queue/backend — two loops split the stream,
+        # double-spend, and when one exits its finally sets status="stopped" while
+        # the other still serves (operator sees a stopped agent that's live).
+        # Racing callers (two requests at cold start, a re-connect mid-turn) must
+        # be a no-op here, not a second loop. (H5 / core TOCTOU family.)
+        if self._task is not None and not self._task.done():
+            return
         self._task = asyncio.create_task(self._run(), name=f"agent:{self.name}")
 
     def _bus_tool_meta(
