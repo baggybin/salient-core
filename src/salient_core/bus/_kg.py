@@ -46,6 +46,64 @@ def set_kg_assert_hook(hook: Callable[..., None]) -> None:
     _kg_assert_hook = hook
 
 
+# ── Pre-write validator seam ─────────────────────────────────────────
+# A downstream skin may register a validator fired BEFORE a kg_assert write,
+# receiving ``(subject, predicate, object, confidence, agent, contradicts)``.
+# Unlike the post-write hook above, this runs *before* the fact is persisted and
+# its refusal is load-bearing: raise ``ClaimRefused`` (or any exception) to
+# refuse the write — the fact never lands and the reason surfaces to the model as
+# a normal kg_assert error. The kernel holds NO policy: it passes the raw write
+# inputs and the skin decides (e.g. a study skin's receipts floor). Default None
+# (no validator ⇒ today's behaviour, byte for byte). Same injection idiom as the
+# other seams (set_kg_assert_hook / set_delegation_observer).
+class ClaimRefused(Exception):
+    """A skin's pre-write kg_assert validator refused a claim. The message is
+    surfaced to the model as the kg_assert error, so write it as actionable
+    policy (\"needs a case:/run: receipt — got prose\"), not a stack trace."""
+
+
+_kg_assert_validator: Callable[..., None] | None = None
+
+
+def set_kg_assert_validator(validator: Callable[..., None] | None) -> None:
+    """Register a pre-``kg_assert``-write validator (or None to clear it).
+
+    Called once at startup by a downstream skin. Receives ``(subject, predicate,
+    object, confidence, agent, contradicts)`` and raises ``ClaimRefused`` to
+    refuse the write. The kernel never inspects the triple itself — all policy
+    lives in the skin's validator."""
+    global _kg_assert_validator
+    _kg_assert_validator = validator
+
+
+def run_kg_assert_validator(
+    subject: str,
+    predicate: str,
+    obj: str,
+    confidence: float,
+    agent: str,
+    contradicts: str | None,
+) -> str | None:
+    """Run the registered pre-write validator, if any.
+
+    Returns None to allow the write, or a refusal reason (already stripped of a
+    stack trace) to deny it. This is the single chokepoint BOTH kg_assert write
+    paths cross (the bus/MCP tool and the in-process runner), so the fail-closed
+    contract lives in exactly one place: ANY exception from the validator denies
+    the write — a skin bug must never fail open into a durable fact (infra
+    failure never collapses into \"allowed\")."""
+    validator = _kg_assert_validator
+    if validator is None:
+        return None
+    try:
+        validator(subject, predicate, obj, confidence, agent, contradicts)
+    except ClaimRefused as e:
+        return f"claim refused: {e}"
+    except Exception as e:  # noqa: BLE001 — fail closed: a validator bug denies.
+        return f"claim refused (validator error): {type(e).__name__}: {e}"
+    return None
+
+
 # Wire schemas. Notable choices (all shape-faithful in commit 1; de-require +
 # constraints follow):
 #   * kg_assert.ttl_days is float|None: absence (None) triggers the engagement-
@@ -249,6 +307,12 @@ def make_kg_tools(daemon: DaemonServices, owner: str) -> list:
         else:
             expires_at = None
         contradicts = args["contradicts"].strip() or None
+        # Pre-write validator seam (before the fact lands). A skin may refuse the
+        # write here; the refusal surfaces as a normal kg_assert error and NO
+        # fact is written. No-op when no validator is registered.
+        refusal = run_kg_assert_validator(s, p, o, conf_f, owner, contradicts)
+        if refusal is not None:
+            return _text(f"error: {refusal}", error=True)
         try:
             fact = daemon.kg.assert_fact(
                 s,

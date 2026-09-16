@@ -82,7 +82,7 @@ below also each both
 """.split()
 )
 
-from ..bus import ContextStore, _redact_secret_fields
+from ..bus import ContextStore, _redact_secret_fields, run_kg_assert_validator
 from ..codex_mcp import GatewayAttachError
 from ..display import (
     _emit,
@@ -3121,6 +3121,17 @@ class AgentRunner:
             except (TypeError, ValueError):
                 conf = 1.0
             eng_id = daemon.engagement_path.name if daemon.engagement_path is not None else None
+            # Pre-write validator seam — MUST guard this in-process path too, not
+            # just the bus tool: a gate only governs what routes through it, and a
+            # validator that guarded only the bus path would leave this one open.
+            contradicts = str(args.get("contradicts") or "").strip() or None
+            refusal = run_kg_assert_validator(s, p, o, conf, self.name, contradicts)
+            if refusal is not None:
+                return (
+                    False,
+                    f"kg_assert error: {refusal}",
+                    f"({s})-[{p}]->({o})",
+                )
             try:
                 fact = daemon.kg.assert_fact(
                     s,

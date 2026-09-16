@@ -35,7 +35,13 @@ from ._delegation import (  # noqa: F401
 )
 from ._discovery import make_discovery_tools
 from ._flags import BusFlags  # noqa: F401
-from ._kg import make_kg_tools, set_kg_assert_hook  # noqa: F401
+from ._kg import (  # noqa: F401
+    ClaimRefused,
+    make_kg_tools,
+    run_kg_assert_validator,
+    set_kg_assert_hook,
+    set_kg_assert_validator,
+)
 from ._lessons import make_lessons_tools
 from ._lifecycle import make_lifecycle_tools
 from ._skills import make_skills_tools
@@ -52,6 +58,9 @@ __all__ = [
     "set_bus_builder",
     "set_delegation_observer",
     "set_kg_assert_hook",
+    "set_kg_assert_validator",
+    "run_kg_assert_validator",
+    "ClaimRefused",
 ]
 
 _BUS_TOOL_NAMES = (
