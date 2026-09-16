@@ -138,26 +138,50 @@ def make_lifecycle_tools(daemon: DaemonServices, owner: str) -> list:
                 f"ask_agent({spawned_name!r}, ...)"
             )
 
-        # Spawning a (usually bus_trusted) lead bypasses the operator's
-        # agent-start gate, so audit the bypass exactly as ask_agent does (A1).
-        from ._delegation import _record_approval_bypass
-
-        await _record_approval_bypass(
-            daemon,
-            owner,
-            spawned_name,
-            "spawn_template",
-            f"spawn_template({spawned_name})",
-            caller_bus_trusted,
-        )
-        # Use the same code path as the spawn RPC.
+        # H4: RESERVE the runner slot SYNCHRONOUSLY — check→insert with NO await
+        # between — so two concurrent spawns can't both pass the check and orphan
+        # the first (whose task would keep running, invisible to the killswitch
+        # that iterates daemon.runners). The second spawn now sees this reserved
+        # runner at its check and refuses. Mirrors the await-free kernel
+        # start_agent; the reserved not-yet-started runner is visible to a
+        # concurrent killswitch and tears down cleanly (proven_quiescent — no
+        # process to reap). `_make_runner` also refuses while a killswitch is in
+        # progress (`_stopping`), so a spawn racing a STOP fails here, not after.
         try:
             runner = daemon._make_runner(cfg)
-            daemon.runners[runner.name] = runner
+        except Exception as e:  # noqa: BLE001
+            return _text(
+                f"spawn_template: cannot spawn {spawned_name!r}: {type(e).__name__}: {e}",
+                error=True,
+            )
+        reserved_name = runner.name  # capture before the identity-narrowing check below
+        daemon.runners[reserved_name] = runner
+        try:
+            # Spawning a (usually bus_trusted) lead bypasses the operator's
+            # agent-start gate, so audit the bypass exactly as ask_agent does (A1).
+            from ._delegation import _record_approval_bypass
+
+            await _record_approval_bypass(
+                daemon,
+                owner,
+                spawned_name,
+                "spawn_template",
+                f"spawn_template({spawned_name})",
+                caller_bus_trusted,
+            )
+            # A killswitch may have swept DURING the audit await — do not start a
+            # runner right after a STOP (mirror the worker/assay post-await
+            # re-check). The reserved runner was already torn down by that sweep.
+            if getattr(daemon, "_stopping", False):
+                raise RuntimeError("daemon stopping — spawn aborted")
             await runner.start()
-            daemon._notify_agent_spawn(runner.name, cfg, runner)
+            daemon._notify_agent_spawn(reserved_name, cfg, runner)
             daemon._persist_running_agents()
         except Exception as e:  # noqa: BLE001
+            # Roll back ONLY our own reservation (identity-checked) — never a
+            # runner a concurrent caller legitimately placed.
+            if daemon.runners.get(reserved_name) is runner:
+                daemon.runners.pop(reserved_name, None)
             return _text(
                 f"spawn_template: failed to start {spawned_name!r}: {type(e).__name__}: {e}",
                 error=True,

@@ -14,8 +14,9 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from salient_core.bus import _delegation as deleg
 from salient_core.bus._lifecycle import make_lifecycle_tools
 
 
@@ -90,6 +91,77 @@ class SpawnTemplateTrustTests(unittest.IsolatedAsyncioTestCase):
         res = await self._spawn_tool(d, "caller").handler({"name": "planner"})
         self.assertIn("not trusted to spawn", _text_of(res))
         self.assertNotIn("planner", d.runners)
+
+
+class SpawnTemplateReserveTests(unittest.IsolatedAsyncioTestCase):
+    """H4: spawn_template reserves the runner slot BEFORE the audit await, so two
+    concurrent spawns can't orphan the first; it rolls the reservation back on
+    failure and aborts if a killswitch sweeps during the await."""
+
+    def setUp(self) -> None:
+        self._prev = os.getcwd()
+        self._tmp = tempfile.mkdtemp(prefix="spawn-reserve-")
+        os.chdir(self._tmp)
+        Path("templates").mkdir()
+        (Path("templates") / "planner.yaml").write_text(
+            "name: planner\nteam: neutral\nsystem_prompt: a planner\n"
+        )
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self.addCleanup(os.chdir, self._prev)
+
+    def _spawn_tool(self, daemon, owner="caller"):
+        return next(t for t in make_lifecycle_tools(daemon, owner) if t.name == "spawn_template")
+
+    async def test_concurrent_spawn_reserves_slot_and_refuses_second(self):
+        d = _SpawnDaemon({"bus_trusted": True})
+        gate = asyncio.Event()
+        calls = {"n": 0}
+
+        async def _fake_bypass(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await gate.wait()  # first caller parks mid-await, slot reserved
+
+        with patch.object(deleg, "_record_approval_bypass", _fake_bypass):
+            tool = self._spawn_tool(d)
+            t1 = asyncio.create_task(tool.handler({"name": "planner"}))
+            # Wait until t1 has RESERVED the slot (and parked in the audit await).
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if "planner" in d.runners:
+                    break
+            r2 = await tool.handler({"name": "planner"})  # runs during t1's await
+            gate.set()
+            r1 = await t1
+
+        self.assertEqual(list(d.runners.keys()), ["planner"], "exactly one runner")
+        self.assertIn("already running", _text_of(r2), "the racing 2nd spawn must be refused")
+        self.assertIn("spawned", _text_of(r1))
+
+    async def test_start_failure_rolls_back_the_reservation(self):
+        d = _SpawnDaemon({"bus_trusted": True})
+
+        class _BadRunner(_Runner):
+            async def start(self) -> None:
+                raise RuntimeError("boom")
+
+        d._make_runner = lambda cfg: _BadRunner(cfg["name"])
+        res = await self._spawn_tool(d).handler({"name": "planner"})
+        self.assertIn("failed to start", _text_of(res))
+        self.assertNotIn(
+            "planner", d.runners, "a failed start must not leave an orphan reservation"
+        )
+
+    async def test_spawn_aborts_when_killswitch_sweeps_during_the_await(self):
+        d = _SpawnDaemon({"bus_trusted": True})
+
+        async def _fake_bypass(*a, **k):
+            d._stopping = True  # a killswitch swept while we were auditing
+
+        with patch.object(deleg, "_record_approval_bypass", _fake_bypass):
+            res = await self._spawn_tool(d).handler({"name": "planner"})
+        self.assertIn("stopping", _text_of(res).lower())
+        self.assertNotIn("planner", d.runners, "must not start a runner right after a STOP swept")
 
 
 class SwarmFinishTests(unittest.IsolatedAsyncioTestCase):
