@@ -47,6 +47,7 @@ from salient_core.runtime import (
 )
 from salient_core.runtime import (
     POLICY_GATE_BUDGET_ANNOTATION,
+    POLICY_QUALIFIED_ANNOTATION,
     AgentTool,
     PolicyDenied,
     ToolBundle,
@@ -679,20 +680,27 @@ def _with_tool_bundle_builder(monkeypatch: pytest.MonkeyPatch, bundle: ToolBundl
     )
 
 
+def _extras(daemon: _Daemon, monkeypatch: pytest.MonkeyPatch, pairs: tuple) -> None:
+    monkeypatch.setattr(
+        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
+    )
+    monkeypatch.setattr(daemon, "_provider_extra_bundles", lambda _cfg: pairs)
+
+
+def _qualified(tool: AgentTool) -> str:
+    return tool.annotations[POLICY_QUALIFIED_ANNOTATION]
+
+
 @pytest.mark.anyio
 async def test_extra_servers_are_merged_and_gated_under_their_own_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A skin's extra server (assay's `extra_tool_types`) reaches a provider seat.
 
-    Two properties at once. Without `_provider_extra_bundles` the extra never
-    appears in a provider bundle at all: measured 2026-09-19, a `mapper` seat
-    declared `extra_tool_types: [search, forged, probe]` and got no `search`,
-    and the AIO swarm's public mine could not run. And when it DOES appear it
-    must be gated under the server name the SKIN returned — `gate_tool_bundle`
-    synthesizes `mcp__<server>__<tool>` and the policy dataset is keyed on it,
-    so a gate that fell back to the agent name would look armed and classify
-    wrong while passing every "a hook was installed" assertion.
+    Without `_provider_extra_bundles` the extra never appears in a provider
+    bundle at all: measured 2026-09-19, a `mapper` seat declared
+    `extra_tool_types: [search, forged, probe]` and got no `search`, and the AIO
+    swarm's public mine could not run.
     """
     calls: list[dict[str, Any]] = []
     extra = _tool("query", calls)
@@ -701,26 +709,72 @@ async def test_extra_servers_are_merged_and_gated_under_their_own_name(
         prohibited={"agent_search.query": [("blocked", "prohibited-marker")]},
     )
     daemon = _Daemon(_Runner(dataset), scope.ScopeStore(None, "extras"))
-    monkeypatch.setattr(
-        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
-    )
     _with_tool_bundle_builder(monkeypatch, ToolBundle())
-    monkeypatch.setattr(
-        daemon, "_provider_extra_bundles", lambda _cfg: (("agent_search", ToolBundle((extra,))),)
-    )
+    _extras(daemon, monkeypatch, (("agent_search", ToolBundle((extra,))),))
 
     bundle = daemon._build_provider_tool_bundle({"name": "agent", "tool": {"type": "fs"}})
 
-    assert [t.name for t in bundle.tools] == ["query"]
+    # The DISPLAY name is namespaced by extra type ...
+    assert [t.name for t in bundle.tools] == ["search_query"]
     query = bundle.tools[0]
+    # ... while the POLICY identity is still the SDK path's (`<agent>_<type>`).
+    assert _qualified(query) == "mcp__agent_search__query"
     assert query.annotations[_GATE_ANNOTATION] is True
-    # Wrapped, not merely annotated — and the DENY must resolve off the extra's
-    # own qualified name, which is the only thing the dataset key can match.
-    assert query.handler is not extra.handler
+    assert query.handler is not extra.handler  # wrapped, not merely annotated
+    # The deny resolves off the ORIGINAL qualified name — the rename moved the
+    # model-visible name, never the policy row.
     with pytest.raises(PolicyDenied):
         await query.handler({"note": "prohibited-marker"})
     assert calls == []
     assert await query.handler({"note": "ordinary"}) == {"ran": True}
+
+
+@pytest.mark.anyio
+async def test_two_extras_sharing_a_wire_name_both_survive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reason for the per-type prefix: a shared wire name must not collide.
+
+    `forged` exports `propose/list/invoke`, `probe` exports `propose/list/show`,
+    `fs` exports `read/list`. On the SDK path those are separate MCP servers
+    (`mcp__mapper_forged__list`, `mcp__mapper_probe__list`); a provider bundle
+    is a flat namespace keyed on the display name, so before the prefix the
+    merge refused to start at all.
+    """
+    calls: list[dict[str, Any]] = []
+    dataset = _dataset(
+        {"agent_forged.list": scope.ExtractorSpec(none=True)},
+        prohibited={"agent_forged.list": [("blocked", "forged-marker")]},
+    )
+    daemon = _Daemon(_Runner(dataset), scope.ScopeStore(None, "shared-wire"))
+    _with_tool_bundle_builder(monkeypatch, ToolBundle((_tool("list", calls),)))
+    _extras(
+        daemon,
+        monkeypatch,
+        (
+            ("agent_forged", ToolBundle((_tool("list", calls),))),
+            ("agent_probe", ToolBundle((_tool("list", calls),))),
+        ),
+    )
+
+    bundle = daemon._build_provider_tool_bundle({"name": "agent", "tool": {"type": "fs"}})
+    by_name = {t.name: t for t in bundle.tools}
+
+    # Three servers, three `list` wires, three distinct display names.
+    assert set(by_name) == {"list", "forged_list", "probe_list"}
+    # Each keeps its own policy row.
+    assert _qualified(by_name["list"]) == "mcp__agent__list"
+    assert _qualified(by_name["forged_list"]) == "mcp__agent_forged__list"
+    assert _qualified(by_name["probe_list"]) == "mcp__agent_probe__list"
+
+    # And the deny lands on the forged row ONLY — proof the prefix did not
+    # re-key the policy lookup.
+    with pytest.raises(PolicyDenied):
+        await by_name["forged_list"].handler({"note": "forged-marker"})
+    assert await by_name["probe_list"].handler({"note": "forged-marker"}) == {"ran": True}
+    # Only the probe row ran: the forged deny did not leak across the shared
+    # wire name, and the probe's own row is not keyed on the forged one.
+    assert calls == [{"note": "forged-marker"}]
 
 
 @pytest.mark.anyio
@@ -731,34 +785,22 @@ async def test_extra_servers_survive_the_bus_only_early_return(
     calls: list[dict[str, Any]] = []
     extra = _tool("record", calls)
     daemon = _Daemon(_Runner(_dataset()), scope.ScopeStore(None, "extras-bus-only"))
-    monkeypatch.setattr(
-        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
-    )
-    monkeypatch.setattr(
-        daemon, "_provider_extra_bundles", lambda _cfg: (("agent_cred", ToolBundle((extra,))),)
-    )
+    _extras(daemon, monkeypatch, (("agent_cred", ToolBundle((extra,))),))
 
     bundle = daemon._build_provider_tool_bundle({"name": "agent"})
 
-    assert [t.name for t in bundle.tools] == ["record"]
+    assert [t.name for t in bundle.tools] == ["cred_record"]
     assert bundle.tools[0].annotations[_GATE_ANNOTATION] is True
 
 
-def test_an_extra_that_collides_with_a_primary_tool_name_fails_loudly(
+def test_a_prefixed_name_that_still_collides_fails_loudly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The merge refuses duplicates rather than letting dispatch pick a gate."""
+    """The prefix removes extra-vs-extra clashes; a real one still fails at build."""
     calls: list[dict[str, Any]] = []
     daemon = _Daemon(_Runner(_dataset()), scope.ScopeStore(None, "extras-dup"))
-    monkeypatch.setattr(
-        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
-    )
-    _with_tool_bundle_builder(monkeypatch, ToolBundle((_tool("query", calls),)))
-    monkeypatch.setattr(
-        daemon,
-        "_provider_extra_bundles",
-        lambda _cfg: (("agent_search", ToolBundle((_tool("query", calls),))),),
-    )
+    _with_tool_bundle_builder(monkeypatch, ToolBundle((_tool("search_query", calls),)))
+    _extras(daemon, monkeypatch, (("agent_search", ToolBundle((_tool("query", calls),))),))
 
     with pytest.raises(ValueError, match="duplicate"):
         daemon._build_provider_tool_bundle({"name": "agent", "tool": {"type": "fs"}})
@@ -779,8 +821,8 @@ def test_one_check_set_is_built_per_agent_not_per_server(
     factory builds its own `HookReplayCache` per call, and any future check may
     hold similar cross-call state. Gating each extra server with a freshly built
     set would hand the agent N+1 of every stateful check — a gate that looks
-    armed and allows more than it should, which is the same class of failure as
-    gating under the wrong qualified name.
+    armed and allows more than it should, the same class of failure as gating
+    under the wrong qualified name.
     """
     built = 0
     real = _Daemon._provider_gate_checks
@@ -794,14 +836,11 @@ def test_one_check_set_is_built_per_agent_not_per_server(
 
     calls: list[dict[str, Any]] = []
     daemon = _Daemon(_Runner(_dataset()), scope.ScopeStore(None, "one-check-set"))
-    monkeypatch.setattr(
-        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
-    )
     _with_tool_bundle_builder(monkeypatch, ToolBundle((_tool("read", calls),)))
-    monkeypatch.setattr(
+    _extras(
         daemon,
-        "_provider_extra_bundles",
-        lambda _cfg: (
+        monkeypatch,
+        (
             ("agent_search", ToolBundle((_tool("query", calls),))),
             ("agent_probe", ToolBundle((_tool("probe", calls),))),
         ),
@@ -809,5 +848,5 @@ def test_one_check_set_is_built_per_agent_not_per_server(
 
     bundle = daemon._build_provider_tool_bundle({"name": "agent", "tool": {"type": "fs"}})
 
-    assert {t.name for t in bundle.tools} == {"read", "query", "probe"}
+    assert {t.name for t in bundle.tools} == {"read", "search_query", "probe_probe"}
     assert built == 1, "a fresh check set per extra server would grant N+1 allowances"
