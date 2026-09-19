@@ -66,6 +66,7 @@ from ..providers import ProviderName, get_provider_registry, is_provider_runtime
 from ..runtime import (
     AgentBackend,
     ToolBundle,
+    _dataclass_replace,
     gate_tool_bundle,
 )
 from ._backend import LocalClaudeBackend, _json_value
@@ -2508,12 +2509,25 @@ class _RunnerFactoryMixin:
         extras = tuple(self._provider_extra_bundles(cfg))
         if not extras:
             return primary
+        from ..alias import to_wire
+
+        agent_prefix = f"{to_wire(cfg['name'])}_"
         tools = list(primary.tools)
         for server, extra in extras:
-            if extra.tools:
-                tools.extend(
-                    self._gate_provider_bundle(cfg, extra, server=server, checks=checks).tools
-                )
+            if not extra.tools:
+                continue
+            # Gate FIRST: the policy identity is minted from the tool's REAL
+            # name and its own server. Only then is the model-visible name
+            # disambiguated — a provider bundle is a flat namespace keyed on
+            # that name, so two servers exporting the same wire name (fine on
+            # the SDK path, where they are separate MCP servers) would collide.
+            # Renaming after the mint keeps the policy row exactly where the
+            # SDK path puts it.
+            gated = self._gate_provider_bundle(cfg, extra, server=server, checks=checks)
+            prefix = server[len(agent_prefix) :] if server.startswith(agent_prefix) else server
+            tools.extend(
+                _dataclass_replace(tool, name=f"{prefix}_{tool.name}") for tool in gated.tools
+            )
         try:
             return ToolBundle(tuple(tools))
         except ValueError as exc:

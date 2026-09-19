@@ -29,6 +29,37 @@ class MissingBackendError(RuntimeError):
 # approval window.
 POLICY_GATE_ANNOTATION: str = "salient/policy_gated"
 POLICY_GATE_BUDGET_ANNOTATION: str = "salient/gate_budget_sec"
+#: The entry's EXACT policy identity (`mcp__<server>__<tool>`), stamped by
+#: `gate_tool_bundle` when it installs the gate. The wrapped handler reads it
+#: back; it never re-derives the name from call-time input, because a security
+#: key that depends on per-call data is how a gate starts classifying against
+#: the wrong row.
+POLICY_QUALIFIED_ANNOTATION: str = "salient/policy_qualified_name"
+
+
+def qualified_tool_name(
+    *,
+    agent_name: str,
+    server: str,
+    tool_name: str,
+    is_bus_tool: bool = False,
+) -> str:
+    """The ONE place a bundle entry's policy identity is built.
+
+    Both runtimes resolve this string: the SDK path sees it as the real
+    ``mcp__<server>__<tool>`` name, and the provider path would otherwise have
+    to synthesize it. The policy dataset (safeguards, prohibited patterns,
+    scope extractors) is keyed on the result, so a second spelling anywhere is
+    a second policy row.
+
+    Bus tools take the ``bus__`` form the policy table is keyed on
+    (``bus.ask_agent``, ``bus.ask_agents``): ``mcp_identity`` special-cases a
+    ``bus__`` server segment and rewrites it. The per-agent form would match no
+    entry and the delegation denylist would look armed and catch nothing.
+    """
+    if is_bus_tool:
+        return f"mcp__bus__{agent_name}__{tool_name}"
+    return f"mcp__{server}__{tool_name}"
 
 
 class PolicyDenied(PermissionError):
@@ -160,20 +191,24 @@ def gate_tool_bundle(
         return bundle
     gated: list[AgentTool] = []
     for tool in bundle.tools:
+        # Minted ONCE, here, from the entry's own server — then stamped on the
+        # entry and read back by the handler. `server` is a build input, never
+        # per-call data.
+        qualified = qualified_tool_name(
+            agent_name=agent_name,
+            server=server,
+            tool_name=tool.name,
+            is_bus_tool=tool.name in bus_tool_names,
+        )
         annotations: dict[str, Any] = dict(tool.annotations)
         annotations[POLICY_GATE_ANNOTATION] = True
+        annotations[POLICY_QUALIFIED_ANNOTATION] = qualified
         if gate_budget_sec:
             annotations[POLICY_GATE_BUDGET_ANNOTATION] = gate_budget_sec
         gated.append(
             _dataclass_replace(
                 tool,
-                handler=_gated_handler(
-                    tool,
-                    agent_name,
-                    server,
-                    checks,
-                    is_bus_tool=tool.name in bus_tool_names,
-                ),
+                handler=_gated_handler(tool, agent_name, qualified, checks),
                 annotations=annotations,
             )
         )
@@ -183,32 +218,22 @@ def gate_tool_bundle(
 def _gated_handler(
     tool: AgentTool,
     agent_name: str,
-    server: str,
+    qualified: str,
     checks: Sequence[PolicyCheck],
-    *,
-    is_bus_tool: bool = False,
 ) -> ToolHandler:
-    """Wrap one handler so policy runs before it — or instead of it."""
+    """Wrap one handler so policy runs before it — or instead of it.
+
+    `qualified` is the entry's policy identity, minted by `gate_tool_bundle`
+    (`qualified_tool_name`) and stamped as `POLICY_QUALIFIED_ANNOTATION`. The
+    handler never derives it — see that annotation's note.
+
+    MCP form matters: the safeguard hook BRANCHES on the prefix. MCP-form →
+    safeguards then allow (scope already lives inside the handler); bare form →
+    the built-in policy path, which runs a SECOND scope evaluation and consults
+    `trusted_builtins`. Provider bundles carry bare wire names, which is why the
+    identity is minted rather than read off the tool.
+    """
     original = tool.handler
-    # The SDK path sees `mcp__<server>__<tool>`, and the safeguard hook BRANCHES
-    # on that prefix: MCP-form → safeguards then allow (scope is already inside
-    # the handler); bare form → the built-in policy path, which runs a SECOND
-    # scope evaluation and consults `trusted_builtins`. Provider bundles carry
-    # bare wire names, so we synthesize the MCP form to get LITERAL parity with
-    # the SDK path — same qualified_name, same dataset lookups. Passing bare
-    # names would quietly take the builtin branch and double-evaluate scope: a
-    # gate that looks armed and classifies wrong.
-    #
-    # BUS tools canonicalize differently: `mcp_identity` special-cases a
-    # `bus__` server segment and yields `bus.<name>`, which is what the policy
-    # table is keyed on (`bus.ask_agent`, `bus.ask_agents`). Synthesizing the
-    # per-agent form for them would produce `<agent>.ask_agents`, matching no
-    # entry — the delegation denylist would look armed and catch nothing, which
-    # is the exact failure mode of the mirror this gate replaced.
-    if is_bus_tool:
-        qualified = f"mcp__bus__{agent_name}__{tool.name}"
-    else:
-        qualified = f"mcp__{server}__{tool.name}"
 
     async def handler(arguments: Mapping[str, JsonValue]) -> JsonValue:
         tool_input: dict[str, Any] = dict(arguments or {})
