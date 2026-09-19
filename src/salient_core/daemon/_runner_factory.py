@@ -28,7 +28,7 @@ _LOOP_WARNED: set[str] = set()
 _APPROVAL_TIMEOUT_SEC: int = 600
 
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, assert_never, cast
 from urllib.parse import urlparse
@@ -62,7 +62,7 @@ def render_profile_block(*args: Any, **kwargs: Any) -> str:
 
 
 from ..protocols import ToolBuildContext
-from ..providers import ProviderName, get_provider_registry
+from ..providers import ProviderName, get_provider_registry, is_provider_runtime
 from ..runtime import (
     AgentBackend,
     ToolBundle,
@@ -2063,7 +2063,7 @@ class _RunnerFactoryMixin:
         if runtime is None:
             options = self._build_options(cfg, stderr_callback=_stderr_sink)
             backend_factory = partial(LocalClaudeBackend, options)
-        elif isinstance(runtime, dict):
+        elif is_provider_runtime(runtime):
             provider_name = ProviderName(runtime.get("provider", ""))
             config = _json_value(runtime.get("config", {}))
             if not isinstance(config, dict):
@@ -2406,6 +2406,9 @@ class _RunnerFactoryMixin:
         cfg: dict[str, Any],
         bundle: ToolBundle,
         bus_tool_names: frozenset[str] = frozenset(),
+        *,
+        server: str | None = None,
+        checks: Sequence[Any] | None = None,
     ) -> ToolBundle:
         """Install the PreToolUse gate on every tool a provider runtime can call.
 
@@ -2428,6 +2431,18 @@ class _RunnerFactoryMixin:
         runs its own `_make_runner` and would otherwise reimplement this seam
         (and its bugs) a third time. This method's job is only to decide WHICH
         checks apply to this agent and what the operator budget is.
+
+        `server` overrides the MCP server name the gate synthesizes its
+        qualified name from (normally the aliased agent name). It exists for a
+        skin's EXTRA servers (`_provider_extra_bundles`), which the SDK path
+        names `<agent>_<type>`; they must keep that name here too, or the two
+        runtimes resolve different policy rows for the same tool.
+
+        `checks` lets a caller hand in ONE set of check instances for several
+        bundles. Two calls to `_provider_gate_checks` build two `HookReplayCache`s
+        (and two of every other check factory's state), so an agent's primary
+        server and its extras must share one set or a future stateful check
+        silently grants the agent N+1 allowances.
         """
         if not bundle.tools:
             return bundle
@@ -2437,8 +2452,8 @@ class _RunnerFactoryMixin:
         return gate_tool_bundle(
             bundle,
             agent_name=agent_name,
-            server=to_wire(agent_name),
-            checks=self._provider_gate_checks(cfg),
+            server=server or to_wire(agent_name),
+            checks=self._provider_gate_checks(cfg) if checks is None else checks,
             # Only agents that actually declare `approve_before` can block on a
             # human, so only they need the extra budget published.
             gate_budget_sec=(
@@ -2450,15 +2465,82 @@ class _RunnerFactoryMixin:
             bus_tool_names=bus_tool_names,
         )
 
+    def _provider_extra_bundles(self, cfg: dict[str, Any]) -> Sequence[tuple[str, ToolBundle]]:
+        """Skin seam: extra ``(server_name, bundle)`` pairs for the provider path.
+
+        The provider path builds an agent's tools from its single ``tool:``
+        block plus the bus tools, so it never reaches ``_build_options`` — where
+        a skin adds its extra tool servers (assay's ``extra_tool_types`` ride
+        ``options.mcp_servers`` there). A skin therefore has no way at all to
+        reach a provider runtime with an extra tool, and the two paths diverge
+        silently: the same engagement gives an SDK seat its ``search`` wire and
+        a polybrain seat none.
+
+        Return each extra server as ``(server_name, ungated_bundle)``. The
+        ``server_name`` MUST be the one the SDK path uses for that extra's
+        ``options.mcp_servers`` entry: ``gate_tool_bundle`` synthesizes
+        ``mcp__<server>__<tool>`` and BRANCHES on that qualified name, so a
+        different name is a different policy row — a gate that looks armed and
+        classifies wrong. Each bundle is gated through the same
+        ``_gate_provider_bundle`` the primary block uses, so it inherits the
+        identical checks (budget, safeguard, ``approve_before``).
+
+        Default: none. A host that contributes no extra servers need not
+        implement it.
+        """
+        return ()
+
+    def _merge_provider_extras(
+        self,
+        cfg: dict[str, Any],
+        primary: ToolBundle,
+        *,
+        checks: Sequence[Any],
+    ) -> ToolBundle:
+        """Append the skin's extra servers to ``primary``, each gated in place.
+
+        ``checks`` is the SAME check set the primary bundle was gated with, so
+        the agent has one instance of each check, not one per server.
+
+        Also reached by a bus-only agent, whose early return in
+        ``_build_provider_tool_bundle`` would otherwise drop its extras.
+        """
+        extras = tuple(self._provider_extra_bundles(cfg))
+        if not extras:
+            return primary
+        tools = list(primary.tools)
+        for server, extra in extras:
+            if extra.tools:
+                tools.extend(
+                    self._gate_provider_bundle(cfg, extra, server=server, checks=checks).tools
+                )
+        try:
+            return ToolBundle(tuple(tools))
+        except ValueError as exc:
+            # A provider runtime flattens every server into one namespace, so a
+            # bare name two servers share (fine on the SDK path, where they are
+            # separate MCP servers) is fatal here. Say why, or the same config
+            # "works" on one runtime and refuses to start on the other.
+            raise ValueError(
+                f"agent {cfg['name']!r}: the provider runtime flattens all tool servers into "
+                f"one namespace, so bare tool names must be unique across the primary server "
+                f"and the extras {[s for s, _ in extras]} (the SDK runtime allows a shared "
+                f"name): {exc}"
+            ) from exc
+
     def _build_provider_tool_bundle(self, cfg: dict[str, Any]) -> ToolBundle:
         bus_bundle, bus_wires = make_bus_tool_bundle(cast("DaemonServices", self), cfg["name"])
+        bus_names = frozenset(t.name for t in bus_bundle.tools)
+        checks = self._provider_gate_checks(cfg)
         tool_cfg = cfg.get("tool")
         if not isinstance(tool_cfg, dict):
             # Bus-only agent (no tool surface) — gated all the same: `ask_agent`
             # / `ask_agents` are bus tools, and a delegation fan-out is exactly
             # the call that must not slip past the prohibited-intent denylist.
-            return self._gate_provider_bundle(
-                cfg, bus_bundle, frozenset(t.name for t in bus_bundle.tools)
+            return self._merge_provider_extras(
+                cfg,
+                self._gate_provider_bundle(cfg, bus_bundle, bus_names, checks=checks),
+                checks=checks,
             )
         factory_config = dict(tool_cfg.get("config") or {})
         if self.engagement_path is not None:
@@ -2493,16 +2575,21 @@ class _RunnerFactoryMixin:
             extra_tools=bus_bundle.tools,
             extra_bare_wires=bus_wires,
         )
-        return self._gate_provider_bundle(
+        return self._merge_provider_extras(
             cfg,
-            get_tool_bundle_builder()(
-                tool_cfg["type"],
-                factory_config,
-                context=context,
+            self._gate_provider_bundle(
+                cfg,
+                get_tool_bundle_builder()(
+                    tool_cfg["type"],
+                    factory_config,
+                    context=context,
+                ),
+                # The built bundle merges the factory's tools with the bus tools
+                # (`extra_tools=bus_bundle.tools`), so name the bus half explicitly.
+                bus_names,
+                checks=checks,
             ),
-            # The built bundle merges the factory's tools with the bus tools
-            # (`extra_tools=bus_bundle.tools`), so name the bus half explicitly.
-            frozenset(t.name for t in bus_bundle.tools),
+            checks=checks,
         )
 
     def _on_loop_detected(

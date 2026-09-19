@@ -20,6 +20,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from ..providers import is_provider_runtime
 from ._helpers import normalize_swarms
 
 # ── Thinking-tier provider seam ──────────────────────────────────────
@@ -356,6 +357,13 @@ def _format_tools_block(cfg: dict[str, Any]) -> str:
     TOOL_WIRE_NAMES = get_tool_wire_names()
     tool_cfg = cfg.get("tool") or {}
     builtins = list(cfg.get("builtin_tools") or [])
+    if is_provider_runtime(cfg.get("runtime")):
+        # A provider runtime (polybrain/codex) serves only its ToolBundle — the
+        # Claude Code built-ins are registered on the SDK path alone. Claiming
+        # them sends the model after tools that answer `unknown tool` (measured
+        # 2026-09-19, a provider seat's transcript), so list them as NOT
+        # available and let the primary MCP tool carry the work.
+        builtins = []
     lines: list[str] = []
     if tool_cfg.get("type"):
         tt = tool_cfg["type"]

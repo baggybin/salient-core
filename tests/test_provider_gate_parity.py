@@ -665,3 +665,149 @@ def test_provider_gate_checks_reuse_the_real_hook_factories() -> None:
         {"name": "agent", "policy": {"approve_before": ["destructive"]}}
     )
     assert len(with_policy) == expected + 1  # + approve_before, last
+
+
+# ---------------------------------------------------------------------------
+# 7. a skin's extra servers ride the same gate
+# ---------------------------------------------------------------------------
+
+
+def _with_tool_bundle_builder(monkeypatch: pytest.MonkeyPatch, bundle: ToolBundle) -> None:
+    """Stub the provider bundle builder so no skin registration is needed."""
+    monkeypatch.setattr(
+        _runner_factory, "get_tool_bundle_builder", lambda: lambda *_a, **_k: bundle
+    )
+
+
+@pytest.mark.anyio
+async def test_extra_servers_are_merged_and_gated_under_their_own_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skin's extra server (assay's `extra_tool_types`) reaches a provider seat.
+
+    Two properties at once. Without `_provider_extra_bundles` the extra never
+    appears in a provider bundle at all: measured 2026-09-19, a `mapper` seat
+    declared `extra_tool_types: [search, forged, probe]` and got no `search`,
+    and the AIO swarm's public mine could not run. And when it DOES appear it
+    must be gated under the server name the SKIN returned — `gate_tool_bundle`
+    synthesizes `mcp__<server>__<tool>` and the policy dataset is keyed on it,
+    so a gate that fell back to the agent name would look armed and classify
+    wrong while passing every "a hook was installed" assertion.
+    """
+    calls: list[dict[str, Any]] = []
+    extra = _tool("query", calls)
+    dataset = _dataset(
+        {"agent_search.query": scope.ExtractorSpec(none=True)},
+        prohibited={"agent_search.query": [("blocked", "prohibited-marker")]},
+    )
+    daemon = _Daemon(_Runner(dataset), scope.ScopeStore(None, "extras"))
+    monkeypatch.setattr(
+        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
+    )
+    _with_tool_bundle_builder(monkeypatch, ToolBundle())
+    monkeypatch.setattr(
+        daemon, "_provider_extra_bundles", lambda _cfg: (("agent_search", ToolBundle((extra,))),)
+    )
+
+    bundle = daemon._build_provider_tool_bundle({"name": "agent", "tool": {"type": "fs"}})
+
+    assert [t.name for t in bundle.tools] == ["query"]
+    query = bundle.tools[0]
+    assert query.annotations[_GATE_ANNOTATION] is True
+    # Wrapped, not merely annotated — and the DENY must resolve off the extra's
+    # own qualified name, which is the only thing the dataset key can match.
+    assert query.handler is not extra.handler
+    with pytest.raises(PolicyDenied):
+        await query.handler({"note": "prohibited-marker"})
+    assert calls == []
+    assert await query.handler({"note": "ordinary"}) == {"ran": True}
+
+
+@pytest.mark.anyio
+async def test_extra_servers_survive_the_bus_only_early_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `tool:`-less agent still gets its extras; the early return must merge too."""
+    calls: list[dict[str, Any]] = []
+    extra = _tool("record", calls)
+    daemon = _Daemon(_Runner(_dataset()), scope.ScopeStore(None, "extras-bus-only"))
+    monkeypatch.setattr(
+        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
+    )
+    monkeypatch.setattr(
+        daemon, "_provider_extra_bundles", lambda _cfg: (("agent_cred", ToolBundle((extra,))),)
+    )
+
+    bundle = daemon._build_provider_tool_bundle({"name": "agent"})
+
+    assert [t.name for t in bundle.tools] == ["record"]
+    assert bundle.tools[0].annotations[_GATE_ANNOTATION] is True
+
+
+def test_an_extra_that_collides_with_a_primary_tool_name_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The merge refuses duplicates rather than letting dispatch pick a gate."""
+    calls: list[dict[str, Any]] = []
+    daemon = _Daemon(_Runner(_dataset()), scope.ScopeStore(None, "extras-dup"))
+    monkeypatch.setattr(
+        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
+    )
+    _with_tool_bundle_builder(monkeypatch, ToolBundle((_tool("query", calls),)))
+    monkeypatch.setattr(
+        daemon,
+        "_provider_extra_bundles",
+        lambda _cfg: (("agent_search", ToolBundle((_tool("query", calls),))),),
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        daemon._build_provider_tool_bundle({"name": "agent", "tool": {"type": "fs"}})
+
+
+def test_the_extra_servers_hook_defaults_to_none() -> None:
+    """The kernel contributes no extras of its own — the seam is the skin's."""
+    daemon = _Daemon(_Runner(_dataset()), scope.ScopeStore(None, "extras-default"))
+    assert daemon._provider_extra_bundles({"name": "agent"}) == ()
+
+
+def test_one_check_set_is_built_per_agent_not_per_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The primary block and every extra must share ONE set of check instances.
+
+    `_provider_gate_checks` is not a pure function of the config: the safeguard
+    factory builds its own `HookReplayCache` per call, and any future check may
+    hold similar cross-call state. Gating each extra server with a freshly built
+    set would hand the agent N+1 of every stateful check — a gate that looks
+    armed and allows more than it should, which is the same class of failure as
+    gating under the wrong qualified name.
+    """
+    built = 0
+    real = _Daemon._provider_gate_checks
+
+    def counting(self: Any, cfg: dict[str, Any]) -> Any:
+        nonlocal built
+        built += 1
+        return real(self, cfg)
+
+    monkeypatch.setattr(_Daemon, "_provider_gate_checks", counting)
+
+    calls: list[dict[str, Any]] = []
+    daemon = _Daemon(_Runner(_dataset()), scope.ScopeStore(None, "one-check-set"))
+    monkeypatch.setattr(
+        _runner_factory, "make_bus_tool_bundle", lambda *_a, **_k: (ToolBundle(), {})
+    )
+    _with_tool_bundle_builder(monkeypatch, ToolBundle((_tool("read", calls),)))
+    monkeypatch.setattr(
+        daemon,
+        "_provider_extra_bundles",
+        lambda _cfg: (
+            ("agent_search", ToolBundle((_tool("query", calls),))),
+            ("agent_probe", ToolBundle((_tool("probe", calls),))),
+        ),
+    )
+
+    bundle = daemon._build_provider_tool_bundle({"name": "agent", "tool": {"type": "fs"}})
+
+    assert {t.name for t in bundle.tools} == {"read", "query", "probe"}
+    assert built == 1, "a fresh check set per extra server would grant N+1 allowances"

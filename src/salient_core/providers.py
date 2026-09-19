@@ -117,6 +117,18 @@ def get_provider_registry() -> ProviderRegistry:
     return _active_provider_registry
 
 
+def is_provider_runtime(runtime: object) -> bool:
+    """True when a roster ``runtime:`` value selects a PROVIDER backend.
+
+    THE definition of "provider runtime". `_make_runner` dispatches on it, and
+    the prompt layer decides from it whether the agent actually has Claude Code
+    built-ins. Two copies of this predicate drift the moment a shorthand is
+    accepted (``runtime: "polybrain"``), after which the prompt would advertise
+    built-ins to a runtime that has none.
+    """
+    return isinstance(runtime, dict)
+
+
 def set_provider_registry(registry: ProviderRegistry) -> None:
     global _active_provider_registry
     _active_provider_registry = registry
